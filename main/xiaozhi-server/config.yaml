@@ -811,9 +811,10 @@ S2S:
     gate_g_mult: 8
     # 模型侧输入降噪：near_field（近讲）/ far_field（远场，房间里的设备一般选这个）；留空 = 不开
     noise_reduction: far_field
-    # 本地插话：门控连续 N 帧新判出人声（不含 300 ms 保持期的帧）就本地停播（比等模型侧 VAD 快）；0 = 关闭
+    # 本地插话：最近 local_barge_window 帧（默认 2N）里有 ≥ N 帧门控新判出人声（不含 300 ms 保持期的帧）就本地停播（比等模型侧 VAD 快）；0 = 关闭
     local_barge: true
     local_barge_frames: 3
+    local_barge_window: 6
     # 工具白名单（空 = 全部）与每会话每分钟调用上限
     tools_allow: []
     tool_calls_per_minute: 12
