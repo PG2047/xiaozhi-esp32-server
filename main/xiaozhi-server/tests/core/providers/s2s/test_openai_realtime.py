@@ -229,10 +229,34 @@ def test_session_noise_reduction_and_gate_window():
         bad = make_provider(conn, "ws://unused", noise_reduction="studio")
         assert bad.noise_reduction == "" and "noise_reduction" not in bad._session()["audio"]["input"]
         g = make_provider(conn, "ws://unused", echo_gate=True, gate_lag_prior_ms=900, gate_lag_max_ms=1500)  # 模型文件不在：能量判据
-        assert g.gate is not None and g.gate.start_window == (0.08, 1.5) and g.gate.lag == pytest.approx(0.9)
-        assert g.gate._window() == pytest.approx((0.6, 0.82))   # 锁定前覆盖滞后 80 ms～1.5 s
+        assert g.gate is not None and g.gate.start_window == pytest.approx((0.65, 1.15)) and g.gate.lag == pytest.approx(0.9)
+        assert g.gate._window() == pytest.approx((0.25, 0.25))   # 锁定前只在先验 ±250 ms 内找回声
+        assert not g.lag_prior_remembered
     finally:
         loop.close()
+
+
+def test_remembered_lag_becomes_next_sessions_prior():
+    """会话结束时把锁定的滞后按 device-id 记住；同一台设备下一段会话用它当先验、起始窗围着它开。"""
+    from core.providers.s2s.openai_realtime import openai_realtime as mod
+
+    async def go():
+        conn = FakeConn(asyncio.get_running_loop())
+        conn.device_id = "test-dev-remember"
+        mod._LAST_LAG.pop(conn.device_id, None)
+        p = make_provider(conn, "ws://unused", echo_gate=True, gate_lag_prior_ms=900)
+        p.gate.lag, p.gate.lag_corr = 0.78, 0.7
+        await p.close()                                             # 没开过 ws：只收尾、记滞后
+        assert mod._LAST_LAG[conn.device_id] == pytest.approx(0.78) and p.stats["gate"]["lag_ms"] == 780
+        q = make_provider(conn, "ws://unused", echo_gate=True, gate_lag_prior_ms=900)
+        assert q.lag_prior_remembered and q.lag_prior_ms == 780 and q.gate.lag == pytest.approx(0.78)
+        assert q.gate.start_window == pytest.approx((0.53, 1.03))
+        r = make_provider(conn, "ws://unused", echo_gate=True, gate_lag_prior_ms=900)
+        r.gate.lag_corr = None                                      # 没锁定过的会话不覆盖记忆
+        await r.close()
+        assert mod._LAST_LAG[conn.device_id] == pytest.approx(0.78)
+        mod._LAST_LAG.pop(conn.device_id, None)
+    asyncio.run(go())
 
 
 def test_local_barge_counts_only_fresh_pass_frames():
@@ -286,6 +310,38 @@ def test_response_audio_reaches_device_with_tts_messages_and_dialogue():
         assert [(m.role, m.content) for m in conn.dialogue.dialogue] == [("user", "现在几点"), ("assistant", "现在三点整。")]
         assert p.stats["turns"] == 1 and p.stats["cancelled"] == 0
         assert conn.client_is_speaking is False
+        await p.close()
+    run_scenario(sc)
+
+
+def test_empty_transcript_deletes_item_and_cancels_only_unvoiced_response():
+    """空转写：删掉该输入；它触发的回复还没出声就取消（后到的音频丢弃）；已出声的回复不取消。"""
+    async def sc(rt, conn, url):
+        p = make_provider(conn, url)
+        conn.s2s = p
+        await p.open()
+        await rt.wait_for("session.update")
+        # 1) 模型侧判出"开口"→ 回复已创建但还没出声 → 空转写到
+        await rt.emit({"type": "response.created", "response": {"id": "r1"}})
+        await rt.emit({"type": "response.output_item.added", "item": {"id": "a1", "type": "message"}})
+        await rt.emit({"type": "conversation.item.input_audio_transcription.completed", "item_id": "u_empty", "transcript": " "})
+        (d,) = await rt.wait_for("conversation.item.delete")
+        assert d["item_id"] == "u_empty"
+        await rt.wait_for("response.cancel")
+        await rt.emit({"type": "response.output_audio.delta", "delta": b64(60)})     # 取消后才到的音频：丢弃
+        await rt.emit({"type": "response.done", "response": {"status": "cancelled", "status_details": {"reason": "client_cancelled"}}})
+        await _real_sleep(0.1)
+        assert conn.websocket.frames() == [] and ("tts", "start") not in conn.websocket.states()
+        assert p.stats["empty_transcripts"] == 1 and p.stats["empty_cancelled"] == 1
+        assert [m.content for m in conn.dialogue.dialogue] == []                       # 空转写不进对话历史
+        # 2) 回复已经出声：只删项，不取消
+        await _stream_response(rt, frames=6, item_id="a2")
+        await wait_until(lambda: p.speaker.frames_sent >= 2, what="已出声")
+        await rt.emit({"type": "conversation.item.input_audio_transcription.completed", "item_id": "u_empty2", "transcript": ""})
+        dels = await rt.wait_for("conversation.item.delete", 2)
+        assert dels[1]["item_id"] == "u_empty2"
+        await _real_sleep(0.1)
+        assert len(rt.of("response.cancel")) == 1 and p.stats["empty_transcripts"] == 2 and p.stats["empty_cancelled"] == 1
         await p.close()
     run_scenario(sc)
 

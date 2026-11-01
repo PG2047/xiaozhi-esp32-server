@@ -16,6 +16,9 @@ devices:
   "aa:bb:cc:dd:ee:03": {name: paused, enabled: false, brain: OpenAIRealtime}
   "aa:bb:cc:dd:ee:04": {name: bad-brain, brain: Nope}
   "aa:bb:cc:dd:ee:05": {name: by-type, brain: openai_realtime}
+  "aa:bb:cc:dd:ee:06": {name: xvf, brain: openai_realtime, s2s: {echo_gate: false, vad_threshold: 0.6, nested: {a: 1}}}
+  "aa:bb:cc:dd:ee:07": {name: cascade-with-s2s, brain: cascade, s2s: {echo_gate: false}}
+  "aa:bb:cc:dd:ee:08": {name: bad-s2s, brain: openai_realtime, s2s: 5}
 """
 
 
@@ -56,6 +59,23 @@ def test_cascade_and_llm_override_with_unknown_tts_ignored(tmp_path):
     assert apply_device_overrides(c) == {"S2S": "", "LLM": "OtherLLM"}
     assert c.config["selected_module"] == {"LLM": "OtherLLM", "TTS": "EdgeTTS", "S2S": ""}
     assert c.config["prompt"] == "全局提示词"
+
+
+def test_s2s_overrides_merge_into_selected_block_only(tmp_path):
+    """s2s 键值表合并进这台设备所选的 S2S 配置块：标量覆盖、嵌套忽略；级联设备的 s2s 忽略；非键值表忽略。"""
+    p = tmp_path / "devices.yaml"
+    p.write_text(REG, encoding="utf-8")
+    c = Conn("aa:bb:cc:dd:ee:06", str(p))
+    assert apply_device_overrides(c) == {"S2S": "OpenAIRealtime", "s2s": ["echo_gate", "vad_threshold"]}
+    blk = c.config["S2S"]["OpenAIRealtime"]
+    assert blk["echo_gate"] is False and blk["vad_threshold"] == 0.6 and "nested" not in blk and blk["type"] == "openai_realtime"
+    c2 = Conn("aa:bb:cc:dd:ee:07", str(p))
+    c2.config["selected_module"]["S2S"] = "OpenAIRealtime"
+    assert apply_device_overrides(c2) == {"S2S": ""}
+    assert c2.config["S2S"]["OpenAIRealtime"] == {"type": "openai_realtime"}     # 级联设备：全局 S2S 块原样
+    c3 = Conn("aa:bb:cc:dd:ee:08", str(p))
+    assert apply_device_overrides(c3) == {"S2S": "OpenAIRealtime"}
+    assert c3.config["S2S"]["OpenAIRealtime"] == {"type": "openai_realtime"}
 
 
 def test_no_change_cases(tmp_path):
