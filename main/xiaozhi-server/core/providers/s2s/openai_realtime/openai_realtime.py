@@ -38,6 +38,8 @@ WAKE_TRIGGER = "嘿，你好呀"   # 上游 listenMessageHandler 把唤醒词统
 RESPONSE_START_WAIT_S = 10.0  # 我们发了 response.create 之后，最多等这么久算"回答进行中"（空闲关闭不打断它）
 SPEECH_GRACE_S = 3.0          # 刚说完这么久内不按空闲关闭：留给模型起回复
 BENIGN_ERRORS = ("response_cancel_not_active", "conversation_already_has_active_response")
+LAG_WINDOW_S = 0.25            # 锁定滞后之前，参考窗只在先验 ±这么多秒内找回声（窗越宽门槛越高：取的是窗内最大功率）
+_LAST_LAG: dict[str, float] = {}   # device-id → 上一段会话锁定的滞后（秒）：同一台设备的滞后很稳，下次会话直接当先验
 
 
 class S2SProvider(S2SProviderBase):
@@ -65,13 +67,18 @@ class S2SProvider(S2SProviderBase):
             self.noise_reduction = ""
 
         gate = None
-        self.lag_prior_ms = int(c.get("gate_lag_prior_ms", 200))
         self.lag_max_ms = int(c.get("gate_lag_max_ms", 1200))
+        self.device_id = str(getattr(conn, "device_id", None) or "")
+        remembered = _LAST_LAG.get(self.device_id) if self.device_id else None
+        self.lag_prior_ms = int(round(remembered * 1000)) if remembered else int(c.get("gate_lag_prior_ms", 200))
+        self.lag_prior_remembered = remembered is not None
         if c.get("echo_gate", True):
-            # 锁定滞后之前，参考窗要盖住整个搜索范围（80 ms～上限），否则先验离真值远时开头几秒的回声漏给模型
+            # 锁定滞后之前，参考窗在先验 ±LAG_WINDOW_S 内找回声。11-01 曾把窗开到 80 ms～上限全程：窗内取最大功率，
+            # 门槛高到音量 25 的插话都过不去；现在靠"记住上一段会话的滞后"把先验放准，窗就可以窄
+            prior = self.lag_prior_ms / 1000
             gate = EchoGate(vad=load_vad(self._vad_model_path()),
-                            lag_prior=self.lag_prior_ms / 1000, lag_max=self.lag_max_ms / 1000,
-                            start_window=(0.08, self.lag_max_ms / 1000))
+                            lag_prior=prior, lag_max=self.lag_max_ms / 1000, g_mult=float(c.get("gate_g_mult", 8.0)),
+                            start_window=(max(0.08, prior - LAG_WINDOW_S), min(self.lag_max_ms / 1000, prior + LAG_WINDOW_S)))
         self.gate = gate
         self.speaker = DeviceSpeaker(conn, getattr(conn, "sample_rate", RT_RATE), gate=gate)
         self.tools = ToolRunner(conn, conn.logger, per_minute=int(c.get("tool_calls_per_minute", 12)),
@@ -95,7 +102,8 @@ class S2SProvider(S2SProviderBase):
         self.t_speech_stopped = None
         self.t_response_requested = None
         self.stats = {"turns": 0, "cancelled": 0, "speech_started": 0, "barge_server": 0, "barge_local": 0,
-                      "barge_device": 0, "up_frames": 0, "tools": 0, "first_audio_ms": []}
+                      "barge_device": 0, "up_frames": 0, "tools": 0, "first_audio_ms": [],
+                      "empty_transcripts": 0, "empty_cancelled": 0}
 
     # ---------- 会话 ----------
     def _vad_model_path(self):
@@ -178,8 +186,8 @@ class S2SProvider(S2SProviderBase):
         self.logger.bind(tag=TAG).info(
             f"Realtime 会话已建立 model={self.model} turn={self.turn_detection_type} "
             f"echo_gate={'on' if self.gate else 'off'} noise_reduction={self.noise_reduction or 'off'} "
-            f"local_barge_frames={self.local_barge_frames} lag_prior_ms={self.lag_prior_ms} lag_max_ms={self.lag_max_ms} "
-            f"in {time.monotonic() - t0:.2f}s")
+            f"local_barge_frames={self.local_barge_frames} lag_prior_ms={self.lag_prior_ms}{'(记忆)' if self.lag_prior_remembered else ''} "
+            f"lag_max_ms={self.lag_max_ms} in {time.monotonic() - t0:.2f}s")
 
     def after_components_ready(self) -> None:
         asyncio.run_coroutine_threadsafe(self._after_ready(), self.conn.loop)
@@ -219,7 +227,10 @@ class S2SProvider(S2SProviderBase):
             with contextlib.suppress(Exception):
                 await self.ws.close()
         if self.gate is not None:
-            self.stats["gate"] = dict(self.gate.stats, lag_ms=round(self.gate.lag * 1000))
+            self.stats["gate"] = dict(self.gate.stats, lag_ms=round(self.gate.lag * 1000),
+                                      g=None if self.gate.g is None else round(self.gate.g, 4))
+            if self.gate.lag_corr is not None and self.device_id:
+                _LAST_LAG[self.device_id] = self.gate.lag   # 下一段会话的先验
         self.logger.bind(tag=TAG).info(f"Realtime 会话结束: {self.stats}")
 
     # ---------- 设备 → 模型 ----------
@@ -347,11 +358,13 @@ class S2SProvider(S2SProviderBase):
             if txt and not self.suppress:
                 await self.show_assistant_text(txt)
         elif et == "conversation.item.input_audio_transcription.completed":
-            txt = ev.get("transcript") or ""
+            txt = (ev.get("transcript") or "").strip()
             if self.log_text:
                 self.logger.bind(tag=TAG).info(f"user: {txt}")
             if txt:
                 await self.show_user_text(txt)
+            else:
+                await self._on_empty_transcript(ev.get("item_id"))
         elif et == "response.done":
             r = ev.get("response") or {}
             self.resp_done = True
@@ -376,6 +389,21 @@ class S2SProvider(S2SProviderBase):
                 self.logger.bind(tag=TAG).info(msg)
             else:
                 self.logger.bind(tag=TAG).warning(msg)
+
+    async def _on_empty_transcript(self, item_id) -> None:
+        """模型侧 VAD 判出"开口"但转写不出一个字：房间里的响动、设备 AGC 回升、播完后的尾音（11-01 真机：每次播完后
+        1～7 秒出现一两次，模型回"不知道你想表达什么"）。把这条空输入从会话里删掉，别让它留在上下文里；
+        它触发的回复若还没出声就一并取消。已经出声的不动——转写是异步的，这时在播的也可能是别的回复，掐断更怪。"""
+        self.stats["empty_transcripts"] += 1
+        if item_id:
+            await self._send({"type": "conversation.item.delete", "item_id": item_id})
+        if not self.resp_done and not self.speaker.speaking and self.speaker.frames_sent == 0:
+            self.suppress = True
+            await self._send({"type": "response.cancel"})
+            self.stats["empty_cancelled"] += 1
+            self.logger.bind(tag=TAG).info("空转写：删除该输入并取消尚未出声的回复")
+        else:
+            self.logger.bind(tag=TAG).info("空转写：删除该输入（回复已出声或没有进行中的回复，不取消）")
 
     # ---------- 工具 ----------
     async def _run_tool(self, item: dict) -> None:

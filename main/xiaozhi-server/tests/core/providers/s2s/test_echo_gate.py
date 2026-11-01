@@ -23,7 +23,7 @@ def _speechlike(seconds: float, seed: int, amp: float = 6000.0) -> np.ndarray:
     return x
 
 
-def _run(lag=0.10, echo_db=-28.0, barge_gain=0.8, barge_at=2.0, barge_len=1.5):
+def _run(lag=0.10, echo_db=-28.0, barge_gain=0.8, barge_at=2.0, barge_len=1.5, log_fn=None, g_mult=None):
     # 真机：TTS 下行 RMS 约 3000～5000，设备 AEC 后残余相对参考约 −28 dB（中位）
     ref = _speechlike(5.0, seed=1, amp=20000.0).astype(np.int16)
     spk = _speechlike(barge_len, seed=2, amp=9000.0)
@@ -37,7 +37,8 @@ def _run(lag=0.10, echo_db=-28.0, barge_gain=0.8, barge_at=2.0, barge_len=1.5):
     up[b0:b0 + len(spk)] += spk * barge_gain
     up = np.clip(up, -32768, 32767).astype(np.int16)
 
-    gate = EchoGate(vad=None, lag_prior=0.08, lag_max=0.30, start_window=None)  # 能量判据（合成信号不是真人声）
+    gate = EchoGate(vad=None, lag_prior=0.08, lag_max=0.30, start_window=None, log_fn=log_fn,
+                    **({"g_mult": g_mult} if g_mult is not None else {}))  # 能量判据（合成信号不是真人声）
     t = 100.0
     gate.on_tts_start(t)
     nf = len(ref) // FR
@@ -96,6 +97,32 @@ def test_lag_estimate_converges_from_far_prior():
     """先验 80 ms、真实 250 ms（离当前值超过 100 ms）：要么相关 ≥ 0.7 一次采用，要么连续两次一致后采用；6 秒内都该收敛。"""
     gate, *_ = _run(lag=0.25, barge_gain=0.0)
     assert abs(gate.lag - 0.25) <= 0.04 and gate.lag_corr is not None
+
+
+def test_lag_retry_pacing_before_and_after_lock():
+    """估不出 / 被拒后 1 秒再试：锁定前触发周期是 2.4 秒，重试时间不能按 5 秒的周期倒推（否则下一帧就又估一次）。"""
+    gate = EchoGate(vad=None)
+    gate._estimate_lag(100.0)                                       # 数据不够
+    assert 100.06 - gate.t_last_lag < 2.4 and gate.t_last_lag == pytest.approx(100.0 - 2.4 + 0.5)
+    gate.lag_corr = 0.7
+    gate._estimate_lag(200.0)
+    assert gate.t_last_lag == pytest.approx(200.0 - gate.lag_every + 0.5)
+
+
+def test_g_capped_by_median_so_barge_frames_do_not_raise_threshold():
+    """比值池里混着插话子帧时 90% 分位被顶高几十倍；g 以中位数 × g_mult 封顶后仍压得住 −28 dB 的回声。"""
+    capped, *_ = _run()
+    plain, *_ = _run(g_mult=0)
+    # 同一段信号：纯分位数被 1.5 秒插话顶到约 0.07（−11.6 dB，比真实残余 −28 dB 高 16 dB）；封顶后约 0.01，仍高于真实残余比 0.0016
+    assert plain.g > 0.03 and capped.g < 0.02 and capped.g > 0.0016 and capped.g_mult == 8.0
+
+
+def test_segment_diagnostic_line():
+    logs = []
+    gate, *_ = _run(log_fn=logs.append)
+    seg = [l for l in logs if l.startswith("echo gate seg")]
+    assert len(seg) == 1 and "g=" in seg[0] and "pass=" in seg[0] and "echo=" in seg[0] and "ref_p50=" in seg[0]
+    assert "pass=0" not in seg[0]                                   # 插话段里有放行帧
 
 
 def test_lag_accept_rule():

@@ -7,12 +7,16 @@
 做法：provider 知道自己发了什么、什么时候发的：
   1. 参考 = 本段第一帧发送时刻起、按设备实际播放排列的下行 PCM（断流处补零）；
   2. 滞后先验 200 ms，0～1200 ms 内按 50 ms 对数包络互相关复估（插话多时跳过）；
-  3. 回声回传比 g = 播放期间"上行功率 / 参考尾窗最大功率"的 90% 分位；
+  3. 回声回传比 g = 播放期间"上行功率 / 参考尾窗最大功率"的 90% 分位，但不超过中位数的 g_mult 倍：比值池里混着用户插话的
+     子帧（插话时上行 / 参考比残余回声高得多），90% 分位会被它们顶到"人声电平"，之后门槛就按人声电平定、把人声也当回声
+     （11-01 XVF3800：播放 1045 帧只放行 4 帧，音量 25 的插话过不去）；中位数要一半以上的池子是人声才会被顶起来。
+     倍数默认 8（合成信号里 4 倍在锁定前的宽窗阶段会漏回声，8 倍不漏；人声子帧只能把 90% 分位顶高，顶不动中位数）；
   4. 每 20 ms 子帧判：上行功率 > α·g·P_ref + (2×底噪)²，且 silero 判为人声 → 整帧放行（判决 pass）并保持 300 ms
      （保持期内的帧判决 pass-hold，同样放行但不算新证据）；否则整帧换成底噪水平的舒适噪声。
      设备不在播放、或这一帧对应的时间窗里设备没放东西时直通。
-滞后：锁定前参考窗覆盖 start_window 全程（80 ms～lag_max），先验只决定"候选离当前值近不近"；估计值离当前值 100 ms 内
-     且相关 ≥ 0.5 直接采用，远的要相关 ≥ 0.7 或连续两次落在同一处才换（见 _accept_lag）。
+滞后：锁定前参考窗覆盖 start_window 全程（provider 传先验 ±250 ms；11-01 实测窗开到 80 ms～1.5 s 时取的是 1.4 秒里的最大功率，
+     门槛高到音量 25 的插话都过不去），先验只决定"候选离当前值近不近"；估计值离当前值 100 ms 内且相关 ≥ 0.5 直接采用，
+     远的要相关 ≥ 0.7 或连续两次落在同一处才换（见 _accept_lag）。每段播放结束记一行诊断（g、各判决数、电平）。
 silero 直接用上游自带的 onnx 模型（models/snakers4_silero-vad），不装 torch；模型文件不在时只用能量判据并记一条警告。
 """
 from __future__ import annotations
@@ -73,7 +77,7 @@ def load_vad(path: str | os.PathLike | None = None):
 
 
 class EchoGate:
-    def __init__(self, alpha=2.0, floor_rms=25.0, g_quantile=0.90, g_prior=1e-2, lag_prior=0.20,
+    def __init__(self, alpha=2.0, floor_rms=25.0, g_quantile=0.90, g_prior=1e-2, g_mult=8.0, lag_prior=0.20,
                  lag_min=0.0, lag_max=1.20, lag_step=0.02, lag_every=5.0, hold_s=0.30,
                  tail_back=0.12, tail_fwd=0.04, vad_threshold=0.5, vad=None, log_fn=None, seed=0,
                  start_window: tuple[float, float] | None = (0.08, 0.65)):
@@ -86,6 +90,7 @@ class EchoGate:
         self.floor_rms = floor_rms
         self.g_quantile = g_quantile
         self.g_prior = g_prior
+        self.g_mult = g_mult     # g ≤ g_mult × 比值中位数；0 = 只用分位数
         self.lag = lag_prior
         self.lag_corr = None
         self._lag_cand = None  # 离当前值远、相关 0.5～0.7 的候选：下一次估计仍落在它附近才采用
@@ -107,6 +112,7 @@ class EchoGate:
         self.g = None
         self.hold_until = -1.0
         self.recent = collections.deque(maxlen=100)
+        self._seg = None   # 本段诊断：各判决计数与电平，on_tts_stop 时记一行
         self.stats = {"frames": 0, "bypass": 0, "pass": 0, "echo": 0, "lag_est": 0, "lag_reject": 0, "noref": 0,
                       "lag_skip_barge": 0}
 
@@ -120,6 +126,8 @@ class EchoGate:
         self.seg_buf = bytearray()
         self.seg_end = None
         self.up_env.clear()
+        self._flush_seg(t)   # 上一段的尾窗还没过完就接上了新回复：先把上一段的诊断记掉
+        self._seg = {"t0": t, "pass": 0, "hold": 0, "echo": 0, "noref": 0, "up_pass": [], "up_echo": [], "ref": []}
         if self.vad is not None:
             self.vad.reset_states()
 
@@ -135,6 +143,19 @@ class EchoGate:
 
     def on_tts_stop(self, t: float) -> None:
         self.seg_end = t
+
+    def _flush_seg(self, t: float) -> None:
+        """一段播放（含播完后的尾窗）过完，记一行诊断：g、各判决数、放行 / 回声帧的电平。在尾窗过完后的第一帧直通时调用。"""
+        s, self._seg = self._seg, None
+        if s is None:
+            return
+        p50 = lambda xs: f"{math.sqrt(float(np.median(xs))):.0f}" if xs else "-"   # 功率中位数 → RMS
+        ratios = np.array(self.ratios) if self.ratios else None
+        self.log(f"echo gate seg {t - s['t0']:.1f}s lag={self.lag * 1000:.0f}ms corr={self.lag_corr if self.lag_corr is None else round(self.lag_corr, 2)} "
+                 f"g={self.g if self.g is None else round(self.g, 4)}"
+                 f"{'' if ratios is None else f' ratio_p50={np.quantile(ratios, 0.5):.4f}'} "
+                 f"pass={s['pass']} hold={s['hold']} echo={s['echo']} noref={s['noref']} "
+                 f"up_rms pass_max={math.sqrt(max(s['up_pass'])) if s['up_pass'] else 0:.0f} echo_p50={p50(s['up_echo'])} ref_p50={p50(s['ref'])}")
 
     # ---------- 内部 ----------
     def _window(self) -> tuple[float, float]:
@@ -169,12 +190,15 @@ class EchoGate:
         return best
 
     def _estimate_lag(self, t: float) -> None:
+        # 重试节奏：锁定前触发周期是 2.4 秒、锁定后 lag_every；"t - 周期 + 1" = 1 秒后再试（原来固定按 lag_every 算，
+        # 锁定前 t - 5 + 1 立刻又满足 ≥ 2.4，变成每帧都估一次：11-01 日志一秒 13 行 rejected，白烧 CPU）
+        period = 2.4 if self.lag_corr is None else self.lag_every
         if len(self.up_env) < 100 or len(self.seg_buf) < 2 * RATE:
-            self.t_last_lag = t - self.lag_every + 0.5
+            self.t_last_lag = t - period + 0.5
             return
         if self.recent and sum(self.recent) / len(self.recent) > 0.3:
             self.stats["lag_skip_barge"] += 1
-            self.t_last_lag = t - self.lag_every + 1.0
+            self.t_last_lag = t - period + 1.0
             return
         self.t_last_lag = t
         ups = np.array(self.up_env, dtype=np.float64)
@@ -208,7 +232,7 @@ class EchoGate:
             self.stats["lag_reject"] += 1
             if best_lag is not None and best_c >= 0.25:
                 self.log(f"echo gate lag candidate {best_lag * 1000:.0f} ms (corr {best_c:.2f}) rejected, keep {self.lag * 1000:.0f} ms")
-            self.t_last_lag = t - self.lag_every + 1.0
+            self.t_last_lag = t - period + 1.0
 
     def _accept_lag(self, lag: float, corr: float) -> bool:
         """滞后估计的接受规则（near = 候选与当前值相差 ≤ 100 ms）：
@@ -256,11 +280,13 @@ class EchoGate:
         t_frame = self.t_audio
         if not self._active(t_frame, speaking):
             self.stats["bypass"] += 1
+            self._flush_seg(t_frame)
             return pcm_bytes, "bypass"
         floor_p = (2.0 * self.floor_rms) ** 2
         g = self.g if self.g is not None else self.g_prior
         any_pass = False
         n_ref = 0
+        last_ref = None
         for i in range(len(a) // SUB):
             sub = a[i * SUB:(i + 1) * SUB].astype(np.float64)
             t_sub = t_frame - 0.06 + i * ENV_S + 0.01
@@ -270,27 +296,42 @@ class EchoGate:
             if p_ref is None:
                 continue
             n_ref += 1
+            last_ref = p_ref
             if p_ref > 1e3:
                 self.ratios.append(p_up / p_ref)
             if p_up > self.alpha * g * p_ref + floor_p:
                 any_pass = True
+        seg = self._seg
         if n_ref == 0:
             self.stats["noref"] += 1
             self.recent.append(0)
+            if seg is not None:
+                seg["noref"] += 1
             return pcm_bytes, "noref"
+        if seg is not None and last_ref is not None:
+            seg["ref"].append(last_ref)
         if len(self.ratios) >= 50:
-            self.g = float(np.quantile(np.array(self.ratios), self.g_quantile))
+            arr = np.array(self.ratios)
+            g_q = float(np.quantile(arr, self.g_quantile))
+            self.g = min(g_q, self.g_mult * float(np.median(arr))) if self.g_mult else g_q
         if (self.lag_corr is None and t_frame - self.t_last_lag >= 2.4) or t_frame - self.t_last_lag >= self.lag_every:
             self._estimate_lag(t_frame)
         vad_p = self._vad_prob(a) if any_pass or t_frame < self.hold_until else 0.0
         fresh = any_pass and vad_p >= self.vad_threshold
         if fresh:
             self.hold_until = t_frame + self.hold_s
+        p_frame = float(np.mean(a.astype(np.float64) ** 2))
         if fresh or t_frame < self.hold_until:
             self.stats["pass"] += 1
             self.recent.append(1)
+            if seg is not None:
+                seg["pass" if fresh else "hold"] += 1
+                seg["up_pass"].append(p_frame)
             return pcm_bytes, "pass" if fresh else "pass-hold"
         self.stats["echo"] += 1
         self.recent.append(0)
+        if seg is not None:
+            seg["echo"] += 1
+            seg["up_echo"].append(p_frame)
         noise = self.rng.normal(0.0, self.floor_rms, len(a)).astype(np.int16)
         return noise.tobytes(), "echo"

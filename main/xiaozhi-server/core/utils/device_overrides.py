@@ -16,6 +16,9 @@ devices:
     prompt: null                # 非空则替换 config["prompt"]
     llm: null                   # 非空且在 LLM 配置块里存在 → selected_module.LLM
     tts: null                   # 同上，TTS
+    s2s:                        # 按设备覆盖所选 S2S 配置块里的项（只对这条连接生效；brain 是级联时忽略）
+      echo_gate: false          #   例：DSP 板自带 AEC 的设备关掉服务端回声门控（本地插话依赖门控判决，会一起关掉）
+      vad_threshold: 0.6        #   例：电视旁边的设备把模型侧 VAD 门槛调高
 ```
 
 任何错误都只记日志、不抛出：配置文件坏了不能让设备连不上。
@@ -98,6 +101,22 @@ def apply_device_overrides(conn) -> dict:
                     applied[section] = name
                 else:
                     conn.logger.bind(tag=TAG).warning(f"设备覆盖的 {key}={name} 不在 {section} 配置块里，忽略")
+
+        s2s_over = info.get("s2s")
+        if isinstance(s2s_over, dict) and s2s_over:
+            name = selected.get("S2S")
+            block = (config.get("S2S") or {}).get(name) if name else None
+            if isinstance(block, dict):
+                for k, v in s2s_over.items():
+                    if isinstance(v, (dict, list)):
+                        conn.logger.bind(tag=TAG).warning(f"设备覆盖 s2s.{k} 只接受标量，忽略")
+                        continue
+                    block[str(k)] = v          # conn.config 是每条连接的深拷贝，改这里不影响别的连接
+                applied["s2s"] = sorted(str(k) for k, v in s2s_over.items() if not isinstance(v, (dict, list)))
+            else:
+                conn.logger.bind(tag=TAG).warning("设备覆盖里有 s2s 项，但这台设备没有选 S2S 大脑（级联），忽略")
+        elif s2s_over is not None:
+            conn.logger.bind(tag=TAG).warning("设备覆盖的 s2s 必须是键值表，忽略")
 
         if applied:
             conn.logger.bind(tag=TAG).info(f"已应用设备覆盖: {applied}")
