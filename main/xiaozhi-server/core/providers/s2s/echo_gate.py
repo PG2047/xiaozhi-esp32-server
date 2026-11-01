@@ -80,7 +80,7 @@ class EchoGate:
     def __init__(self, alpha=2.0, floor_rms=25.0, g_quantile=0.90, g_prior=1e-2, g_mult=8.0, lag_prior=0.20,
                  lag_min=0.0, lag_max=1.20, lag_step=0.02, lag_every=5.0, hold_s=0.30,
                  tail_back=0.12, tail_fwd=0.04, vad_threshold=0.5, vad=None, log_fn=None, seed=0,
-                 start_window: tuple[float, float] | None = (0.08, 0.65)):
+                 start_window: tuple[float, float] | None = (0.08, 0.65), near_prelock=0.25):
         """默认值来自真机：Seoul 公网入口下滞后 160～520 ms（相对本段第一帧发送时刻；Tokyo 入口 11-01 两台设备锁定在
         940～1180 ms，按部署传 lag_prior / lag_max），残余回声相对参考 −8～−50 dB 起伏，上行到达抖动中位 31 ms、最大 143 ms
         （所以音频时钟按帧序号重建）。vad=None 表示只用能量判据。
@@ -98,6 +98,7 @@ class EchoGate:
         self.hold_s = hold_s
         self.tail_back, self.tail_fwd = tail_back, tail_fwd
         self.start_window = start_window
+        self.near_prelock = near_prelock   # 锁定前"候选离先验近"的尺度（与起始窗一致）；锁定后微调用 100 ms
         self.vad_threshold = vad_threshold
         self.vad = vad
         self.t_audio = None
@@ -112,7 +113,8 @@ class EchoGate:
         self.g = None
         self.hold_until = -1.0
         self.recent = collections.deque(maxlen=100)
-        self._seg = None   # 本段诊断：各判决计数与电平，on_tts_stop 时记一行
+        self._seg = None   # 本段诊断：各判决计数与电平，尾窗过完记一行
+        self._idle_pow = collections.deque(maxlen=3000)   # 两段播放之间直通帧的功率：用户说话的电平（与残余回声、门槛比）
         self.stats = {"frames": 0, "bypass": 0, "pass": 0, "echo": 0, "lag_est": 0, "lag_reject": 0, "noref": 0,
                       "lag_skip_barge": 0}
 
@@ -127,7 +129,9 @@ class EchoGate:
         self.seg_end = None
         self.up_env.clear()
         self._flush_seg(t)   # 上一段的尾窗还没过完就接上了新回复：先把上一段的诊断记掉
-        self._seg = {"t0": t, "pass": 0, "hold": 0, "echo": 0, "noref": 0, "up_pass": [], "up_echo": [], "ref": []}
+        self._seg = {"t0": t, "pass": 0, "hold": 0, "echo": 0, "noref": 0, "vad_reject": 0,
+                     "up_pass": [], "up_echo": [], "ref": [], "ratio_echo": [], "idle": list(self._idle_pow)}
+        self._idle_pow.clear()
         if self.vad is not None:
             self.vad.reset_states()
 
@@ -149,13 +153,18 @@ class EchoGate:
         s, self._seg = self._seg, None
         if s is None:
             return
-        p50 = lambda xs: f"{math.sqrt(float(np.median(xs))):.0f}" if xs else "-"   # 功率中位数 → RMS
+        rms_q = lambda xs, q: f"{math.sqrt(float(np.quantile(xs, q))):.0f}" if xs else "-"   # 功率分位 → RMS
         ratios = np.array(self.ratios) if self.ratios else None
+        re_ = np.array(s["ratio_echo"]) if s["ratio_echo"] else None
+        # 一行看全：g 与比值池（全部 / 只算判回声的帧）、各判决数、"能量过线但 silero 不认"的帧数、
+        # 放行帧最大电平、回声帧中位 / 最大电平、参考中位电平、段前空闲期（用户说话）的 90% 电平
         self.log(f"echo gate seg {t - s['t0']:.1f}s lag={self.lag * 1000:.0f}ms corr={self.lag_corr if self.lag_corr is None else round(self.lag_corr, 2)} "
                  f"g={self.g if self.g is None else round(self.g, 4)}"
-                 f"{'' if ratios is None else f' ratio_p50={np.quantile(ratios, 0.5):.4f}'} "
-                 f"pass={s['pass']} hold={s['hold']} echo={s['echo']} noref={s['noref']} "
-                 f"up_rms pass_max={math.sqrt(max(s['up_pass'])) if s['up_pass'] else 0:.0f} echo_p50={p50(s['up_echo'])} ref_p50={p50(s['ref'])}")
+                 f"{'' if ratios is None else f' ratio_p50={np.quantile(ratios, 0.5):.4f} ratio_p90={np.quantile(ratios, 0.9):.4f}'}"
+                 f"{'' if re_ is None else f' ratio_echo_p90={np.quantile(re_, 0.9):.4f}'} "
+                 f"pass={s['pass']} hold={s['hold']} echo={s['echo']} noref={s['noref']} vad_reject={s['vad_reject']} "
+                 f"up_rms pass_max={rms_q(s['up_pass'], 1.0)} echo_p50={rms_q(s['up_echo'], 0.5)} echo_max={rms_q(s['up_echo'], 1.0)} "
+                 f"ref_p50={rms_q(s['ref'], 0.5)} idle_p90={rms_q(s['idle'], 0.9)}")
 
     # ---------- 内部 ----------
     def _window(self) -> tuple[float, float]:
@@ -241,7 +250,7 @@ class EchoGate:
           也凑得出来（11-01 真机：一次 0.51 把滞后从 220 换到 80 ms，之后整段会话门控对真正的回声视而不见）；
         - 0.25 ≤ corr < 0.5 且 near：只在锁定过之后当作微调接受。锁定前不接受，免得弱相关把先验钉死
           （11-01 真机：0.44 把 200 换成 140 ms，而真实约 1000 ms，之后再没估出来过）。"""
-        near = abs(lag - self.lag) <= 0.10
+        near = abs(lag - self.lag) <= (self.near_prelock if self.lag_corr is None else 0.10)
         if corr >= 0.7 or (corr >= 0.5 and near):
             ok = True
         elif corr >= 0.5:
@@ -281,12 +290,14 @@ class EchoGate:
         if not self._active(t_frame, speaking):
             self.stats["bypass"] += 1
             self._flush_seg(t_frame)
+            self._idle_pow.append(float(np.mean(a.astype(np.float64) ** 2)))
             return pcm_bytes, "bypass"
         floor_p = (2.0 * self.floor_rms) ** 2
         g = self.g if self.g is not None else self.g_prior
         any_pass = False
         n_ref = 0
         last_ref = None
+        frame_ratios = []
         for i in range(len(a) // SUB):
             sub = a[i * SUB:(i + 1) * SUB].astype(np.float64)
             t_sub = t_frame - 0.06 + i * ENV_S + 0.01
@@ -299,6 +310,7 @@ class EchoGate:
             last_ref = p_ref
             if p_ref > 1e3:
                 self.ratios.append(p_up / p_ref)
+                frame_ratios.append(p_up / p_ref)
             if p_up > self.alpha * g * p_ref + floor_p:
                 any_pass = True
         seg = self._seg
@@ -333,5 +345,8 @@ class EchoGate:
         if seg is not None:
             seg["echo"] += 1
             seg["up_echo"].append(p_frame)
+            seg["ratio_echo"].extend(frame_ratios)
+            if any_pass:
+                seg["vad_reject"] += 1   # 能量过线、silero 不认：插话被判回声时，看是能量不够还是 VAD 不认
         noise = self.rng.normal(0.0, self.floor_rms, len(a)).astype(np.int16)
         return noise.tobytes(), "echo"
