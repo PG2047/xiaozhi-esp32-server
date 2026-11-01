@@ -8,8 +8,11 @@
   1. 参考 = 本段第一帧发送时刻起、按设备实际播放排列的下行 PCM（断流处补零）；
   2. 滞后先验 200 ms，0～1200 ms 内按 50 ms 对数包络互相关复估（插话多时跳过）；
   3. 回声回传比 g = 播放期间"上行功率 / 参考尾窗最大功率"的 90% 分位；
-  4. 每 20 ms 子帧判：上行功率 > α·g·P_ref + (2×底噪)²，且 silero 判为人声 → 整帧放行并保持 300 ms；
-     否则整帧换成底噪水平的舒适噪声。设备不在播放、或这一帧对应的时间窗里设备没放东西时直通。
+  4. 每 20 ms 子帧判：上行功率 > α·g·P_ref + (2×底噪)²，且 silero 判为人声 → 整帧放行（判决 pass）并保持 300 ms
+     （保持期内的帧判决 pass-hold，同样放行但不算新证据）；否则整帧换成底噪水平的舒适噪声。
+     设备不在播放、或这一帧对应的时间窗里设备没放东西时直通。
+滞后：锁定前参考窗覆盖 start_window 全程（80 ms～lag_max），先验只决定"候选离当前值近不近"；估计值离当前值 100 ms 内
+     且相关 ≥ 0.5 直接采用，远的要相关 ≥ 0.7 或连续两次落在同一处才换（见 _accept_lag）。
 silero 直接用上游自带的 onnx 模型（models/snakers4_silero-vad），不装 torch；模型文件不在时只用能量判据并记一条警告。
 """
 from __future__ import annotations
@@ -74,16 +77,18 @@ class EchoGate:
                  lag_min=0.0, lag_max=1.20, lag_step=0.02, lag_every=5.0, hold_s=0.30,
                  tail_back=0.12, tail_fwd=0.04, vad_threshold=0.5, vad=None, log_fn=None, seed=0,
                  start_window: tuple[float, float] | None = (0.08, 0.65)):
-        """默认值来自真机：公网入口下滞后 160～520 ms（相对本段第一帧发送时刻），残余回声相对参考 −8～−50 dB 起伏，
-        上行到达抖动中位 31 ms、最大 143 ms（所以音频时钟按帧序号重建）。vad=None 表示只用能量判据。
+        """默认值来自真机：Seoul 公网入口下滞后 160～520 ms（相对本段第一帧发送时刻；Tokyo 入口 11-01 两台设备锁定在
+        940～1180 ms，按部署传 lag_prior / lag_max），残余回声相对参考 −8～−50 dB 起伏，上行到达抖动中位 31 ms、最大 143 ms
+        （所以音频时钟按帧序号重建）。vad=None 表示只用能量判据。
         start_window=(最短, 最长) 秒：还没估出滞后之前，参考窗放宽到覆盖这段回声延迟（会话开头先验常常不准，
-        窄窗盖不住，唤醒应答的回声漏给模型，模型去回答自己的回声）。"""
+        窄窗盖不住，唤醒应答的回声漏给模型，模型去回答自己的回声）；最长值应取到 lag_max。"""
         self.alpha = alpha
         self.floor_rms = floor_rms
         self.g_quantile = g_quantile
         self.g_prior = g_prior
         self.lag = lag_prior
         self.lag_corr = None
+        self._lag_cand = None  # 离当前值远、相关 0.5～0.7 的候选：下一次估计仍落在它附近才采用
         self.lag_min, self.lag_max, self.lag_step, self.lag_every = lag_min, lag_max, lag_step, lag_every
         self.hold_s = hold_s
         self.tail_back, self.tail_fwd = tail_back, tail_fwd
@@ -102,7 +107,8 @@ class EchoGate:
         self.g = None
         self.hold_until = -1.0
         self.recent = collections.deque(maxlen=100)
-        self.stats = {"frames": 0, "bypass": 0, "pass": 0, "echo": 0, "lag_est": 0, "noref": 0, "lag_skip_barge": 0}
+        self.stats = {"frames": 0, "bypass": 0, "pass": 0, "echo": 0, "lag_est": 0, "lag_reject": 0, "noref": 0,
+                      "lag_skip_barge": 0}
 
     # ---------- 事件 ----------
     @property
@@ -194,13 +200,35 @@ class EchoGate:
             if c > best_c:
                 best_c, best_lag = c, float(lag)
         self.stats["lag_est"] += 1
-        accept = best_lag is not None and (best_c >= 0.5 or (best_c >= 0.25 and abs(best_lag - self.lag) <= 0.10))
-        if accept:
+        if best_lag is not None and self._accept_lag(best_lag, best_c):
             old = self.lag
             self.lag, self.lag_corr = best_lag, best_c
             self.log(f"echo gate lag {old * 1000:.0f} -> {best_lag * 1000:.0f} ms (corr {best_c:.2f})")
         else:
+            self.stats["lag_reject"] += 1
+            if best_lag is not None and best_c >= 0.25:
+                self.log(f"echo gate lag candidate {best_lag * 1000:.0f} ms (corr {best_c:.2f}) rejected, keep {self.lag * 1000:.0f} ms")
             self.t_last_lag = t - self.lag_every + 1.0
+
+    def _accept_lag(self, lag: float, corr: float) -> bool:
+        """滞后估计的接受规则（near = 候选与当前值相差 ≤ 100 ms）：
+        - corr ≥ 0.7，或 corr ≥ 0.5 且 near：直接采用；
+        - corr ≥ 0.5 但远：先记为候选，下一次估计仍落在它 100 ms 内才采用。几十个候选里挑最大值，0.5 出头的相关在噪声里
+          也凑得出来（11-01 真机：一次 0.51 把滞后从 220 换到 80 ms，之后整段会话门控对真正的回声视而不见）；
+        - 0.25 ≤ corr < 0.5 且 near：只在锁定过之后当作微调接受。锁定前不接受，免得弱相关把先验钉死
+          （11-01 真机：0.44 把 200 换成 140 ms，而真实约 1000 ms，之后再没估出来过）。"""
+        near = abs(lag - self.lag) <= 0.10
+        if corr >= 0.7 or (corr >= 0.5 and near):
+            ok = True
+        elif corr >= 0.5:
+            ok = self._lag_cand is not None and abs(lag - self._lag_cand) <= 0.10
+            if not ok:
+                self._lag_cand = lag
+        else:
+            ok = corr >= 0.25 and near and self.lag_corr is not None
+        if ok:
+            self._lag_cand = None
+        return ok
 
     def _vad_prob(self, a: np.ndarray) -> float:
         if self.vad is None:
@@ -261,7 +289,7 @@ class EchoGate:
         if fresh or t_frame < self.hold_until:
             self.stats["pass"] += 1
             self.recent.append(1)
-            return pcm_bytes, "pass"
+            return pcm_bytes, "pass" if fresh else "pass-hold"
         self.stats["echo"] += 1
         self.recent.append(0)
         noise = self.rng.normal(0.0, self.floor_rms, len(a)).astype(np.int16)

@@ -218,6 +218,53 @@ def test_open_sends_session_update_then_forwards_resampled_audio():
     run_scenario(sc)
 
 
+def test_session_noise_reduction_and_gate_window():
+    """noise_reduction 透传进 session.audio.input；非法值忽略并告警；门控锁定前的参考窗盖到 gate_lag_max_ms。"""
+    loop = asyncio.new_event_loop()
+    try:
+        conn = FakeConn(loop)
+        p = make_provider(conn, "ws://unused", noise_reduction="far_field")
+        assert p._session()["audio"]["input"]["noise_reduction"] == {"type": "far_field"}
+        assert "noise_reduction" not in make_provider(conn, "ws://unused")._session()["audio"]["input"]
+        bad = make_provider(conn, "ws://unused", noise_reduction="studio")
+        assert bad.noise_reduction == "" and "noise_reduction" not in bad._session()["audio"]["input"]
+        g = make_provider(conn, "ws://unused", echo_gate=True, gate_lag_prior_ms=900, gate_lag_max_ms=1500)  # 模型文件不在：能量判据
+        assert g.gate is not None and g.gate.start_window == (0.08, 1.5) and g.gate.lag == pytest.approx(0.9)
+        assert g.gate._window() == pytest.approx((0.6, 0.82))   # 锁定前覆盖滞后 80 ms～1.5 s
+    finally:
+        loop.close()
+
+
+def test_local_barge_counts_only_fresh_pass_frames():
+    """本地插话：N 帧数的是门控新判出的人声帧（pass）；保持期（pass-hold）不算也不清零；echo / bypass 清零。"""
+    class StubGate:
+        def __init__(self, labels):
+            self.labels = list(labels)
+            self.stats, self.lag = {}, 0.2
+
+        def process(self, pcm, t, speaking):
+            return pcm, self.labels.pop(0)
+
+    async def go():
+        conn = FakeConn(asyncio.get_running_loop())
+        p = make_provider(conn, "ws://unused", local_barge_frames=3)
+        barges = []
+
+        async def fake_barge(reason):
+            barges.append((reason, len(labels) - len(p.gate.labels)))
+            p.speaker.speaking = False
+
+        p._barge = fake_barge
+        labels = ["pass", "pass-hold", "pass-hold", "pass", "echo", "pass", "pass-hold", "pass", "pass", "pass"]
+        p.gate = StubGate(labels)
+        p.speaker.speaking = True
+        for _ in labels:
+            await p.on_pcm(pcm(60))
+        # 1,-,-,2 | echo→0 | 1,-,2,3→打断（第 9 帧）；之后 speaking=False，第 10 帧清零
+        assert barges == [("local", 9)] and p.barge_run == 0
+    asyncio.run(go())
+
+
 def test_response_audio_reaches_device_with_tts_messages_and_dialogue():
     async def sc(rt, conn, url):
         p = make_provider(conn, url)
