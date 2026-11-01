@@ -335,13 +335,15 @@ def test_response_audio_reaches_device_with_tts_messages_and_dialogue():
 
 
 def test_empty_transcript_deletes_item_and_cancels_only_unvoiced_response():
-    """空转写：删掉该输入；它触发的回复还没出声就取消（后到的音频丢弃）；已出声的回复不取消。"""
+    """空转写：删掉该输入；短开口触发的回复还没出声就取消（后到的音频丢弃）；已出声的回复不取消；长开口不取消。"""
     async def sc(rt, conn, url):
         p = make_provider(conn, url)
         conn.s2s = p
         await p.open()
         await rt.wait_for("session.update")
-        # 1) 模型侧判出"开口"→ 回复已创建但还没出声 → 空转写到
+        # 1) 模型侧判出 0.6 秒的"开口"→ 回复已创建但还没出声 → 空转写到
+        await rt.emit({"type": "input_audio_buffer.speech_started", "item_id": "u_empty", "audio_start_ms": 1000})
+        await rt.emit({"type": "input_audio_buffer.speech_stopped", "item_id": "u_empty", "audio_end_ms": 1600})
         await rt.emit({"type": "response.created", "response": {"id": "r1"}})
         await rt.emit({"type": "response.output_item.added", "item": {"id": "a1", "type": "message"}})
         await rt.emit({"type": "conversation.item.input_audio_transcription.completed", "item_id": "u_empty", "transcript": " "})
@@ -362,6 +364,19 @@ def test_empty_transcript_deletes_item_and_cancels_only_unvoiced_response():
         assert dels[1]["item_id"] == "u_empty2"
         await _real_sleep(0.1)
         assert len(rt.of("response.cancel")) == 1 and p.stats["empty_transcripts"] == 2 and p.stats["empty_cancelled"] == 1
+        # 3) 开口 2.5 秒的空转写（真提问被设备侧压碎）：只删项，回复还没出声也不取消，让模型回"没听清"
+        await rt.emit({"type": "response.done", "response": {"status": "completed"}})
+        await wait_until(lambda: p.resp_done, what="上一条回复结束")
+        await rt.emit({"type": "input_audio_buffer.speech_started", "item_id": "u_long", "audio_start_ms": 9000})
+        await rt.emit({"type": "input_audio_buffer.speech_stopped", "item_id": "u_long", "audio_end_ms": 11500})
+        await rt.emit({"type": "response.created", "response": {"id": "r3"}})
+        await rt.emit({"type": "conversation.item.input_audio_transcription.completed", "item_id": "u_long", "transcript": ""})
+        dels = await rt.wait_for("conversation.item.delete", 3)
+        assert dels[2]["item_id"] == "u_long"
+        await _real_sleep(0.1)
+        assert len(rt.of("response.cancel")) == 1 and p.stats["empty_long"] == 1 and p.stats["empty_cancelled"] == 1
+        assert p.suppress is False                                   # 回复照常放给设备
+        assert p._turn_seconds("u_long") == pytest.approx(2.5) and p._turn_seconds("nope") is None
         await p.close()
     run_scenario(sc)
 

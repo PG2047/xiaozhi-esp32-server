@@ -815,6 +815,9 @@ S2S:
     local_barge: true
     local_barge_frames: 3
     local_barge_window: 6
+    # 空转写兜底：模型侧判出开口但转写为空时删掉该输入；开口短于这个秒数（假开口：噪声 / 尾音 / AGC 回升）才顺带取消还没出声的回复，
+    # 更长的当作真提问被设备侧压碎，不取消、让模型回"没听清"
+    empty_cancel_max_s: 1.5
     # 工具白名单（空 = 全部）与每会话每分钟调用上限
     tools_allow: []
     tool_calls_per_minute: 12
