@@ -803,9 +803,13 @@ S2S:
     # 残余回声门控：设备端 AEC 之后仍会漏一点播放回声，模型侧 VAD 会把它当成用户开口并打断自己。
     # 需要上游 VAD 的 silero onnx 模型（selected_module.VAD 的 model_dir）；模型不在时只用能量判据。
     echo_gate: true
+    # 回声滞后先验与搜索上限（毫秒，相对本段第一帧发送时刻）：按部署实测填。Seoul 入口 10-20 实测 160～520，Tokyo 入口 11-01 实测 940～1180。
+    # 锁定前参考窗总是覆盖 80 ms～上限全程；先验只决定估计值"离当前值近不近"（近的相关 ≥ 0.5 就采用，远的要 ≥ 0.7 或连续两次一致）
     gate_lag_prior_ms: 200
     gate_lag_max_ms: 1200
-    # 本地插话：门控连续 N 帧判为人声就本地停播（比等模型侧 VAD 快）；0 = 关闭
+    # 模型侧输入降噪：near_field（近讲）/ far_field（远场，房间里的设备一般选这个）；留空 = 不开
+    noise_reduction: far_field
+    # 本地插话：门控连续 N 帧新判出人声（不含 300 ms 保持期的帧）就本地停播（比等模型侧 VAD 快）；0 = 关闭
     local_barge: true
     local_barge_frames: 3
     # 工具白名单（空 = 全部）与每会话每分钟调用上限

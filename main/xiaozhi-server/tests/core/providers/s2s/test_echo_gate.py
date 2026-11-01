@@ -65,6 +65,10 @@ def test_echo_suppressed_and_barge_passes():
     assert _rms(out[barge]) > 0.8 * _rms(up[barge])  # 插话基本原样放行
     first = next(k for k in range(b0 // FR, len(dec)) if dec[k] == "pass")
     assert (first - b0 // FR) * 60 <= 120      # 插话判决延迟 ≤ 120 ms
+    assert dec[first] == "pass" and "pass-hold" in dec[first:]   # 新判出的人声标 pass；音节间隙 / 结束后的 300 ms 保持期标 pass-hold
+    for k, d in enumerate(dec):
+        if d == "pass-hold":
+            assert "pass" in dec[max(0, k - 5):k]                 # 保持帧只跟在 300 ms 内的新判人声帧之后
 
 
 def test_bypass_when_not_playing():
@@ -86,6 +90,31 @@ def test_noref_passthrough_during_underrun():
 def test_lag_estimate_converges():
     gate, *_ = _run(lag=0.18, barge_gain=0.0)
     assert abs(gate.lag - 0.18) <= 0.04
+
+
+def test_lag_estimate_converges_from_far_prior():
+    """先验 80 ms、真实 250 ms（离当前值超过 100 ms）：要么相关 ≥ 0.7 一次采用，要么连续两次一致后采用；6 秒内都该收敛。"""
+    gate, *_ = _run(lag=0.25, barge_gain=0.0)
+    assert abs(gate.lag - 0.25) <= 0.04 and gate.lag_corr is not None
+
+
+def test_lag_accept_rule():
+    """11-01 真机两种误锁：0.44 的弱相关把先验钉死（200→140）、一次 0.51 把滞后换到 80 ms。"""
+    gate = EchoGate(vad=None, lag_prior=0.9)
+    assert not gate._accept_lag(0.14, 0.44)             # 锁定前、远、弱：拒
+    assert not gate._accept_lag(0.84, 0.44)             # 锁定前、近、弱：也拒（0.25 档只在锁定后当微调）
+    assert not gate._accept_lag(0.08, 0.51)             # 远、0.5 出头：先记为候选
+    assert gate._lag_cand == 0.08
+    assert not gate._accept_lag(0.40, 0.55)             # 下一次落在别处：换候选，仍不采用
+    assert gate._lag_cand == 0.40
+    assert gate._accept_lag(0.46, 0.52)                 # 连续两次落在同一处（≤ 100 ms）：采用
+    assert gate._lag_cand is None
+    gate.lag, gate.lag_corr = 0.46, 0.52
+    assert gate._accept_lag(0.52, 0.30)                 # 锁定后、近、0.25 档：微调
+    assert not gate._accept_lag(0.80, 0.45)             # 锁定后、远、弱：拒
+    assert gate._accept_lag(1.00, 0.75)                 # 相关 ≥ 0.7：远也直接采用
+    gate.lag = 1.00
+    assert gate._accept_lag(0.95, 0.5)                  # 近且 ≥ 0.5：直接采用
 
 
 def test_silero_onnx_runs_with_upstream_model():

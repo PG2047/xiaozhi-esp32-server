@@ -89,6 +89,12 @@ S2S:
 它复用 `selected_module.VAD` 的 silero onnx 模型；模型不在时只用能量判据。实测只有设备 AEC、不开门控的场景能不能稳，
 建议先开着，再按日志里的 `gate` 统计决定。
 
+滞后（回声比下行晚多少到）按部署差很多：Seoul 入口时期 160～520 ms，Tokyo 入口 11-01 两台设备都锁定在 940～1180 ms。
+`gate_lag_prior_ms` 填实测值附近、`gate_lag_max_ms` 留出余量；锁定前参考窗覆盖 80 ms～上限全程，先验只决定估计值离当前值
+近不近（近的相关 ≥ 0.5 直接采用，远的要 ≥ 0.7 或连续两次一致，防止噪声里凑出来的弱相关把滞后钉错）。被拒的候选会记一行
+`echo gate lag candidate … rejected`。本地插话 `local_barge_frames` 数的是门控新判出的人声帧（判决 `pass`），300 ms 保持期
+的帧（`pass-hold`）不算；`noise_reduction: far_field` 让模型侧先做远场降噪，减少房间噪声触发模型侧 VAD。
+
 ## 附录：Mock 测试
 
 `tests/core/providers/s2s/` 里有一个假的 Realtime WebSocket 服务端（`test_openai_realtime.py`），按脚本发事件、断言 provider

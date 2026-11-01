@@ -5,7 +5,7 @@
 上行：设备 16 kHz PCM → 残余回声门控（可关）→ 16 k → 24 k → input_audio_buffer.append；模型侧 server_vad 判轮次。
 下行：response.output_audio.delta（24 kHz PCM）→ 60 ms Opus → 上游节拍器 → 设备；转写用 tts sentence_start / stt 消息给设备显示，
       并写进 conn.dialogue 供记忆使用。
-打断：模型侧 speech_started、本地门控连续 N 帧判为人声、设备 abort 三条路都汇到 handleAbortMessage → cancel()：
+打断：模型侧 speech_started、本地门控连续 N 帧新判出人声（保持期的帧不算）、设备 abort 三条路都汇到 handleAbortMessage → cancel()：
       丢掉未发的帧、response.cancel（模型侧判的不用，它自己已取消）、conversation.item.truncate 截到设备实际播到的位置。
 工具：response.output_item.done 里的 function_call → core/providers/s2s/tools.py → function_call_output → response.create。
 结束：模型最后一次真的出声回答之后 idle_close_s 秒没有新回答就关连接（设备回待机）；上游中途断开也关连接，
@@ -58,12 +58,20 @@ class S2SProvider(S2SProviderBase):
         self.wake_greeting = c.get("wake_greeting", "用户刚叫醒你，只用两三个字回应，比如“我在”。")
         self.local_barge_frames = int(c.get("local_barge_frames", 3)) if c.get("local_barge", True) else 0
         self.log_text = bool(c.get("log_text", False))
+        # 模型侧输入降噪：near_field（近讲）/ far_field（远场）；其它值忽略
+        self.noise_reduction = str(c.get("noise_reduction") or "").strip()
+        if self.noise_reduction and self.noise_reduction not in ("near_field", "far_field"):
+            self.logger.bind(tag=TAG).warning(f"noise_reduction={self.noise_reduction} 不是 near_field / far_field，忽略")
+            self.noise_reduction = ""
 
         gate = None
+        self.lag_prior_ms = int(c.get("gate_lag_prior_ms", 200))
+        self.lag_max_ms = int(c.get("gate_lag_max_ms", 1200))
         if c.get("echo_gate", True):
+            # 锁定滞后之前，参考窗要盖住整个搜索范围（80 ms～上限），否则先验离真值远时开头几秒的回声漏给模型
             gate = EchoGate(vad=load_vad(self._vad_model_path()),
-                            lag_prior=float(c.get("gate_lag_prior_ms", 200)) / 1000,
-                            lag_max=float(c.get("gate_lag_max_ms", 1200)) / 1000)
+                            lag_prior=self.lag_prior_ms / 1000, lag_max=self.lag_max_ms / 1000,
+                            start_window=(0.08, self.lag_max_ms / 1000))
         self.gate = gate
         self.speaker = DeviceSpeaker(conn, getattr(conn, "sample_rate", RT_RATE), gate=gate)
         self.tools = ToolRunner(conn, conn.logger, per_minute=int(c.get("tool_calls_per_minute", 12)),
@@ -127,6 +135,11 @@ class S2SProvider(S2SProviderBase):
         tools = self._tool_list()
         instructions = self._instructions()
         self._session_sig = (instructions, tuple(sorted(t["name"] for t in tools)))
+        audio_in = {"format": {"type": "audio/pcm", "rate": RT_RATE},
+                    "transcription": {"model": self.transcribe_model},
+                    "turn_detection": self._turn_detection()}
+        if self.noise_reduction:
+            audio_in["noise_reduction"] = {"type": self.noise_reduction}
         return {
             "type": "realtime",
             "instructions": instructions,
@@ -134,9 +147,7 @@ class S2SProvider(S2SProviderBase):
             "tool_choice": "auto",
             "output_modalities": ["audio"],
             "audio": {
-                "input": {"format": {"type": "audio/pcm", "rate": RT_RATE},
-                          "transcription": {"model": self.transcribe_model},
-                          "turn_detection": self._turn_detection()},
+                "input": audio_in,
                 "output": {"format": {"type": "audio/pcm", "rate": RT_RATE}, "voice": self.voice},
             },
         }
@@ -166,7 +177,9 @@ class S2SProvider(S2SProviderBase):
         self._arm_idle()
         self.logger.bind(tag=TAG).info(
             f"Realtime 会话已建立 model={self.model} turn={self.turn_detection_type} "
-            f"echo_gate={'on' if self.gate else 'off'} in {time.monotonic() - t0:.2f}s")
+            f"echo_gate={'on' if self.gate else 'off'} noise_reduction={self.noise_reduction or 'off'} "
+            f"local_barge_frames={self.local_barge_frames} lag_prior_ms={self.lag_prior_ms} lag_max_ms={self.lag_max_ms} "
+            f"in {time.monotonic() - t0:.2f}s")
 
     def after_components_ready(self) -> None:
         asyncio.run_coroutine_threadsafe(self._after_ready(), self.conn.loop)
@@ -216,12 +229,14 @@ class S2SProvider(S2SProviderBase):
         if self.gate is not None:
             pcm16k, info = self.gate.process(pcm16k, time.monotonic(), self.speaker.speaking)
             if self.local_barge_frames:
-                if self.speaker.speaking and info.startswith("pass"):
+                # 只数门控新判出的人声帧（pass）；保持期的帧（pass-hold）既不算证据也不清零——否则一帧 pass 带出的
+                # 300 ms 保持就凑够了 N 帧，N 形同虚设（11-01 真机：模型开口 240～420 ms 就被一声响动本地打断）
+                if not (self.speaker.speaking and info.startswith("pass")):
+                    self.barge_run = 0
+                elif info == "pass":
                     self.barge_run += 1
                     if self.barge_run == self.local_barge_frames:
                         await self._barge("local")
-                else:
-                    self.barge_run = 0
         # 设备 listen start 之前（唤醒词那几十帧）的音频不送模型：否则模型侧 VAD 把"你好小智"当一轮提问，唤醒后答两次。
         # 状态记在连接上（listenMessageHandler 维护）：provider 建成常晚于 listen start，自己记会错过它
         if not getattr(self.conn, "client_is_listening", False):
