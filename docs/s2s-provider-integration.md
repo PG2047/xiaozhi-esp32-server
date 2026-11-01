@@ -97,6 +97,9 @@ S2S:
 `echo gate seg …`（g、各判决数、放行 / 回声帧的电平），调门控看它。本地插话 `local_barge_frames` 数的是门控新判出的人声帧
 （判决 `pass`），300 ms 保持期的帧（`pass-hold`）不算，按最近 `local_barge_window` 帧（默认 2N）的滑窗数，不要求连续；`noise_reduction: far_field` 让模型侧先做远场降噪，减少房间噪声触发
 模型侧 VAD。按设备调这些项用 `data/devices.yaml` 的 `s2s:`（见 docs/device-overrides.md）。
+空转写兜底：模型侧判出开口但转写为空（噪声、尾音、AGC 回升）时删掉该输入；开口短于 `empty_cancel_max_s`（默认 1.5 秒）才顺带取消
+还没出声的回复，更长的当作真提问被设备侧压碎、不取消，让模型回"没听清"。日志 `空转写：开口 N s …`，统计 `empty_transcripts /
+empty_cancelled / empty_long`。
 
 ## 附录：Mock 测试
 

@@ -64,6 +64,10 @@ class S2SProvider(S2SProviderBase):
         # 被几帧回声判决打散，没触发（silero 对双讲时被 DSP 处理过的人声时认时不认）
         self.local_barge_window = max(self.local_barge_frames, int(c.get("local_barge_window", 2 * self.local_barge_frames)))
         self._barge_marks = collections.deque(maxlen=max(1, self.local_barge_window))
+        # 空转写兜底只取消"短开口"触发的回复：假开口（噪声、尾音、AGC 回升）通常不到 1 秒；真提问被设备侧压碎成空转写时开口有
+        # 2～4 秒，这时取消回复用户听到的是沉默，不如让模型回"没听清"（11-01 15:27 真人测试：提问被 XMOS 双讲压碎后答案被吞掉）
+        self.empty_cancel_max_s = float(c.get("empty_cancel_max_s", 1.5))
+        self._turn_ms: collections.OrderedDict[str, list] = collections.OrderedDict()   # item_id → [audio_start_ms, audio_end_ms]
         self.log_text = bool(c.get("log_text", False))
         # 模型侧输入降噪：near_field（近讲）/ far_field（远场）；其它值忽略
         self.noise_reduction = str(c.get("noise_reduction") or "").strip()
@@ -109,7 +113,7 @@ class S2SProvider(S2SProviderBase):
         self.t_response_requested = None
         self.stats = {"turns": 0, "cancelled": 0, "speech_started": 0, "barge_server": 0, "barge_local": 0,
                       "barge_device": 0, "up_frames": 0, "tools": 0, "first_audio_ms": [],
-                      "empty_transcripts": 0, "empty_cancelled": 0}
+                      "empty_transcripts": 0, "empty_cancelled": 0, "empty_long": 0}
 
     # ---------- 会话 ----------
     def _vad_model_path(self):
@@ -327,6 +331,7 @@ class S2SProvider(S2SProviderBase):
             self.in_speech = True
             conn.last_activity_time = time.time() * 1000
             self.stats["speech_started"] += 1
+            self._note_turn(ev.get("item_id"), ev.get("audio_start_ms"), None)
             if (self.speaker.speaking or self.speaker.frames_queued > self.speaker.frames_sent) and not self.suppress:
                 await self._barge("server")
             await self._maybe_refresh_tools()  # 用户开口到模型决定调工具之间还有几百毫秒，够把新注册的工具同步上去
@@ -334,6 +339,7 @@ class S2SProvider(S2SProviderBase):
             self.in_speech = False
             self.t_speech_stopped = time.monotonic()
             conn.last_activity_time = time.time() * 1000
+            self._note_turn(ev.get("item_id"), None, ev.get("audio_end_ms"))
         elif et == "response.created":
             self.resp_done = False
             self.suppress = False
@@ -399,20 +405,46 @@ class S2SProvider(S2SProviderBase):
             else:
                 self.logger.bind(tag=TAG).warning(msg)
 
+    def _note_turn(self, item_id, start_ms, end_ms) -> None:
+        """按 item_id 记模型侧判出的开口起止（毫秒，缓冲区时间轴），空转写到了用它算开口时长。只留最近 32 条。"""
+        if not item_id:
+            return
+        rec = self._turn_ms.setdefault(item_id, [None, None])
+        if start_ms is not None:
+            rec[0] = start_ms
+        if end_ms is not None:
+            rec[1] = end_ms
+        while len(self._turn_ms) > 32:
+            self._turn_ms.popitem(last=False)
+
+    def _turn_seconds(self, item_id):
+        rec = self._turn_ms.get(item_id) if item_id else None
+        if not rec or rec[0] is None or rec[1] is None:
+            return None
+        return max(0.0, (rec[1] - rec[0]) / 1000.0)
+
     async def _on_empty_transcript(self, item_id) -> None:
         """模型侧 VAD 判出"开口"但转写不出一个字：房间里的响动、设备 AGC 回升、播完后的尾音（11-01 真机：每次播完后
         1～7 秒出现一两次，模型回"不知道你想表达什么"）。把这条空输入从会话里删掉，别让它留在上下文里；
-        它触发的回复若还没出声就一并取消。已经出声的不动——转写是异步的，这时在播的也可能是别的回复，掐断更怪。"""
+        它触发的回复若还没出声、且开口很短（< empty_cancel_max_s）就一并取消。开口长的多半是真提问被设备侧压碎
+        （11-01 15:27：XMOS 双讲把近端压到 rms 450～750），这时不取消，让模型回"没听清"，用户知道要重说。
+        已经出声的不动——转写是异步的，这时在播的也可能是别的回复，掐断更怪。时长不明（没收到起止事件）按短开口处理。"""
         self.stats["empty_transcripts"] += 1
+        dur = self._turn_seconds(item_id)
+        dur_txt = "?" if dur is None else f"{dur:.1f}"
         if item_id:
             await self._send({"type": "conversation.item.delete", "item_id": item_id})
-        if not self.resp_done and not self.speaker.speaking and self.speaker.frames_sent == 0:
+        unvoiced = not self.resp_done and not self.speaker.speaking and self.speaker.frames_sent == 0
+        if dur is not None and dur >= self.empty_cancel_max_s:
+            self.stats["empty_long"] += 1
+            self.logger.bind(tag=TAG).info(f"空转写：开口 {dur_txt} s ≥ {self.empty_cancel_max_s:g} s，当作真提问被压碎：只删除该输入，让模型回应")
+        elif unvoiced:
             self.suppress = True
             await self._send({"type": "response.cancel"})
             self.stats["empty_cancelled"] += 1
-            self.logger.bind(tag=TAG).info("空转写：删除该输入并取消尚未出声的回复")
+            self.logger.bind(tag=TAG).info(f"空转写：开口 {dur_txt} s，删除该输入并取消尚未出声的回复")
         else:
-            self.logger.bind(tag=TAG).info("空转写：删除该输入（回复已出声或没有进行中的回复，不取消）")
+            self.logger.bind(tag=TAG).info(f"空转写：开口 {dur_txt} s，删除该输入（回复已出声或没有进行中的回复，不取消）")
 
     # ---------- 工具 ----------
     async def _run_tool(self, item: dict) -> None:
