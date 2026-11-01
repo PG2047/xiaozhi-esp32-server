@@ -260,7 +260,7 @@ def test_remembered_lag_becomes_next_sessions_prior():
 
 
 def test_local_barge_counts_only_fresh_pass_frames():
-    """本地插话：N 帧数的是门控新判出的人声帧（pass）；保持期（pass-hold）不算也不清零；echo / bypass 清零。"""
+    """本地插话：最近 2N 帧里数门控新判出的人声帧（pass）；保持期（pass-hold）和回声判决记 0 但不清窗；停播即清窗。"""
     class StubGate:
         def __init__(self, labels):
             self.labels = list(labels)
@@ -284,8 +284,28 @@ def test_local_barge_counts_only_fresh_pass_frames():
         p.speaker.speaking = True
         for _ in labels:
             await p.on_pcm(pcm(60))
-        # 1,-,-,2 | echo→0 | 1,-,2,3→打断（第 9 帧）；之后 speaking=False，第 10 帧清零
-        assert barges == [("local", 9)] and p.barge_run == 0
+        # 窗 6 帧：第 6 帧时窗内 pass = 第 1、4、6 帧 = 3 → 打断（保持期与回声判决都不清窗）；之后 speaking=False，窗清空
+        assert barges == [("local", 6)] and len(p._barge_marks) == 0
+        # 真人测试那种"人声被回声判决打散"的序列（11-01 15:27：13 帧 pass 夹着 echo）：连续计数永远到不了 5，滑窗能
+        q = make_provider(conn, "ws://unused", local_barge_frames=5)          # 窗默认 10
+        q._barge = fake_barge
+        barges.clear()
+        labels2 = ["pass", "pass", "echo", "pass", "pass", "echo", "pass", "pass", "echo"]
+        q.gate = StubGate(labels2)
+        q.speaker.speaking = True
+        for _ in labels2:
+            await q.on_pcm(pcm(60))
+        assert [r for r, _ in barges] == ["local"] and q.local_barge_window == 10
+        # 窗外的旧帧会滑出：稀疏的 pass 不触发
+        r = make_provider(conn, "ws://unused", local_barge_frames=3, local_barge_window=4)
+        r._barge = fake_barge
+        barges.clear()
+        labels3 = ["pass", "echo", "echo", "echo", "pass", "echo", "echo", "echo", "pass"]
+        r.gate = StubGate(labels3)
+        r.speaker.speaking = True
+        for _ in labels3:
+            await r.on_pcm(pcm(60))
+        assert barges == []
     asyncio.run(go())
 
 

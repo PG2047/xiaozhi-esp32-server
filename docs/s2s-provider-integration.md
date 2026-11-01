@@ -95,7 +95,7 @@ S2S:
 `echo gate lag candidate … rejected`。锁定前参考窗只在先验 ±250 ms 内找回声（窗取的是窗内最大功率，开得越宽门槛越高），
 会话结束时按 device-id 记住锁定值，同一台设备下一段会话直接拿它当先验（日志 `lag_prior_ms=…(记忆)`）。每段播放结束记一行
 `echo gate seg …`（g、各判决数、放行 / 回声帧的电平），调门控看它。本地插话 `local_barge_frames` 数的是门控新判出的人声帧
-（判决 `pass`），300 ms 保持期的帧（`pass-hold`）不算；`noise_reduction: far_field` 让模型侧先做远场降噪，减少房间噪声触发
+（判决 `pass`），300 ms 保持期的帧（`pass-hold`）不算，按最近 `local_barge_window` 帧（默认 2N）的滑窗数，不要求连续；`noise_reduction: far_field` 让模型侧先做远场降噪，减少房间噪声触发
 模型侧 VAD。按设备调这些项用 `data/devices.yaml` 的 `s2s:`（见 docs/device-overrides.md）。
 
 ## 附录：Mock 测试
