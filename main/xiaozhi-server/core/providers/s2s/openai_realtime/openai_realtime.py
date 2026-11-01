@@ -78,6 +78,7 @@ class S2SProvider(S2SProviderBase):
             prior = self.lag_prior_ms / 1000
             gate = EchoGate(vad=load_vad(self._vad_model_path()),
                             lag_prior=prior, lag_max=self.lag_max_ms / 1000, g_mult=float(c.get("gate_g_mult", 8.0)),
+                            near_prelock=LAG_WINDOW_S,
                             start_window=(max(0.08, prior - LAG_WINDOW_S), min(self.lag_max_ms / 1000, prior + LAG_WINDOW_S)))
         self.gate = gate
         self.speaker = DeviceSpeaker(conn, getattr(conn, "sample_rate", RT_RATE), gate=gate)

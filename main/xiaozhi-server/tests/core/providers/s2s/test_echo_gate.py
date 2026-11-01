@@ -122,12 +122,14 @@ def test_segment_diagnostic_line():
     gate, *_ = _run(log_fn=logs.append)
     seg = [l for l in logs if l.startswith("echo gate seg")]
     assert len(seg) == 1 and "g=" in seg[0] and "pass=" in seg[0] and "echo=" in seg[0] and "ref_p50=" in seg[0]
+    assert "ratio_echo_p90=" in seg[0] and "vad_reject=" in seg[0] and "echo_max=" in seg[0] and "idle_p90=" in seg[0]
     assert "pass=0" not in seg[0]                                   # 插话段里有放行帧
 
 
 def test_lag_accept_rule():
     """11-01 真机两种误锁：0.44 的弱相关把先验钉死（200→140）、一次 0.51 把滞后换到 80 ms。"""
     gate = EchoGate(vad=None, lag_prior=0.9)
+    assert gate._accept_lag(0.70, 0.52)                 # 锁定前：先验 ±250 ms 内（与起始窗一致）、corr ≥ 0.5 就采用
     assert not gate._accept_lag(0.14, 0.44)             # 锁定前、远、弱：拒
     assert not gate._accept_lag(0.84, 0.44)             # 锁定前、近、弱：也拒（0.25 档只在锁定后当微调）
     assert not gate._accept_lag(0.08, 0.51)             # 远、0.5 出头：先记为候选
