@@ -90,6 +90,8 @@ class S2SProvider(S2SProviderBase):
         self.empty_cancel_max_s = float(c.get("empty_cancel_max_s", 1.5))
         self._turn_ms: collections.OrderedDict[str, list] = collections.OrderedDict()   # item_id → [audio_start_ms, audio_end_ms]
         self.log_text = bool(c.get("log_text", False))
+        # 按设备追加到提示词末尾的一段话（登记表 s2s: 里写字符串，与 Live 同名同义），用来试附和 / 旁人这类轮次规则
+        self.instructions_suffix = str(c.get("instructions_suffix") or "").strip()
         # 模型侧输入降噪：near_field（近讲）/ far_field（远场）；其它值忽略
         self.noise_reduction = str(c.get("noise_reduction") or "").strip()
         if self.noise_reduction and self.noise_reduction not in ("near_field", "far_field"):
@@ -171,7 +173,10 @@ class S2SProvider(S2SProviderBase):
         # 建成那一刻 conn.prompt 往往还是 None（快速提示词在之后才设置）：先用配置里的原始 prompt，别让第一轮没有人设
         instructions = (getattr(self.conn, "prompt", None) or (self.conn.config.get("prompt") if isinstance(getattr(self.conn, "config", None), dict) else None)
                         or self.config.get("instructions") or "")
-        return str(instructions)
+        instructions = str(instructions)
+        if self.instructions_suffix:
+            instructions = f"{instructions}\n\n{self.instructions_suffix}"
+        return instructions
 
     def _session(self) -> dict:
         tools = self._tool_list()

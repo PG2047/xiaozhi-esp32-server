@@ -250,6 +250,22 @@ def test_session_transcription_hints():
         loop.close()
 
 
+def test_instructions_suffix_appended():
+    """instructions_suffix 接在提示词后面（建会话和之后的同步都带）；留空不变。"""
+    async def sc(rt, conn, url):
+        p = make_provider(conn, url, instructions_suffix=" 附和时继续说。 ")
+        conn.s2s = p
+        await p.open()
+        (upd,) = await rt.wait_for("session.update")
+        assert upd["session"]["instructions"] == "你是测试助手\n\n附和时继续说。"
+        await p._refresh_session()
+        (_, upd2) = await rt.wait_for("session.update", 2)
+        assert upd2["session"]["instructions"] == "你是测试助手\n\n附和时继续说。"
+        assert make_provider(conn, url)._instructions() == "你是测试助手"
+        await p.close()
+    run_scenario(sc)
+
+
 def test_remembered_lag_becomes_next_sessions_prior():
     """会话结束时把锁定的滞后按 device-id 记住；同一台设备下一段会话用它当先验、起始窗围着它开。"""
     from core.providers.s2s.openai_realtime import openai_realtime as mod
