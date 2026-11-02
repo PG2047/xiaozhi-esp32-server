@@ -789,6 +789,10 @@ S2S:
     voice: marin
     # 用户说话的转写模型（给设备显示、写进对话历史和记忆）
     transcribe_model: gpt-4o-mini-transcribe
+    # 转写提示（可选，留空不发）：language 用 ISO-639-1 代码（zh / en …），prompt 写专名或唤醒词，帮转写认对名字。
+    # 只影响转写文本，不影响模型听到的音频和回答
+    transcribe_language: ""
+    transcribe_prompt: ""
     # 轮次检测：server_vad（静音满 vad_silence_ms 判停）或 semantic_vad（按语义判，vad_eagerness: low/medium/high/auto）
     turn_detection: server_vad
     vad_threshold: 0.5

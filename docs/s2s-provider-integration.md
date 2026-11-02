@@ -100,6 +100,8 @@ S2S:
 空转写兜底：模型侧判出开口但转写为空（噪声、尾音、AGC 回升）时删掉该输入；开口短于 `empty_cancel_max_s`（默认 1.5 秒）才顺带取消
 还没出声的回复，更长的当作真提问被设备侧压碎、不取消，让模型回"没听清"。日志 `空转写：开口 N s …`，统计 `empty_transcripts /
 empty_cancelled / empty_long`。
+转写提示：`transcribe_language`（ISO-639-1，如 `zh`）和 `transcribe_prompt`（专名，如唤醒词"小智"）留空不发，填了透传进
+`session.audio.input.transcription`。只影响转写文本（设备显示、对话历史），不影响模型听到的音频；用来避免噪声被转成别的语言、名字被写错。
 
 ## 附录：Mock 测试
 

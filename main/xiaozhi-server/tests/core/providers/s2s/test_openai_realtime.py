@@ -236,6 +236,20 @@ def test_session_noise_reduction_and_gate_window():
         loop.close()
 
 
+def test_session_transcription_hints():
+    """transcribe_language / transcribe_prompt 填了才发；留空时 transcription 只有 model。"""
+    loop = asyncio.new_event_loop()
+    try:
+        conn = FakeConn(loop)
+        p = make_provider(conn, "ws://unused", transcribe_language="zh", transcribe_prompt="小智")
+        assert p._session()["audio"]["input"]["transcription"] == {
+            "model": "gpt-4o-mini-transcribe", "language": "zh", "prompt": "小智"}
+        plain = make_provider(conn, "ws://unused", transcribe_language="  ", transcribe_prompt=None)
+        assert plain._session()["audio"]["input"]["transcription"] == {"model": "gpt-4o-mini-transcribe"}
+    finally:
+        loop.close()
+
+
 def test_remembered_lag_becomes_next_sessions_prior():
     """会话结束时把锁定的滞后按 device-id 记住；同一台设备下一段会话用它当先验、起始窗围着它开。"""
     from core.providers.s2s.openai_realtime import openai_realtime as mod
