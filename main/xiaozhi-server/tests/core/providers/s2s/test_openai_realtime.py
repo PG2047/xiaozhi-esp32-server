@@ -404,6 +404,34 @@ def test_server_detected_barge_in_truncates_without_cancel():
     run_scenario(sc)
 
 
+def test_second_barge_on_same_response_is_not_cancelled_again():
+    """模型侧 speech_started 和设备侧 abort 同一秒到：只打断一次，不重复发 response.cancel / truncate；下一条回复照常可打断。"""
+    async def sc(rt, conn, url):
+        p = make_provider(conn, url)
+        conn.s2s = p
+        await p.open()
+        await rt.wait_for("session.update")
+        await _stream_response(rt, frames=20)
+        await wait_until(lambda: p.speaker.frames_sent >= 5, what="设备收到预缓冲帧")
+        await rt.emit({"type": "input_audio_buffer.speech_started", "item_id": "u1", "audio_start_ms": 1000})
+        await rt.wait_for("conversation.item.truncate")
+        await handleAbortMessage(conn)                                # 设备侧 abort 紧跟着到
+        await _real_sleep(0.1)
+        assert "response.cancel" not in rt.types() and len(rt.of("conversation.item.truncate")) == 1
+        assert p.stats["barge_server"] == 1 and p.stats["barge_device"] == 0 and p.stats["barge_dup"] == 1
+        await rt.emit({"type": "response.done", "response": {"status": "cancelled", "status_details": {"reason": "turn_detected"}}})
+        # 下一条回复：设备 abort 两次 → 只取消一次
+        await _stream_response(rt, frames=20, item_id="item_2")
+        await wait_until(lambda: p.speaker.frames_sent >= 5, what="第二条回复出声")
+        await handleAbortMessage(conn)
+        await handleAbortMessage(conn)
+        await _real_sleep(0.1)
+        assert len(rt.of("response.cancel")) == 1 and len(rt.of("conversation.item.truncate")) == 2
+        assert p.stats["barge_device"] == 1 and p.stats["barge_dup"] == 2
+        await p.close()
+    run_scenario(sc)
+
+
 def test_device_abort_cancels_response_and_truncates():
     async def sc(rt, conn, url):
         p = make_provider(conn, url)
