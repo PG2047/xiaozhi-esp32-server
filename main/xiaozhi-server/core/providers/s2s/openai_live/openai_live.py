@@ -55,6 +55,8 @@ class S2SProvider(S2SProviderBase):
         self.instructions_suffix = str(c.get("instructions_suffix") or "").strip()
         # 上行开口 / 收声日志（量插话和应答延迟用，onset_rms: 0 关掉）
         self.trace = UplinkTrace(conn.logger, TAG, "Live", int(c.get("onset_rms", 800)))
+        self.resume_after_user_s = float(c.get("resume_after_user_ms", 300)) / 1000
+        self.resume_max_wait_s = float(c.get("resume_max_wait_ms", 1500)) / 1000
 
         gate = None
         if c.get("echo_gate", True):
@@ -70,7 +72,8 @@ class S2SProvider(S2SProviderBase):
         self.closing = False
         self.in_seg = False        # 正在把一段回复发给设备
         self.silence_ms = 0.0      # 段内连续静音时长
-        self.suppress = False      # 设备 abort 后丢掉本段剩下的音频，直到模型静音
+        self.suppress = False      # 设备 abort 后丢掉模型的音频，直到用户说完、模型也静音（见 _may_resume）
+        self.t_abort = 0.0
         self.in_text = []
         self.out_text = []
         self._idle_handle = None
@@ -169,7 +172,8 @@ class S2SProvider(S2SProviderBase):
     async def cancel(self, reason: str) -> None:
         """只会来自设备 abort（handleAbortMessage）：模型侧的插话 Live 自己处理，表现为下行变静音。"""
         played = self.speaker.played_ms()
-        self.suppress = self.in_seg
+        self.suppress = True
+        self.t_abort = time.time()
         await self._end_segment(interrupted=True)
         self.stats["barge_device"] += 1
         self.logger.bind(tag=TAG).info(f"打断（{reason}）：本段已播 {played} ms t={time.time():.3f}")
@@ -218,8 +222,8 @@ class S2SProvider(S2SProviderBase):
         ms = len(pcm) / 2 / LIVE_RATE * 1000
         loud = audioop.rms(pcm, 2) > self.speech_rms
         if not loud:
-            if self.suppress:
-                self.suppress = False  # 模型停下了：下一次开口是新的一段
+            if self.suppress and self._may_resume():
+                self.suppress = False  # 用户说完了、模型也停了：下一次开口是对用户的回应
             if not self.in_seg:
                 return
             self.silence_ms += ms
@@ -236,6 +240,16 @@ class S2SProvider(S2SProviderBase):
         if self.down_rs is not None:
             pcm = self.down_rs.process(pcm)
         await self.speaker.push(pcm)
+
+    def _may_resume(self) -> bool:
+        """设备打断之后什么时候恢复播放。11-02 R3：打断 0.1 秒后模型还在接着数（"十七，十八，好"），
+        遇到第一个静音帧就恢复会把这几个数在用户还没说完时放出来。所以要等用户说完（上行收声 resume_after_user_s 秒），
+        打断后一直没听到用户开口（误打断）就等 resume_max_wait_s 秒。"""
+        now = time.time()
+        tr = self.trace
+        if tr.t_last >= self.t_abort - 0.5:          # 打断前后用户在说话
+            return not tr.loud and now - tr.t_last >= self.resume_after_user_s
+        return now - self.t_abort >= self.resume_max_wait_s
 
     async def _begin_segment(self) -> None:
         self.in_seg = True
