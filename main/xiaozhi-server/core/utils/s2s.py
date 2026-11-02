@@ -46,12 +46,52 @@ async def drain_pending_texts(conn) -> None:
         await conn.s2s.on_text(t)
 
 
+EARLY_AUDIO_MAX = 60   # 约 3.6 秒（60 ms 一包）
+
+
+def s2s_buffer_early_audio(conn, packet: bytes) -> bool:
+    """选了 S2S、provider 还没建成（唤醒后约 1 秒）时先攒设备的 Opus 包；返回 True = 已攒，调用方别再往下走。
+    建成之后由 drain_early_audio 按原顺序补送给愿意要的 provider（Live：wants_early_audio），
+    这样"你好小智，一年有几个月"一口气说完时问题不丢（11-03 R22）；不要的（Realtime）照旧丢掉。attach 结束后不再攒。"""
+    if getattr(conn, "_s2s_attach_done", False) or getattr(conn, "conn_from_mqtt_gateway", False) or not s2s_selected(conn):
+        return False
+    if not getattr(conn, "client_is_listening", False):
+        return True   # listen start 之前是设备补发的唤醒词音频：照旧丢掉，不然模型听到"你好小智"会自己再打一遍招呼（11-03 R23）
+    buf = getattr(conn, "_s2s_early_audio", None)
+    if buf is None:
+        buf = conn._s2s_early_audio = []
+    if len(buf) < EARLY_AUDIO_MAX:
+        buf.append(packet)
+    return True
+
+
+async def drain_early_audio(conn) -> None:
+    """在连接的事件循环上、处理建成后第一个音频包之前调用：先把攒下的包解码交给 provider，保证顺序。"""
+    buf = getattr(conn, "_s2s_early_audio", None)
+    if not buf:
+        return
+    conn._s2s_early_audio = []
+    if conn.s2s is None or not getattr(conn.s2s, "wants_early_audio", False):
+        return
+    for packet in buf:
+        pcm = conn._decode_opus_packet(packet)
+        if pcm:
+            await conn.s2s.on_pcm(pcm)
+
+
 def attach_s2s(conn):
     """在 ConnectionHandler._initialize_components（执行器线程）里调用。
 
     selected_module.S2S 没填 → None（原版级联）。填了就创建 provider 并在连接的事件循环上打开上游会话，
     整段限时 connect_timeout_s + 1 秒；任何失败都返回 None 并记一条警告，连接照常走级联，设备无感。
     """
+    try:
+        return _attach_s2s(conn)
+    finally:
+        conn._s2s_attach_done = True   # 之后的音频直达 provider（或走级联），不再攒
+
+
+def _attach_s2s(conn):
     selected = (conn.config.get("selected_module") or {}).get("S2S")
     if not selected:
         return None

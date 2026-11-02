@@ -37,6 +37,19 @@ TAG = __name__
 
 LIVE_RATE = 16000       # 上下行都用 16 kHz（Live 支持 16 k / 24 k）
 WAKE_TRIGGER = "嘿，你好呀"
+TTS_RATE = 24000        # /v1/audio/speech 的 pcm 是 24 kHz 16-bit 单声道
+_GREETING_CACHE: dict[tuple, bytes] = {}   # (voice, 文本, 设备采样率) → PCM，进程内共用：只有第一次唤醒要等 TTS
+
+
+def _trim_silence(pcm: bytes, rate: int, rms: int = 200, pad_ms: int = 40) -> bytes:
+    """裁掉首尾低于 rms 的 10 ms 帧，两头各留 pad_ms。"""
+    step = rate // 100 * 2
+    frames = [pcm[i:i + step] for i in range(0, len(pcm) - len(pcm) % 2, step)]
+    loud = [i for i, f in enumerate(frames) if len(f) >= 2 and audioop.rms(f, 2) > rms]
+    if not loud:
+        return pcm
+    pad = pad_ms // 10
+    return b"".join(frames[max(0, loud[0] - pad):loud[-1] + 1 + pad])
 
 
 class S2SProvider(S2SProviderBase):
@@ -50,6 +63,20 @@ class S2SProvider(S2SProviderBase):
         # Live 没有"让模型先开口"的入口（session.instructions.append 只对 delegation 有效，11-02 实测）：
         # 默认把设备 listen start 之前的音频（唤醒词那几十帧）也送给模型，让它自己听到"你好小智"再回应
         self.forward_before_listen = bool(c.get("forward_before_listen", True))
+        # 唤醒应答：Live 没法让模型先开口（XVF3800 走"服务端收唤醒词音频"的路径，固件也不播提示音），
+        # 所以用同一把 key 的 TTS 合成一句（默认"我在。"、同一个音色）缓存起来，唤醒时直接播。空串关掉
+        self.wake_greeting_text = str(c.get("wake_greeting_text", "我在。") or "").strip()
+        self.greeting_tts_model = str(c.get("greeting_tts_model") or "gpt-4o-mini-tts")
+        self.tts_url = str(c.get("tts_url") or "https://api.openai.com/v1/audio/speech")
+        self._greeting_task = None
+        # 告别：Live 说完"再见"不会自己结束会话（11-03 R19：要等 45 秒空闲关闭）。用户这句里有告别词、
+        # 模型这段回复又短又是告别，就在这段播完后关连接；工具（handle_exit_intent）置了 close_after_chat 也照办
+        # 建成前攒下的设备音频要不要补送（core/utils/s2s.drain_early_audio）："你好小智，……"连着说时问题在里面
+        self.wants_early_audio = bool(c.get("early_audio", True))
+        self.close_on_goodbye = bool(c.get("close_on_goodbye", True))
+        self.goodbye_words = tuple(c.get("goodbye_words") or ("再见", "拜拜", "回头见", "下次聊"))
+        self.last_user_text = ""
+        self._t_close_flag = None
         self.connect_timeout_s = float(c.get("connect_timeout_s", 4))
         self.idle_close_s = float(c.get("idle_close_s", 45))
         self.speech_rms = int(c.get("speech_rms", 30))          # 下行帧 RMS 超过它算"在说话"（模型静音时发的是全零）
@@ -58,6 +85,7 @@ class S2SProvider(S2SProviderBase):
         # 工具：tools: false 关掉 delegation；后台模型默认 gpt-6-luna（官方示例）
         self.tools_enabled = bool(c.get("tools", True))
         self.delegation_model = str(c.get("delegation_model") or "gpt-6-luna")
+        self.delegation_reasoning = str(c.get("delegation_reasoning") or "").strip()   # 后台推理强度（low / medium …），空 = 模型默认
         self.delegation_instructions = str(c.get("delegation_instructions") or
                                            "你是小智的后台，负责调用工具（家居控制、设备音量等）并给出一两句中文结论；不需要工具的问题直接简短回答。")
         self.tools = ToolRunner(conn, conn.logger, per_minute=int(c.get("tool_calls_per_minute", 12)),
@@ -127,22 +155,31 @@ class S2SProvider(S2SProviderBase):
                 funcs = []
         return to_realtime_tools(funcs, self.tools.allow or None)   # Responses 的 function 工具与 Realtime 同为拍平格式
 
-    def _mutable_session(self) -> dict:
-        """session.start / session.update 里可变的部分：指令 + delegation（工具清单）。"""
+    def _mutable_session(self, update: bool = False) -> dict:
+        """session.start 里的指令 + delegation；update=True 时只给 delegation——session.update 不接受 instructions
+        （11-02 实测 unknown_parameter: 'session.instructions'，整条更新被拒），所以 Live 主模型的指令只在建会话时定，
+        之后才挂上的 HA 设备清单等经后台模型的 instructions 带过去。"""
         instructions = self._instructions()
-        out = {"instructions": instructions}
+        out = {} if update else {"instructions": instructions}
         if self.tools_enabled:
             tools = self._tool_list()
             self._session_sig = (instructions, tuple(sorted(t["name"] for t in tools)))
-            out["delegation"] = {"type": "responses", "responses": {
-                "model": self.delegation_model, "instructions": f"{instructions}\n\n{self.delegation_instructions}",
-                "tools": tools, "tool_choice": "auto"}}
+            responses = {"model": self.delegation_model, "instructions": f"{instructions}\n\n{self.delegation_instructions}",
+                         "tools": tools, "tool_choice": "auto"}
+            if self.delegation_reasoning:
+                responses["reasoning"] = {"effort": self.delegation_reasoning}
+            out["delegation"] = {"type": "responses", "responses": responses}
         else:
             self._session_sig = (instructions, ())
         return out
 
     def after_components_ready(self) -> None:
-        asyncio.run_coroutine_threadsafe(self._maybe_refresh(), self.conn.loop)
+        asyncio.run_coroutine_threadsafe(self._after_ready(), self.conn.loop)
+
+    async def _after_ready(self) -> None:
+        await self._maybe_refresh()
+        from core.utils.s2s import drain_pending_texts
+        await drain_pending_texts(self.conn)   # provider 建成前到的唤醒词 detect 现在补送（要播唤醒应答）
 
     async def _maybe_refresh(self) -> None:
         """提示词或工具清单变了就 session.update（HA 设备清单、MCP 工具都在会话建立之后才挂上）。"""
@@ -150,7 +187,7 @@ class S2SProvider(S2SProviderBase):
         sig = (self._instructions(), tuple(sorted(t["name"] for t in tools)))
         if sig == self._session_sig or self.ws is None:
             return
-        await self._send({"type": "session.update", "session": self._mutable_session()})
+        await self._send({"type": "session.update", "session": self._mutable_session(update=True)})
         self.logger.bind(tag=TAG).info(f"Live 会话配置已同步：指令 {len(sig[0])} 字、工具 {len(sig[1])} 个")
 
     async def open(self) -> None:
@@ -177,6 +214,8 @@ class S2SProvider(S2SProviderBase):
 
         t0 = time.monotonic()
         self.ws = await asyncio.wait_for(_connect(), self.connect_timeout_s)
+        if self.wake_greeting_text:
+            self._greeting_task = self.spawn(self._greeting_pcm())
         self.spawn(self._rx_loop())
         self._arm_idle()
         self.logger.bind(tag=TAG).info(
@@ -216,9 +255,53 @@ class S2SProvider(S2SProviderBase):
         self.stats["up_frames"] += 1
 
     async def on_text(self, text: str) -> None:
-        # Live 没有"按文字起一轮回复"的入口（探针未验证）：唤醒词那句不处理，用户开口后模型自己接话
-        if (text or "").strip() and text.strip() != WAKE_TRIGGER:
+        # Live 没有"按文字起一轮回复"的入口：唤醒词那句只用来播缓存的唤醒应答，其余文字忽略
+        text = (text or "").strip()
+        if text == WAKE_TRIGGER:
+            await self._play_greeting()
+        elif text:
             self.logger.bind(tag=TAG).info("Live 暂不支持文字输入，已忽略")
+
+    async def _greeting_pcm(self) -> bytes:
+        key = (self.voice, self.wake_greeting_text, self.speaker.sample_rate)
+        if key in _GREETING_CACHE:
+            return _GREETING_CACHE[key]
+        import aiohttp
+        body = {"model": self.greeting_tts_model, "voice": self.voice, "input": self.wake_greeting_text,
+                "response_format": "pcm", "instructions": "自然、亲切、简短地应一声。"}
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
+                async with s.post(self.tts_url, json=body, headers={"Authorization": f"Bearer {self.api_key}"}) as r:
+                    if r.status != 200:
+                        self.logger.bind(tag=TAG).warning(f"唤醒应答 TTS 失败 HTTP {r.status}")
+                        return b""
+                    pcm = await r.read()
+        except Exception as e:  # noqa: BLE001
+            self.logger.bind(tag=TAG).warning(f"唤醒应答 TTS 失败 {type(e).__name__}")
+            return b""
+        pcm = _trim_silence(pcm, TTS_RATE)   # TTS 首尾各带几百毫秒静音（11-02 实测整句 2.35 秒）
+        if self.speaker.sample_rate != TTS_RATE:
+            pcm = Resampler(TTS_RATE, self.speaker.sample_rate).process(pcm)
+        _GREETING_CACHE[key] = pcm
+        return pcm
+
+    async def _play_greeting(self) -> None:
+        if not self.wake_greeting_text or self.in_seg or self.speaker.speaking:
+            return
+        try:
+            pcm = await asyncio.wait_for(asyncio.shield(self._greeting_task), 2.5) if self._greeting_task else b""
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+            pcm = b""
+        if not pcm or self.in_seg or self.speaker.speaking:
+            return
+        await asyncio.sleep(0.3)   # 给攒下的音频一点时间补送进来（drain_early_audio 在下一个音频包时执行）
+        if self.trace.loud or time.time() - self.trace.t_last < 0.5:
+            self.logger.bind(tag=TAG).info("Live 唤醒应答跳过：用户唤醒后接着在说")
+            return
+        await self.speaker.begin()
+        await self.speaker.push(pcm)
+        self.spawn(self.speaker.end())
+        self.logger.bind(tag=TAG).info(f"Live 唤醒应答「{self.wake_greeting_text}」{round(len(pcm) / 2 / self.speaker.sample_rate * 1000)} ms")
 
     # ---------- 打断 ----------
     async def cancel(self, reason: str) -> None:
@@ -368,17 +451,28 @@ class S2SProvider(S2SProviderBase):
             self.logger.bind(tag=TAG).info(f"assistant: {txt}")
         if txt:
             await self.show_assistant_text(txt)
+        if not interrupted and self._is_goodbye(txt):
+            self.logger.bind(tag=TAG).info("Live 告别：这段播完后结束会话")
+            self.conn.close_after_chat = True    # speaker.end() 等设备播完、发 tts stop 后关连接
         if interrupted:
             await self.speaker.interrupt()
         else:
             self.spawn(self.speaker.end())
         await self._flush_input_text()
 
+    def _is_goodbye(self, assistant_txt: str) -> bool:
+        if not self.close_on_goodbye or not assistant_txt:
+            return False
+        said = (self.last_user_text + "".join(self.in_text))
+        return (any(w in said for w in self.goodbye_words) and len(assistant_txt) <= 16
+                and any(w in assistant_txt for w in self.goodbye_words))
+
     async def _flush_input_text(self) -> None:
         txt = "".join(self.in_text).strip()
         self.in_text.clear()
         if not txt:
             return
+        self.last_user_text = txt
         self.stats["input_utts"] += 1
         if self.log_text:
             self.logger.bind(tag=TAG).info(f"user: {txt}")
@@ -393,6 +487,17 @@ class S2SProvider(S2SProviderBase):
     def _idle_tick(self) -> None:
         if self.closing:
             return
+        # 工具（handle_exit_intent）置了"说完就结束"，而模型没有再出声（没有段结束去触发 speaker.end 里的关闭）
+        if getattr(self.conn, "close_after_chat", False) and not self.speaker.speaking and not self.in_seg:
+            now = time.monotonic()
+            self._t_close_flag = self._t_close_flag or now
+            if now - self._t_close_flag > 2.0:
+                self.logger.bind(tag=TAG).info("Live 结束会话（close_after_chat）")
+                self.closing = True
+                self.spawn(self.conn.close())
+                return
+        else:
+            self._t_close_flag = None
         if not self.speaker.speaking and not self.in_seg and time.monotonic() - self.t_activity > self.idle_close_s:
             self.logger.bind(tag=TAG).info(f"空闲超过 {self.idle_close_s:.0f} 秒，关闭连接")
             self.closing = True

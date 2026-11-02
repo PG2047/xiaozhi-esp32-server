@@ -47,7 +47,7 @@ def run(scenario):
             url = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}/v1/live/sessions"
             conn = FakeConn(asyncio.get_running_loop())
             p = S2SProvider({"api_key": "k", "url": url, "echo_gate": False, "idle_close_s": 0,
-                             "end_silence_ms": 300}, conn)
+                             "end_silence_ms": 300, "wake_greeting_text": ""}, conn)
             conn.s2s = p
             await p.open()
             await scenario(lv, conn, p)
@@ -138,7 +138,7 @@ def test_instructions_suffix_appended():
             url = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}/v1/live/sessions"
             conn = FakeConn(asyncio.get_running_loop())
             p = S2SProvider({"api_key": "k", "url": url, "echo_gate": False, "idle_close_s": 0,
-                             "instructions_suffix": "附和时继续说。"}, conn)
+                             "instructions_suffix": "附和时继续说。", "wake_greeting_text": ""}, conn)
             conn.s2s = p
             await p.open()
             assert lv.received[0]["session"]["instructions"] == "你是测试助手\n\n附和时继续说。"
@@ -196,9 +196,126 @@ def test_session_update_when_tools_change():
         await p._maybe_refresh()
         await wait_until(lambda: any(m["type"] == "session.update" for m in lv.received), what="session.update")
         upd = [m for m in lv.received if m["type"] == "session.update"][-1]["session"]
-        assert upd["instructions"] == "你是测试助手（已加设备清单）" and upd["delegation"]["responses"]["tools"]
+        assert "instructions" not in upd and upd["delegation"]["responses"]["tools"]
+        assert upd["delegation"]["responses"]["instructions"].startswith("你是测试助手（已加设备清单）")
         n = sum(m["type"] == "session.update" for m in lv.received)
         await p._maybe_refresh()          # 没变化不重复发
         await _real_sleep(0.1)
         assert sum(m["type"] == "session.update" for m in lv.received) == n
     run(sc)
+
+
+def test_wake_trigger_plays_cached_greeting():
+    async def go():
+        lv = FakeLive()
+        async with serve(lv.handler, "127.0.0.1", 0) as srv:
+            url = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}/v1/live/sessions"
+            conn = FakeConn(asyncio.get_running_loop())
+            p = S2SProvider({"api_key": "k", "url": url, "echo_gate": False, "idle_close_s": 0}, conn)
+
+            async def fake_tts():
+                return (np.ones(conn.sample_rate * 3 // 10, np.int16) * 2000).tobytes()   # 0.3 秒，不出网
+            p._greeting_pcm = fake_tts
+            conn.s2s = p
+            await p.open()
+            await p.on_text("嘿，你好呀")
+            await wait_until(lambda: ("tts", "start") in conn.websocket.states(), what="唤醒应答 tts start")
+            await wait_until(lambda: len(conn.websocket.frames()) > 0, what="唤醒应答音频")
+            await p.close()
+    asyncio.run(go())
+
+
+def test_trim_silence_keeps_speech_with_padding():
+    from core.providers.s2s.openai_live.openai_live import _trim_silence
+    rate = 24000
+    sil = b"\x00\x00" * (rate // 2)                                  # 0.5 秒静音
+    voice = (np.ones(rate // 5, np.int16) * 3000).tobytes()            # 0.2 秒有声
+    out = _trim_silence(sil + voice + sil, rate)
+    ms = len(out) / 2 / rate * 1000
+    assert 200 <= ms <= 300
+
+
+def test_goodbye_closes_after_playback():
+    async def sc(lv, conn, p):
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "好了，再见"})
+        await lv.emit({"type": "session.output_transcript.delta", "delta": "再见。"})
+        await lv.audio(6, 2000)
+        await lv.audio(5, 0)
+        await wait_until(lambda: conn.closed, timeout=8, what="告别后关连接")
+        assert conn.close_after_chat
+    run(sc)
+
+
+def test_goodbye_word_inside_a_question_does_not_close():
+    async def sc(lv, conn, p):
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "再见用英语怎么说"})
+        await lv.emit({"type": "session.output_transcript.delta", "delta": "再见用英语说是 goodbye，也可以说 bye。"})
+        await lv.audio(6, 2000)
+        await lv.audio(5, 0)
+        await wait_until(lambda: ("tts", "stop") in conn.websocket.states(), timeout=8, what="tts stop")
+        await _real_sleep(0.2)
+        assert not conn.closed and not conn.close_after_chat
+    run(sc)
+
+
+def test_early_audio_buffered_then_drained_in_order_only_for_willing_provider():
+    from core.utils.s2s import drain_early_audio, s2s_buffer_early_audio
+
+    class P:
+        def __init__(self, wants):
+            self.wants_early_audio = wants
+            self.got = []
+
+        async def on_pcm(self, pcm):
+            self.got.append(pcm)
+
+    class C:
+        config = {"selected_module": {"S2S": "OpenAILive"}}
+        conn_from_mqtt_gateway = False
+        client_is_listening = True
+        s2s = None
+
+        def _decode_opus_packet(self, b):
+            return b * 2
+
+    async def go():
+        c = C()
+        c.client_is_listening = False
+        assert s2s_buffer_early_audio(c, b"w")           # listen start 之前（唤醒词音频）：吞掉、不攒
+        c.client_is_listening = True
+        assert s2s_buffer_early_audio(c, b"a") and s2s_buffer_early_audio(c, b"b")
+        c._s2s_attach_done = True
+        assert not s2s_buffer_early_audio(c, b"c")      # attach 结束后不再攒
+        c.s2s = P(True)
+        await drain_early_audio(c)
+        assert c.s2s.got == [b"aa", b"bb"]
+        await drain_early_audio(c)                       # 只补送一次
+        assert c.s2s.got == [b"aa", b"bb"]
+        c2 = C()
+        s2s_buffer_early_audio(c2, b"x")
+        c2._s2s_attach_done = True
+        c2.s2s = P(False)
+        await drain_early_audio(c2)                      # Realtime 这类不要的：丢掉
+        assert c2.s2s.got == []
+    asyncio.run(go())
+
+
+def test_greeting_skipped_when_user_keeps_talking():
+    async def go():
+        lv = FakeLive()
+        async with serve(lv.handler, "127.0.0.1", 0) as srv:
+            url = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}/v1/live/sessions"
+            conn = FakeConn(asyncio.get_running_loop())
+            p = S2SProvider({"api_key": "k", "url": url, "echo_gate": False, "idle_close_s": 0}, conn)
+
+            async def fake_tts():
+                return (np.ones(conn.sample_rate // 5, np.int16) * 2000).tobytes()
+            p._greeting_pcm = fake_tts
+            conn.s2s = p
+            await p.open()
+            await p.on_pcm((np.ones(960, np.int16) * 3000).tobytes())   # 唤醒后用户接着在说
+            await p.on_text("嘿，你好呀")
+            await _real_sleep(0.2)
+            assert ("tts", "start") not in conn.websocket.states()
+            await p.close()
+    asyncio.run(go())
