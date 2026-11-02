@@ -223,3 +223,13 @@ def test_wake_trigger_plays_cached_greeting():
             await wait_until(lambda: len(conn.websocket.frames()) > 0, what="唤醒应答音频")
             await p.close()
     asyncio.run(go())
+
+
+def test_trim_silence_keeps_speech_with_padding():
+    from core.providers.s2s.openai_live.openai_live import _trim_silence
+    rate = 24000
+    sil = b"\x00\x00" * (rate // 2)                                  # 0.5 秒静音
+    voice = (np.ones(rate // 5, np.int16) * 3000).tobytes()            # 0.2 秒有声
+    out = _trim_silence(sil + voice + sil, rate)
+    ms = len(out) / 2 / rate * 1000
+    assert 200 <= ms <= 300

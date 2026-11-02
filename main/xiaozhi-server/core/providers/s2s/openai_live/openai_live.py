@@ -41,6 +41,17 @@ TTS_RATE = 24000        # /v1/audio/speech 的 pcm 是 24 kHz 16-bit 单声道
 _GREETING_CACHE: dict[tuple, bytes] = {}   # (voice, 文本, 设备采样率) → PCM，进程内共用：只有第一次唤醒要等 TTS
 
 
+def _trim_silence(pcm: bytes, rate: int, rms: int = 200, pad_ms: int = 40) -> bytes:
+    """裁掉首尾低于 rms 的 10 ms 帧，两头各留 pad_ms。"""
+    step = rate // 100 * 2
+    frames = [pcm[i:i + step] for i in range(0, len(pcm) - len(pcm) % 2, step)]
+    loud = [i for i, f in enumerate(frames) if len(f) >= 2 and audioop.rms(f, 2) > rms]
+    if not loud:
+        return pcm
+    pad = pad_ms // 10
+    return b"".join(frames[max(0, loud[0] - pad):loud[-1] + 1 + pad])
+
+
 class S2SProvider(S2SProviderBase):
     def __init__(self, config: dict, conn):
         super().__init__(config, conn)
@@ -257,6 +268,7 @@ class S2SProvider(S2SProviderBase):
         except Exception as e:  # noqa: BLE001
             self.logger.bind(tag=TAG).warning(f"唤醒应答 TTS 失败 {type(e).__name__}")
             return b""
+        pcm = _trim_silence(pcm, TTS_RATE)   # TTS 首尾各带几百毫秒静音（11-02 实测整句 2.35 秒）
         if self.speaker.sample_rate != TTS_RATE:
             pcm = Resampler(TTS_RATE, self.speaker.sample_rate).process(pcm)
         _GREETING_CACHE[key] = pcm
