@@ -52,6 +52,10 @@ class S2SProvider(S2SProviderBase):
         self.model = str(c.get("model_name") or "gpt-realtime")
         self.voice = str(c.get("voice") or "marin")
         self.transcribe_model = str(c.get("transcribe_model") or "gpt-4o-mini-transcribe")
+        # 转写提示：language 填 ISO-639-1（如 zh），prompt 填专名（如唤醒词"小智"）。只影响转写文本（设备显示、对话历史），
+        # 不影响模型听到的音频。11-02 真人测试：没填语言时噪声会被转成韩语 / 日语短词，"小智"常被写成"乔治""在这"
+        self.transcribe_language = str(c.get("transcribe_language") or "").strip()
+        self.transcribe_prompt = str(c.get("transcribe_prompt") or "").strip()
         self.turn_detection_type = str(c.get("turn_detection") or "server_vad")
         self.vad_threshold = float(c.get("vad_threshold", 0.5))
         self.vad_silence_ms = int(c.get("vad_silence_ms", 400))
@@ -154,8 +158,13 @@ class S2SProvider(S2SProviderBase):
         tools = self._tool_list()
         instructions = self._instructions()
         self._session_sig = (instructions, tuple(sorted(t["name"] for t in tools)))
+        transcription = {"model": self.transcribe_model}
+        if self.transcribe_language:
+            transcription["language"] = self.transcribe_language
+        if self.transcribe_prompt:
+            transcription["prompt"] = self.transcribe_prompt
         audio_in = {"format": {"type": "audio/pcm", "rate": RT_RATE},
-                    "transcription": {"model": self.transcribe_model},
+                    "transcription": transcription,
                     "turn_detection": self._turn_detection()}
         if self.noise_reduction:
             audio_in["noise_reduction"] = {"type": self.noise_reduction}
