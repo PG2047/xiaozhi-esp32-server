@@ -1,6 +1,9 @@
 """OpenAI GPT-Live（gpt-live-1）作为 S2S provider：WebSocket 直连平台（wss://api.openai.com/v1/live/sessions），平台 API key。
 
-实验性（11-02 探针）：只回答两个问题——原生全双工模型会不会被设备的残余回声打断、播放中插话能不能停下并听懂。工具未接。
+实验性（11-02 探针起）。工具走 Responses delegation（11-02 夜实测）：session.start 的 delegation.responses.tools 声明 func_handler 的工具，
+后台模型调用函数时服务端发 response.event{event: response.output_item.done(function_call)}，这里经 ToolRunner 执行后发
+response.item.create(function_call_output)，这一轮的调用全部交回且 response.completed 之后再发 response.create，后台据此给出结论、Live 说出来。
+工具清单（HA 插件、MCP）在会话建立之后才注册齐：after_components_ready 和每次听到用户开口时比对，变了就 session.update。
 
 与 Realtime 的协议差异（11-02 Tokyo 实测）：
   开场 session.start → session.started；上行 session.input_audio.append；
@@ -28,6 +31,7 @@ from websockets.exceptions import ConnectionClosed
 from core.providers.s2s.audio import Resampler
 from core.providers.s2s.base import DeviceSpeaker, S2SProviderBase, UplinkTrace
 from core.providers.s2s.echo_gate import EchoGate, load_vad
+from core.providers.s2s.tools import ToolRunner, to_realtime_tools
 
 TAG = __name__
 
@@ -51,6 +55,17 @@ class S2SProvider(S2SProviderBase):
         self.speech_rms = int(c.get("speech_rms", 30))          # 下行帧 RMS 超过它算"在说话"（模型静音时发的是全零）
         self.end_silence_ms = int(c.get("end_silence_ms", 700))  # 段内连续静音这么久算一段结束
         self.log_text = bool(c.get("log_text", False))
+        # 工具：tools: false 关掉 delegation；后台模型默认 gpt-6-luna（官方示例）
+        self.tools_enabled = bool(c.get("tools", True))
+        self.delegation_model = str(c.get("delegation_model") or "gpt-6-luna")
+        self.delegation_instructions = str(c.get("delegation_instructions") or
+                                           "你是小智的后台，负责调用工具（家居控制、设备音量等）并给出一两句中文结论；不需要工具的问题直接简短回答。")
+        self.tools = ToolRunner(conn, conn.logger, per_minute=int(c.get("tool_calls_per_minute", 12)),
+                                allow=c.get("tools_allow") or None)
+        self._session_sig = None
+        self._calls: dict[str, asyncio.Task] = {}   # call_id → 执行中的工具
+        self._resp_completed = False                # 当前后台回复已 completed，等工具结果交齐再 response.create
+        self._had_calls = False
         # 按设备追加到提示词末尾的一段话（登记表 s2s: 里写字符串即可），用来试附和 / 旁人这类轮次规则
         self.instructions_suffix = str(c.get("instructions_suffix") or "").strip()
         # 上行开口 / 收声日志（量插话和应答延迟用，onset_rms: 0 关掉）
@@ -102,6 +117,42 @@ class S2SProvider(S2SProviderBase):
         return instructions
 
     # ---------- 会话 ----------
+    def _tool_list(self) -> list[dict]:
+        fh = getattr(self.conn, "func_handler", None)
+        funcs = []
+        if fh is not None:
+            try:
+                funcs = fh.get_functions() or []
+            except Exception:  # noqa: BLE001
+                funcs = []
+        return to_realtime_tools(funcs, self.tools.allow or None)   # Responses 的 function 工具与 Realtime 同为拍平格式
+
+    def _mutable_session(self) -> dict:
+        """session.start / session.update 里可变的部分：指令 + delegation（工具清单）。"""
+        instructions = self._instructions()
+        out = {"instructions": instructions}
+        if self.tools_enabled:
+            tools = self._tool_list()
+            self._session_sig = (instructions, tuple(sorted(t["name"] for t in tools)))
+            out["delegation"] = {"type": "responses", "responses": {
+                "model": self.delegation_model, "instructions": f"{instructions}\n\n{self.delegation_instructions}",
+                "tools": tools, "tool_choice": "auto"}}
+        else:
+            self._session_sig = (instructions, ())
+        return out
+
+    def after_components_ready(self) -> None:
+        asyncio.run_coroutine_threadsafe(self._maybe_refresh(), self.conn.loop)
+
+    async def _maybe_refresh(self) -> None:
+        """提示词或工具清单变了就 session.update（HA 设备清单、MCP 工具都在会话建立之后才挂上）。"""
+        tools = self._tool_list() if self.tools_enabled else []
+        sig = (self._instructions(), tuple(sorted(t["name"] for t in tools)))
+        if sig == self._session_sig or self.ws is None:
+            return
+        await self._send({"type": "session.update", "session": self._mutable_session()})
+        self.logger.bind(tag=TAG).info(f"Live 会话配置已同步：指令 {len(sig[0])} 字、工具 {len(sig[1])} 个")
+
     async def open(self) -> None:
         if not self.api_key or self.api_key.startswith("你的"):
             raise RuntimeError("api_key 未配置")
@@ -110,7 +161,7 @@ class S2SProvider(S2SProviderBase):
             ws = await connect(self.url, additional_headers={"Authorization": f"Bearer {self.api_key}"},
                                max_size=None, open_timeout=None, ping_interval=20, ping_timeout=20)
             try:
-                session = {"model": self.model, "instructions": self._instructions(),
+                session = {"model": self.model, **self._mutable_session(),
                            "audio": {"format": {"type": "audio/pcm", "rate": LIVE_RATE}, "output": {"voice": self.voice}}}
                 await ws.send(json.dumps({"type": "session.start", "session": session}, ensure_ascii=False))
                 while True:
@@ -130,7 +181,8 @@ class S2SProvider(S2SProviderBase):
         self._arm_idle()
         self.logger.bind(tag=TAG).info(
             f"Live 会话已建立 model={self.model} voice={self.voice} echo_gate={'on' if self.gate else 'off'} "
-            f"speech_rms={self.speech_rms} end_silence_ms={self.end_silence_ms} in {time.monotonic() - t0:.2f}s")
+            f"speech_rms={self.speech_rms} end_silence_ms={self.end_silence_ms} "
+            f"tools={'off' if not self.tools_enabled else len(self._session_sig[1])}@{self.delegation_model} in {time.monotonic() - t0:.2f}s")
 
     async def _send(self, obj: dict) -> None:
         if self.ws is None:
@@ -205,16 +257,56 @@ class S2SProvider(S2SProviderBase):
             if self.t_last_input_text is None or now - self.t_last_input_text > 1.5:
                 # 一句话的第一个转写片段：探针用它对齐"用户开口 → 模型听到"（时间戳给毫秒，日志自带的只到秒）
                 self.logger.bind(tag=TAG).info(f"Live 听到用户 t={time.time():.3f} playing={self.in_seg}")
+                self.spawn(self._maybe_refresh())   # 用户开口到后台调工具之间还有一两秒，够把新注册的工具同步上去
             self.in_text.append(ev.get("delta") or "")
             self.t_last_input_text = now
             self.t_activity = now
         elif et == "session.output_transcript.delta":
             self.out_text.append(ev.get("delta") or "")
+        elif et == "response.event":
+            await self._on_backend_event(ev.get("event") or {})
+        elif et == "session.delegation.created":
+            d = ev.get("delegation") or {}
+            self.stats["delegations"] = self.stats.get("delegations", 0) + 1
+            self.logger.bind(tag=TAG).info(f"Live 委托后台 target={d.get('target')} t={time.time():.3f}")
         elif "error" in et:
             err = ev.get("error") or {}
-            self.logger.bind(tag=TAG).warning(f"Live error type={err.get('type')} code={err.get('code')}")
-        elif et not in ("session.usage.updated",):
+            self.logger.bind(tag=TAG).warning(f"Live error type={err.get('type')} code={err.get('code')} {str(err.get('message') or '')[:120]}")
+        elif et not in ("session.usage.updated", "session.updated"):
             self.logger.bind(tag=TAG).info(f"Live 事件 {et}")
+
+    # ---------- 工具（Responses delegation） ----------
+    async def _on_backend_event(self, inner: dict) -> None:
+        it = inner.get("type", "")
+        if it == "response.created":
+            self._resp_completed, self._had_calls = False, False
+        elif it == "response.output_item.done":
+            item = inner.get("item") or {}
+            if item.get("type") == "function_call" and item.get("call_id"):
+                self._had_calls = True
+                cid = item["call_id"]
+                self._calls[cid] = self.spawn(self._run_tool(cid, item.get("name") or "", item.get("arguments") or "{}"))
+        elif it == "response.completed":
+            self._resp_completed = True
+            await self._maybe_continue()
+        elif it in ("response.failed", "response.incomplete", "error"):
+            self.logger.bind(tag=TAG).warning(f"Live 后台 {it}: {json.dumps(inner, ensure_ascii=False)[:200]}")
+
+    async def _run_tool(self, call_id: str, name: str, arguments) -> None:
+        self.stats["tools"] = self.stats.get("tools", 0) + 1
+        try:
+            output = await self.tools.run(name, arguments)
+            await self._send({"type": "response.item.create",
+                              "item": {"type": "function_call_output", "call_id": call_id, "output": output}})
+        finally:
+            self._calls.pop(call_id, None)
+        await self._maybe_continue()
+
+    async def _maybe_continue(self) -> None:
+        """这一轮后台回复里的函数调用全部交回、且回复已 completed，才让后台继续（否则报 function_call_outputs_required）。"""
+        if self._had_calls and self._resp_completed and not self._calls:
+            self._had_calls = self._resp_completed = False
+            await self._send({"type": "response.create"})
 
     async def _on_audio(self, pcm: bytes) -> None:
         if not pcm:
