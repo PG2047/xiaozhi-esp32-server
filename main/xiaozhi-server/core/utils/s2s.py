@@ -55,6 +55,8 @@ def s2s_buffer_early_audio(conn, packet: bytes) -> bool:
     这样"你好小智，一年有几个月"一口气说完时问题不丢（11-03 R22）；不要的（Realtime）照旧丢掉。attach 结束后不再攒。"""
     if getattr(conn, "_s2s_attach_done", False) or getattr(conn, "conn_from_mqtt_gateway", False) or not s2s_selected(conn):
         return False
+    if not getattr(conn, "client_is_listening", False):
+        return True   # listen start 之前是设备补发的唤醒词音频：照旧丢掉，不然模型听到"你好小智"会自己再打一遍招呼（11-03 R23）
     buf = getattr(conn, "_s2s_early_audio", None)
     if buf is None:
         buf = conn._s2s_early_audio = []

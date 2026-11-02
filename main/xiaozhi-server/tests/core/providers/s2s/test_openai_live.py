@@ -272,6 +272,7 @@ def test_early_audio_buffered_then_drained_in_order_only_for_willing_provider():
     class C:
         config = {"selected_module": {"S2S": "OpenAILive"}}
         conn_from_mqtt_gateway = False
+        client_is_listening = True
         s2s = None
 
         def _decode_opus_packet(self, b):
@@ -279,6 +280,9 @@ def test_early_audio_buffered_then_drained_in_order_only_for_willing_provider():
 
     async def go():
         c = C()
+        c.client_is_listening = False
+        assert s2s_buffer_early_audio(c, b"w")           # listen start 之前（唤醒词音频）：吞掉、不攒
+        c.client_is_listening = True
         assert s2s_buffer_early_audio(c, b"a") and s2s_buffer_early_audio(c, b"b")
         c._s2s_attach_done = True
         assert not s2s_buffer_early_audio(c, b"c")      # attach 结束后不再攒
