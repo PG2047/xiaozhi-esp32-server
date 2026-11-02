@@ -22,7 +22,7 @@ from core.utils.util import (
 )
 from typing import Dict, Any
 from collections import deque
-from core.utils.s2s import attach_s2s
+from core.utils.s2s import attach_s2s, drain_early_audio, s2s_buffer_early_audio
 from core.utils.device_overrides import apply_device_overrides
 from core.utils.modules_initialize import (
     initialize_modules,
@@ -377,10 +377,13 @@ class ConnectionHandler:
         elif isinstance(message, bytes):
             if self.s2s is not None:
                 # S2S 模式：解完 Opus 直接交给 provider，不进 ASR 队列（没有 ASR 线程来取）
+                await drain_early_audio(self)  # 建成前攒下的包先补送（只有第一次有内容）
                 pcm_frame = self._decode_opus_packet(message)
                 if pcm_frame:
                     await self.s2s.on_pcm(pcm_frame)
                 return
+            if s2s_buffer_early_audio(self, message):
+                return  # S2S 还没建成：先攒着
             if self.vad is None or self.asr is None:
                 return
 

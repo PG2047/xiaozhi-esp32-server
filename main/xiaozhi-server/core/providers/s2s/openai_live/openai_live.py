@@ -71,6 +71,8 @@ class S2SProvider(S2SProviderBase):
         self._greeting_task = None
         # 告别：Live 说完"再见"不会自己结束会话（11-03 R19：要等 45 秒空闲关闭）。用户这句里有告别词、
         # 模型这段回复又短又是告别，就在这段播完后关连接；工具（handle_exit_intent）置了 close_after_chat 也照办
+        # 建成前攒下的设备音频要不要补送（core/utils/s2s.drain_early_audio）："你好小智，……"连着说时问题在里面
+        self.wants_early_audio = bool(c.get("early_audio", True))
         self.close_on_goodbye = bool(c.get("close_on_goodbye", True))
         self.goodbye_words = tuple(c.get("goodbye_words") or ("再见", "拜拜", "回头见", "下次聊"))
         self.last_user_text = ""
@@ -291,6 +293,10 @@ class S2SProvider(S2SProviderBase):
         except (asyncio.TimeoutError, Exception):  # noqa: BLE001
             pcm = b""
         if not pcm or self.in_seg or self.speaker.speaking:
+            return
+        await asyncio.sleep(0.3)   # 给攒下的音频一点时间补送进来（drain_early_audio 在下一个音频包时执行）
+        if self.trace.loud or time.time() - self.trace.t_last < 0.5:
+            self.logger.bind(tag=TAG).info("Live 唤醒应答跳过：用户唤醒后接着在说")
             return
         await self.speaker.begin()
         await self.speaker.push(pcm)

@@ -256,3 +256,62 @@ def test_goodbye_word_inside_a_question_does_not_close():
         await _real_sleep(0.2)
         assert not conn.closed and not conn.close_after_chat
     run(sc)
+
+
+def test_early_audio_buffered_then_drained_in_order_only_for_willing_provider():
+    from core.utils.s2s import drain_early_audio, s2s_buffer_early_audio
+
+    class P:
+        def __init__(self, wants):
+            self.wants_early_audio = wants
+            self.got = []
+
+        async def on_pcm(self, pcm):
+            self.got.append(pcm)
+
+    class C:
+        config = {"selected_module": {"S2S": "OpenAILive"}}
+        conn_from_mqtt_gateway = False
+        s2s = None
+
+        def _decode_opus_packet(self, b):
+            return b * 2
+
+    async def go():
+        c = C()
+        assert s2s_buffer_early_audio(c, b"a") and s2s_buffer_early_audio(c, b"b")
+        c._s2s_attach_done = True
+        assert not s2s_buffer_early_audio(c, b"c")      # attach 结束后不再攒
+        c.s2s = P(True)
+        await drain_early_audio(c)
+        assert c.s2s.got == [b"aa", b"bb"]
+        await drain_early_audio(c)                       # 只补送一次
+        assert c.s2s.got == [b"aa", b"bb"]
+        c2 = C()
+        s2s_buffer_early_audio(c2, b"x")
+        c2._s2s_attach_done = True
+        c2.s2s = P(False)
+        await drain_early_audio(c2)                      # Realtime 这类不要的：丢掉
+        assert c2.s2s.got == []
+    asyncio.run(go())
+
+
+def test_greeting_skipped_when_user_keeps_talking():
+    async def go():
+        lv = FakeLive()
+        async with serve(lv.handler, "127.0.0.1", 0) as srv:
+            url = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}/v1/live/sessions"
+            conn = FakeConn(asyncio.get_running_loop())
+            p = S2SProvider({"api_key": "k", "url": url, "echo_gate": False, "idle_close_s": 0}, conn)
+
+            async def fake_tts():
+                return (np.ones(conn.sample_rate // 5, np.int16) * 2000).tobytes()
+            p._greeting_pcm = fake_tts
+            conn.s2s = p
+            await p.open()
+            await p.on_pcm((np.ones(960, np.int16) * 3000).tobytes())   # 唤醒后用户接着在说
+            await p.on_text("嘿，你好呀")
+            await _real_sleep(0.2)
+            assert ("tts", "start") not in conn.websocket.states()
+            await p.close()
+    asyncio.run(go())
