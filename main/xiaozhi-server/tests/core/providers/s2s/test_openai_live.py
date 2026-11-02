@@ -47,7 +47,7 @@ def run(scenario):
             url = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}/v1/live/sessions"
             conn = FakeConn(asyncio.get_running_loop())
             p = S2SProvider({"api_key": "k", "url": url, "echo_gate": False, "idle_close_s": 0,
-                             "end_silence_ms": 300}, conn)
+                             "end_silence_ms": 300, "wake_greeting_text": ""}, conn)
             conn.s2s = p
             await p.open()
             await scenario(lv, conn, p)
@@ -138,7 +138,7 @@ def test_instructions_suffix_appended():
             url = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}/v1/live/sessions"
             conn = FakeConn(asyncio.get_running_loop())
             p = S2SProvider({"api_key": "k", "url": url, "echo_gate": False, "idle_close_s": 0,
-                             "instructions_suffix": "附和时继续说。"}, conn)
+                             "instructions_suffix": "附和时继续说。", "wake_greeting_text": ""}, conn)
             conn.s2s = p
             await p.open()
             assert lv.received[0]["session"]["instructions"] == "你是测试助手\n\n附和时继续说。"
@@ -203,3 +203,23 @@ def test_session_update_when_tools_change():
         await _real_sleep(0.1)
         assert sum(m["type"] == "session.update" for m in lv.received) == n
     run(sc)
+
+
+def test_wake_trigger_plays_cached_greeting():
+    async def go():
+        lv = FakeLive()
+        async with serve(lv.handler, "127.0.0.1", 0) as srv:
+            url = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}/v1/live/sessions"
+            conn = FakeConn(asyncio.get_running_loop())
+            p = S2SProvider({"api_key": "k", "url": url, "echo_gate": False, "idle_close_s": 0}, conn)
+
+            async def fake_tts():
+                return (np.ones(conn.sample_rate * 3 // 10, np.int16) * 2000).tobytes()   # 0.3 秒，不出网
+            p._greeting_pcm = fake_tts
+            conn.s2s = p
+            await p.open()
+            await p.on_text("嘿，你好呀")
+            await wait_until(lambda: ("tts", "start") in conn.websocket.states(), what="唤醒应答 tts start")
+            await wait_until(lambda: len(conn.websocket.frames()) > 0, what="唤醒应答音频")
+            await p.close()
+    asyncio.run(go())
