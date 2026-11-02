@@ -30,6 +30,9 @@ class FakeLive:
             if m["type"] == "session.start":
                 await ws.send(json.dumps({"type": "session.started", "session": {"id": "live_x"}}))
 
+    async def emit(self, ev):
+        await self.ws.send(json.dumps(ev))
+
     async def audio(self, n, amp):
         for _ in range(n):
             d = base64.b64encode((np.ones(1600, np.int16) * amp).tobytes()).decode()  # 100 ms @16k
@@ -165,3 +168,37 @@ def test_uplink_trace_logs_onset_then_offset():
     tr.feed(loud, True)
     tr.feed(quiet, True)
     assert len(lg.msgs) == 2 and "上行开口" in lg.msgs[0] and "playing=True" in lg.msgs[0] and "上行收声" in lg.msgs[1]
+
+
+def test_delegation_declares_tools_and_returns_function_output():
+    async def sc(lv, conn, p):
+        d = lv.received[0]["session"]["delegation"]
+        assert d["type"] == "responses" and d["responses"]["model"] == "gpt-6-luna"
+        assert [t["name"] for t in d["responses"]["tools"]] == ["hass_state"]
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "item_1", "target": "responses"}})
+        await lv.emit({"type": "response.event", "event": {"type": "response.created", "response": {"id": "resp_1"}}})
+        await lv.emit({"type": "response.event", "event": {"type": "response.output_item.done", "item": {
+            "type": "function_call", "call_id": "call_1", "name": "hass_state", "arguments": "{\"entity_id\": \"light.x\"}"}}})
+        await lv.emit({"type": "response.event", "event": {"type": "response.completed", "response": {"id": "resp_1"}}})
+        await wait_until(lambda: any(m["type"] == "response.create" for m in lv.received), what="response.create")
+        outs = [m for m in lv.received if m["type"] == "response.item.create"]
+        assert len(outs) == 1 and outs[0]["item"]["call_id"] == "call_1" and outs[0]["item"]["output"] == "客厅灯已打开"
+        assert conn.func_handler.calls and conn.func_handler.calls[0]["name"] == "hass_state"
+        # response.create 必须在函数结果之后
+        types = [m["type"] for m in lv.received]
+        assert types.index("response.item.create") < types.index("response.create")
+    run(sc)
+
+
+def test_session_update_when_tools_change():
+    async def sc(lv, conn, p):
+        conn.prompt = "你是测试助手（已加设备清单）"
+        await p._maybe_refresh()
+        await wait_until(lambda: any(m["type"] == "session.update" for m in lv.received), what="session.update")
+        upd = [m for m in lv.received if m["type"] == "session.update"][-1]["session"]
+        assert upd["instructions"] == "你是测试助手（已加设备清单）" and upd["delegation"]["responses"]["tools"]
+        n = sum(m["type"] == "session.update" for m in lv.received)
+        await p._maybe_refresh()          # 没变化不重复发
+        await _real_sleep(0.1)
+        assert sum(m["type"] == "session.update" for m in lv.received) == n
+    run(sc)
