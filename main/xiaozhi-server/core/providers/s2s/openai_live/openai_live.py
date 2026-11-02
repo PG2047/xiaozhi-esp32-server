@@ -1,0 +1,287 @@
+"""OpenAI GPT-Live（gpt-live-1）作为 S2S provider：WebSocket 直连平台（wss://api.openai.com/v1/live/sessions），平台 API key。
+
+实验性（11-02 探针）：只回答两个问题——原生全双工模型会不会被设备的残余回声打断、播放中插话能不能停下并听懂。工具未接。
+
+与 Realtime 的协议差异（11-02 Tokyo 实测）：
+  开场 session.start → session.started；上行 session.input_audio.append；
+  下行 session.output_audio.delta 是**连续流**：模型不说话时也按实时节奏发全零 PCM，没有"回复开始 / 结束"事件；
+  轮次和插话全由模型自己判（说"停一下"它就不再往下说），没有 response.cancel / truncate。
+所以这里按能量把下行流切成"回复段"：段内的帧（含短停顿）照发，连续静音超过 end_silence_ms 算一段结束（等设备播完发 tts stop）；
+段外的静音帧直接丢，不让设备一直处在播放状态（否则回声门控永远当作在播放）。
+设备 abort（按键 / 固件侧插话）时丢掉未发的帧，并丢弃本段剩下的音频，直到模型下一次静音再开口。
+上行：设备 16 kHz PCM → 残余回声门控（可关，echo_gate: false）→ 直接 16 kHz 送上游。
+日志只记事件、时长、字数，不记转写正文（log_text: true 才记）；api_key 不打印。
+"""
+from __future__ import annotations
+
+import asyncio
+import audioop
+import base64
+import contextlib
+import json
+import os
+import time
+
+from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed
+
+from core.providers.s2s.audio import Resampler
+from core.providers.s2s.base import DeviceSpeaker, S2SProviderBase
+from core.providers.s2s.echo_gate import EchoGate, load_vad
+
+TAG = __name__
+
+LIVE_RATE = 16000       # 上下行都用 16 kHz（Live 支持 16 k / 24 k）
+WAKE_TRIGGER = "嘿，你好呀"
+
+
+class S2SProvider(S2SProviderBase):
+    def __init__(self, config: dict, conn):
+        super().__init__(config, conn)
+        c = self.config
+        self.api_key = str(c.get("api_key") or "")
+        self.url = str(c.get("url") or "wss://api.openai.com/v1/live/sessions")
+        self.model = str(c.get("model_name") or "gpt-live-1")
+        self.voice = str(c.get("voice") or "marin")
+        # Live 没有"让模型先开口"的入口（session.instructions.append 只对 delegation 有效，11-02 实测）：
+        # 默认把设备 listen start 之前的音频（唤醒词那几十帧）也送给模型，让它自己听到"你好小智"再回应
+        self.forward_before_listen = bool(c.get("forward_before_listen", True))
+        self.connect_timeout_s = float(c.get("connect_timeout_s", 4))
+        self.idle_close_s = float(c.get("idle_close_s", 45))
+        self.speech_rms = int(c.get("speech_rms", 30))          # 下行帧 RMS 超过它算"在说话"（模型静音时发的是全零）
+        self.end_silence_ms = int(c.get("end_silence_ms", 700))  # 段内连续静音这么久算一段结束
+        self.log_text = bool(c.get("log_text", False))
+
+        gate = None
+        if c.get("echo_gate", True):
+            gate = EchoGate(vad=load_vad(self._vad_model_path()),
+                            lag_prior=float(c.get("gate_lag_prior_ms", 200)) / 1000,
+                            lag_max=float(c.get("gate_lag_max_ms", 1200)) / 1000)
+        self.gate = gate
+        out_rate = getattr(conn, "sample_rate", LIVE_RATE)
+        self.speaker = DeviceSpeaker(conn, out_rate, gate=gate)
+        self.down_rs = Resampler(LIVE_RATE, out_rate) if out_rate != LIVE_RATE else None
+
+        self.ws = None
+        self.closing = False
+        self.in_seg = False        # 正在把一段回复发给设备
+        self.silence_ms = 0.0      # 段内连续静音时长
+        self.suppress = False      # 设备 abort 后丢掉本段剩下的音频，直到模型静音
+        self.in_text = []
+        self.out_text = []
+        self._idle_handle = None
+        self.t_activity = time.monotonic()
+        self.t_last_input_text = None
+        self.t_seg = time.monotonic()
+        self.stats = {"segments": 0, "barge_device": 0, "up_frames": 0, "seg_after_input_ms": [],
+                      "input_utts": 0}
+
+    def _vad_model_path(self):
+        try:
+            selected = (self.conn.config.get("selected_module") or {}).get("VAD")
+            model_dir = ((self.conn.config.get("VAD") or {}).get(selected) or {}).get("model_dir")
+        except AttributeError:
+            model_dir = None
+        if not model_dir:
+            return None
+        return os.path.join(model_dir, "src", "silero_vad", "data", "silero_vad.onnx")
+
+    def _instructions(self) -> str:
+        instructions = (getattr(self.conn, "prompt", None) or (self.conn.config.get("prompt") if isinstance(getattr(self.conn, "config", None), dict) else None)
+                        or self.config.get("instructions") or "")
+        return str(instructions)
+
+    # ---------- 会话 ----------
+    async def open(self) -> None:
+        if not self.api_key or self.api_key.startswith("你的"):
+            raise RuntimeError("api_key 未配置")
+
+        async def _connect():
+            ws = await connect(self.url, additional_headers={"Authorization": f"Bearer {self.api_key}"},
+                               max_size=None, open_timeout=None, ping_interval=20, ping_timeout=20)
+            try:
+                session = {"model": self.model, "instructions": self._instructions(),
+                           "audio": {"format": {"type": "audio/pcm", "rate": LIVE_RATE}, "output": {"voice": self.voice}}}
+                await ws.send(json.dumps({"type": "session.start", "session": session}, ensure_ascii=False))
+                while True:
+                    ev = json.loads(await ws.recv())
+                    if ev.get("type") == "session.started":
+                        return ws
+                    if "error" in str(ev.get("type")):
+                        code = (ev.get("error") or {}).get("code")
+                        raise RuntimeError(f"first event {ev.get('type')} {code or ''}".strip())
+            except BaseException:
+                self.spawn(ws.close())
+                raise
+
+        t0 = time.monotonic()
+        self.ws = await asyncio.wait_for(_connect(), self.connect_timeout_s)
+        self.spawn(self._rx_loop())
+        self._arm_idle()
+        self.logger.bind(tag=TAG).info(
+            f"Live 会话已建立 model={self.model} voice={self.voice} echo_gate={'on' if self.gate else 'off'} "
+            f"speech_rms={self.speech_rms} end_silence_ms={self.end_silence_ms} in {time.monotonic() - t0:.2f}s")
+
+    async def _send(self, obj: dict) -> None:
+        if self.ws is None:
+            return
+        with contextlib.suppress(ConnectionClosed):
+            await self.ws.send(json.dumps(obj, ensure_ascii=False))
+
+    async def close(self) -> None:
+        self.closing = True
+        if self._idle_handle is not None:
+            self._idle_handle.cancel()
+        await super().close()
+        if self.ws is not None:
+            with contextlib.suppress(Exception):
+                await self._send({"type": "session.close"})
+                await self.ws.close()
+        if self.gate is not None:
+            self.stats["gate"] = dict(self.gate.stats, lag_ms=round(self.gate.lag * 1000))
+        self.logger.bind(tag=TAG).info(f"Live 会话结束: {self.stats}")
+
+    # ---------- 设备 → 模型 ----------
+    async def on_pcm(self, pcm16k: bytes) -> None:
+        if self.closing or not pcm16k:
+            return
+        if self.gate is not None:
+            pcm16k, _ = self.gate.process(pcm16k, time.monotonic(), self.speaker.speaking)
+        if not self.forward_before_listen and not getattr(self.conn, "client_is_listening", False):
+            return
+        await self._send({"type": "session.input_audio.append", "audio": base64.b64encode(pcm16k).decode()})
+        self.stats["up_frames"] += 1
+
+    async def on_text(self, text: str) -> None:
+        # Live 没有"按文字起一轮回复"的入口（探针未验证）：唤醒词那句不处理，用户开口后模型自己接话
+        if (text or "").strip() and text.strip() != WAKE_TRIGGER:
+            self.logger.bind(tag=TAG).info("Live 暂不支持文字输入，已忽略")
+
+    # ---------- 打断 ----------
+    async def cancel(self, reason: str) -> None:
+        """只会来自设备 abort（handleAbortMessage）：模型侧的插话 Live 自己处理，表现为下行变静音。"""
+        played = self.speaker.played_ms()
+        self.suppress = self.in_seg
+        await self._end_segment(interrupted=True)
+        self.stats["barge_device"] += 1
+        self.logger.bind(tag=TAG).info(f"打断（{reason}）：本段已播 {played} ms t={time.time():.3f}")
+
+    # ---------- 模型 → 设备 ----------
+    async def _rx_loop(self) -> None:
+        try:
+            async for raw in self.ws:
+                try:
+                    ev = json.loads(raw)
+                except ValueError:
+                    continue
+                try:
+                    await self._on_event(ev.get("type", ""), ev)
+                except Exception as e:  # noqa: BLE001
+                    self.logger.bind(tag=TAG).error(f"处理 Live 事件 {ev.get('type')} 出错: {type(e).__name__}: {e}")
+        except ConnectionClosed:
+            pass
+        if not self.closing:
+            self.closing = True
+            self.logger.bind(tag=TAG).warning("Live 上游断开，关闭本连接")
+            self.spawn(self.conn.close())
+
+    async def _on_event(self, et: str, ev: dict) -> None:
+        if et == "session.output_audio.delta":
+            await self._on_audio(base64.b64decode(ev.get("delta") or ev.get("audio") or ""))
+        elif et == "session.input_transcript.delta":
+            now = time.monotonic()
+            if self.t_last_input_text is None or now - self.t_last_input_text > 1.5:
+                # 一句话的第一个转写片段：探针用它对齐"用户开口 → 模型听到"（时间戳给毫秒，日志自带的只到秒）
+                self.logger.bind(tag=TAG).info(f"Live 听到用户 t={time.time():.3f} playing={self.in_seg}")
+            self.in_text.append(ev.get("delta") or "")
+            self.t_last_input_text = now
+            self.t_activity = now
+        elif et == "session.output_transcript.delta":
+            self.out_text.append(ev.get("delta") or "")
+        elif "error" in et:
+            err = ev.get("error") or {}
+            self.logger.bind(tag=TAG).warning(f"Live error type={err.get('type')} code={err.get('code')}")
+        elif et not in ("session.usage.updated",):
+            self.logger.bind(tag=TAG).info(f"Live 事件 {et}")
+
+    async def _on_audio(self, pcm: bytes) -> None:
+        if not pcm:
+            return
+        ms = len(pcm) / 2 / LIVE_RATE * 1000
+        loud = audioop.rms(pcm, 2) > self.speech_rms
+        if not loud:
+            if self.suppress:
+                self.suppress = False  # 模型停下了：下一次开口是新的一段
+            if not self.in_seg:
+                return
+            self.silence_ms += ms
+            if self.silence_ms >= self.end_silence_ms:
+                await self._end_segment()
+                return
+        else:
+            if self.suppress:
+                return
+            self.silence_ms = 0.0
+            self.t_activity = time.monotonic()
+            if not self.in_seg:
+                await self._begin_segment()
+        if self.down_rs is not None:
+            pcm = self.down_rs.process(pcm)
+        await self.speaker.push(pcm)
+
+    async def _begin_segment(self) -> None:
+        self.in_seg = True
+        self.t_seg = time.monotonic()
+        self.stats["segments"] += 1
+        self.logger.bind(tag=TAG).info(f"Live 段开始 #{self.stats['segments']} t={time.time():.3f}")
+        await self._flush_input_text()
+        if self.t_last_input_text is not None:
+            self.stats["seg_after_input_ms"].append(round(1000 * (time.monotonic() - self.t_last_input_text)))
+        await self.speaker.begin()
+
+    async def _end_segment(self, interrupted: bool = False) -> None:
+        if not self.in_seg:
+            return
+        self.in_seg = False
+        tail = self.silence_ms
+        self.silence_ms = 0.0
+        self.logger.bind(tag=TAG).info(
+            f"Live 段结束 #{self.stats['segments']} t={time.time():.3f} dur={round(1000 * (time.monotonic() - self.t_seg) - tail)}ms"
+            f"{' interrupted' if interrupted else ''}")
+        txt = "".join(self.out_text).strip()
+        self.out_text.clear()
+        if self.log_text and txt:
+            self.logger.bind(tag=TAG).info(f"assistant: {txt}")
+        if txt:
+            await self.show_assistant_text(txt)
+        if interrupted:
+            await self.speaker.interrupt()
+        else:
+            self.spawn(self.speaker.end())
+        await self._flush_input_text()
+
+    async def _flush_input_text(self) -> None:
+        txt = "".join(self.in_text).strip()
+        self.in_text.clear()
+        if not txt:
+            return
+        self.stats["input_utts"] += 1
+        if self.log_text:
+            self.logger.bind(tag=TAG).info(f"user: {txt}")
+        await self.show_user_text(txt)
+
+    # ---------- 空闲关闭 ----------
+    def _arm_idle(self) -> None:
+        if self.idle_close_s <= 0 or self.closing:
+            return
+        self._idle_handle = self.conn.loop.call_later(1.0, self._idle_tick)
+
+    def _idle_tick(self) -> None:
+        if self.closing:
+            return
+        if not self.speaker.speaking and not self.in_seg and time.monotonic() - self.t_activity > self.idle_close_s:
+            self.logger.bind(tag=TAG).info(f"空闲超过 {self.idle_close_s:.0f} 秒，关闭连接")
+            self.closing = True
+            self.spawn(self.conn.close())
+            return
+        self._arm_idle()
