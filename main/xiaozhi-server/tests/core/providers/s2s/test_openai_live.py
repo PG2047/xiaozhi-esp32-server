@@ -196,7 +196,8 @@ def test_session_update_when_tools_change():
         await p._maybe_refresh()
         await wait_until(lambda: any(m["type"] == "session.update" for m in lv.received), what="session.update")
         upd = [m for m in lv.received if m["type"] == "session.update"][-1]["session"]
-        assert upd["instructions"] == "你是测试助手（已加设备清单）" and upd["delegation"]["responses"]["tools"]
+        assert "instructions" not in upd and upd["delegation"]["responses"]["tools"]
+        assert upd["delegation"]["responses"]["instructions"].startswith("你是测试助手（已加设备清单）")
         n = sum(m["type"] == "session.update" for m in lv.received)
         await p._maybe_refresh()          # 没变化不重复发
         await _real_sleep(0.1)

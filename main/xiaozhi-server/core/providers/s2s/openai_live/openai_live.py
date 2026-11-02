@@ -127,10 +127,12 @@ class S2SProvider(S2SProviderBase):
                 funcs = []
         return to_realtime_tools(funcs, self.tools.allow or None)   # Responses 的 function 工具与 Realtime 同为拍平格式
 
-    def _mutable_session(self) -> dict:
-        """session.start / session.update 里可变的部分：指令 + delegation（工具清单）。"""
+    def _mutable_session(self, update: bool = False) -> dict:
+        """session.start 里的指令 + delegation；update=True 时只给 delegation——session.update 不接受 instructions
+        （11-02 实测 unknown_parameter: 'session.instructions'，整条更新被拒），所以 Live 主模型的指令只在建会话时定，
+        之后才挂上的 HA 设备清单等经后台模型的 instructions 带过去。"""
         instructions = self._instructions()
-        out = {"instructions": instructions}
+        out = {} if update else {"instructions": instructions}
         if self.tools_enabled:
             tools = self._tool_list()
             self._session_sig = (instructions, tuple(sorted(t["name"] for t in tools)))
@@ -150,7 +152,7 @@ class S2SProvider(S2SProviderBase):
         sig = (self._instructions(), tuple(sorted(t["name"] for t in tools)))
         if sig == self._session_sig or self.ws is None:
             return
-        await self._send({"type": "session.update", "session": self._mutable_session()})
+        await self._send({"type": "session.update", "session": self._mutable_session(update=True)})
         self.logger.bind(tag=TAG).info(f"Live 会话配置已同步：指令 {len(sig[0])} 字、工具 {len(sig[1])} 个")
 
     async def open(self) -> None:
