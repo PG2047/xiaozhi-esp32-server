@@ -20,6 +20,7 @@ import collections
 import contextlib
 import json
 import os
+import re
 import time
 
 from websockets.asyncio.client import connect
@@ -38,6 +39,12 @@ DEVICE_RATE = 16000     # 设备上行
 WAKE_TRIGGER = "嘿，你好呀"   # 上游 listenMessageHandler 把唤醒词统一换成这句再进 startToChat
 RESPONSE_START_WAIT_S = 10.0  # 我们发了 response.create 之后，最多等这么久算"回答进行中"（空闲关闭不打断它）
 SPEECH_GRACE_S = 3.0          # 刚说完这么久内不按空闲关闭：留给模型起回复
+_PUNCT = re.compile(r"[\s，。,.!?！？、；;：:\"'“”‘’…~～\-]+")
+
+
+def _norm_text(s: str) -> str:
+    """去掉空白和标点，用来比较转写是不是只剩提示词。"""
+    return _PUNCT.sub("", s or "")
 BENIGN_ERRORS = ("response_cancel_not_active", "conversation_already_has_active_response")
 LAG_WINDOW_S = 0.25            # 锁定滞后之前，参考窗只在先验 ±这么多秒内找回声（窗越宽门槛越高：取的是窗内最大功率）
 _LAST_LAG: dict[str, float] = {}   # device-id → 上一段会话锁定的滞后（秒）：同一台设备的滞后很稳，下次会话直接当先验
@@ -59,6 +66,13 @@ class S2SProvider(S2SProviderBase):
         # 不影响模型听到的音频。11-02 真人测试：没填语言时噪声会被转成韩语 / 日语短词，"小智"常被写成"乔治""在这"
         self.transcribe_language = str(c.get("transcribe_language") or "").strip()
         self.transcribe_prompt = str(c.get("transcribe_prompt") or "").strip()
+        # 转写只剩提示词本身（例如整句只有"小智"）按空转写处理。11-02 加了 prompt=小智 之后，静场里的底噪（设备输入 40～150 rms）
+        # 4 次被转写成"小智"：不是空串，空转写兜底不删，模型当成用户在叫它就开口，长故事讲完一截又自己接着讲。
+        # 代价：用户在会话里整句只喊一声"小智"也会被当成空转写，模型不再回"我在"
+        self.prompt_only_as_empty = bool(c.get("prompt_only_as_empty", True))
+        self._prompt_tokens = {t for t in (_norm_text(x) for x in re.split(r"[，,、;；\s]+", self.transcribe_prompt)) if t}
+        if self.transcribe_prompt:
+            self._prompt_tokens.add(_norm_text(self.transcribe_prompt))
         self.turn_detection_type = str(c.get("turn_detection") or "server_vad")
         self.vad_threshold = float(c.get("vad_threshold", 0.5))
         self.vad_silence_ms = int(c.get("vad_silence_ms", 400))
@@ -121,7 +135,8 @@ class S2SProvider(S2SProviderBase):
         self.t_response_requested = None
         self.stats = {"turns": 0, "cancelled": 0, "speech_started": 0, "barge_server": 0, "barge_local": 0,
                       "barge_device": 0, "up_frames": 0, "tools": 0, "first_audio_ms": [],
-                      "empty_transcripts": 0, "empty_cancelled": 0, "empty_long": 0, "barge_dup": 0}
+                      "empty_transcripts": 0, "empty_cancelled": 0, "empty_long": 0, "barge_dup": 0,
+                      "prompt_only": 0}
 
     # ---------- 会话 ----------
     def _vad_model_path(self):
@@ -405,7 +420,11 @@ class S2SProvider(S2SProviderBase):
             txt = (ev.get("transcript") or "").strip()
             if self.log_text:
                 self.logger.bind(tag=TAG).info(f"user: {txt}")
-            if txt:
+            if txt and self._prompt_only(txt):
+                self.stats["prompt_only"] += 1
+                self.logger.bind(tag=TAG).info(f"转写只有提示词「{txt}」，按空转写处理")
+                await self._on_empty_transcript(ev.get("item_id"))
+            elif txt:
                 await self.show_user_text(txt)
             else:
                 await self._on_empty_transcript(ev.get("item_id"))
@@ -451,6 +470,9 @@ class S2SProvider(S2SProviderBase):
         if not rec or rec[0] is None or rec[1] is None:
             return None
         return max(0.0, (rec[1] - rec[0]) / 1000.0)
+
+    def _prompt_only(self, txt: str) -> bool:
+        return self.prompt_only_as_empty and bool(self._prompt_tokens) and _norm_text(txt) in self._prompt_tokens
 
     async def _on_empty_transcript(self, item_id) -> None:
         """模型侧 VAD 判出"开口"但转写不出一个字：房间里的响动、设备 AGC 回升、播完后的尾音（11-01 真机：每次播完后

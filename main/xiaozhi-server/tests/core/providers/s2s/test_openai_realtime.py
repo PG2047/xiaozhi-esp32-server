@@ -420,6 +420,42 @@ def test_empty_transcript_deletes_item_and_cancels_only_unvoiced_response():
     run_scenario(sc)
 
 
+def test_prompt_only_transcript_counts_as_empty():
+    """转写只剩提示词（整句"小智"）按空转写处理：删项、取消没出声的回复、不进对话、设备不显示；带别的内容照常。"""
+    async def sc(rt, conn, url):
+        p = make_provider(conn, url, transcribe_prompt="小智")
+        conn.s2s = p
+        await p.open()
+        await rt.wait_for("session.update")
+        await rt.emit({"type": "input_audio_buffer.speech_started", "item_id": "u_p", "audio_start_ms": 1000})
+        await rt.emit({"type": "input_audio_buffer.speech_stopped", "item_id": "u_p", "audio_end_ms": 1700})
+        await rt.emit({"type": "response.created", "response": {"id": "r1"}})
+        await rt.emit({"type": "response.output_item.added", "item": {"id": "a1", "type": "message"}})
+        await rt.emit({"type": "conversation.item.input_audio_transcription.completed", "item_id": "u_p", "transcript": "小智。"})
+        (d,) = await rt.wait_for("conversation.item.delete")
+        assert d["item_id"] == "u_p"
+        await rt.wait_for("response.cancel")
+        assert p.stats["prompt_only"] == 1 and p.stats["empty_transcripts"] == 1 and p.stats["empty_cancelled"] == 1
+        assert [m.content for m in conn.dialogue.dialogue] == []
+        assert [t["text"] for t in conn.websocket.texts() if t.get("type") == "stt"] == []
+        await rt.emit({"type": "response.done", "response": {"status": "cancelled", "status_details": {"reason": "client_cancelled"}}})
+        await wait_until(lambda: p.resp_done, what="上一条回复结束")
+        await rt.emit({"type": "conversation.item.input_audio_transcription.completed", "item_id": "u_q", "transcript": "小智，现在几点"})
+        await wait_until(lambda: [m.content for m in conn.dialogue.dialogue] == ["小智，现在几点"], what="带内容的进对话")
+        assert p.stats["prompt_only"] == 1 and len(rt.of("conversation.item.delete")) == 1
+        await p.close()
+    run_scenario(sc)
+    loop = asyncio.new_event_loop()
+    try:
+        conn = FakeConn(loop)
+        assert make_provider(conn, "ws://unused", transcribe_prompt="小智")._prompt_only(" 小智！")
+        assert not make_provider(conn, "ws://unused", transcribe_prompt="小智", prompt_only_as_empty=False)._prompt_only("小智")
+        assert not make_provider(conn, "ws://unused")._prompt_only("小智")          # 没配提示词：不拦
+        assert not make_provider(conn, "ws://unused", transcribe_prompt="小智")._prompt_only("小智小智呀")
+    finally:
+        loop.close()
+
+
 def test_server_detected_barge_in_truncates_without_cancel():
     async def sc(rt, conn, url):
         p = make_provider(conn, url)
