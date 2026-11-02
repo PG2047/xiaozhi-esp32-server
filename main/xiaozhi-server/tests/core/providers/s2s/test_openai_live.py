@@ -72,8 +72,9 @@ def test_speech_then_silence_makes_one_segment_with_tts_stop():
     run(sc)
 
 
-def test_device_abort_drops_rest_of_segment_until_model_goes_quiet():
+def test_false_device_abort_resumes_after_max_wait():
     async def sc(lv, conn, p):
+        p.resume_max_wait_s = 0.0          # 打断后一直没听到用户：等够 resume_max_wait 就恢复
         await lv.audio(4, 2000)
         await wait_until(lambda: p.in_seg, what="进段")
         await p.cancel("device")
@@ -84,6 +85,27 @@ def test_device_abort_drops_rest_of_segment_until_model_goes_quiet():
         await lv.audio(1, 0)             # 模型停了
         await lv.audio(3, 2000)          # 新的一段
         await wait_until(lambda: p.stats["segments"] == 2, what="第二段")
+    run(sc)
+
+
+def test_after_device_abort_waits_until_user_finished():
+    async def sc(lv, conn, p):
+        p.resume_after_user_s = 0.2
+        loud_up = (np.ones(960, np.int16) * 3000).tobytes()
+        quiet_up = (np.ones(960, np.int16) * 10).tobytes()
+        await lv.audio(4, 2000)
+        await wait_until(lambda: p.in_seg, what="进段")
+        await p.on_pcm(loud_up)          # 用户开口
+        await p.cancel("device")
+        await lv.audio(1, 0)             # 模型短停顿
+        await lv.audio(3, 2000)          # 模型接着数（用户还在说）：必须丢
+        await _real_sleep(0.1)
+        assert p.suppress and p.stats["segments"] == 1
+        await _real_sleep(0.45)
+        await p.on_pcm(quiet_up)         # 用户说完（上行静了 0.4 秒以上）
+        await lv.audio(1, 0)             # 模型静音：可以恢复
+        await lv.audio(3, 2000)          # 对用户的回应
+        await wait_until(lambda: p.stats["segments"] == 2, what="回应段")
     run(sc)
 
 
