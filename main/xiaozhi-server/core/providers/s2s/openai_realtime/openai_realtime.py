@@ -105,6 +105,7 @@ class S2SProvider(S2SProviderBase):
         self.in_speech = False
         self.barge_run = 0
         self._pending_barge = None
+        self._interrupted = None       # 本条回复已被哪条路打断（server / local / device / empty）；response.created 时清
         self._tool_tasks: set[asyncio.Task] = set()
         self._session_sig = None   # (指令全文, 工具名)：两者任一变了就重新 session.update
         self._idle_handle = None
@@ -113,7 +114,7 @@ class S2SProvider(S2SProviderBase):
         self.t_response_requested = None
         self.stats = {"turns": 0, "cancelled": 0, "speech_started": 0, "barge_server": 0, "barge_local": 0,
                       "barge_device": 0, "up_frames": 0, "tools": 0, "first_audio_ms": [],
-                      "empty_transcripts": 0, "empty_cancelled": 0, "empty_long": 0}
+                      "empty_transcripts": 0, "empty_cancelled": 0, "empty_long": 0, "barge_dup": 0}
 
     # ---------- 会话 ----------
     def _vad_model_path(self):
@@ -290,6 +291,12 @@ class S2SProvider(S2SProviderBase):
         模型侧 / 本地插话由 _barge 先调 handleAbortMessage，再经钩子到这里，真正的原因放在 _pending_barge。"""
         if reason == "device" and self._pending_barge:
             reason, self._pending_barge = self._pending_barge, None
+        if self._interrupted and not self.resp_done:
+            # 同一条回复已经被别的路打断过（例如模型侧 speech_started 和设备侧 abort 同一秒到）：不再发 response.cancel /
+            # truncate——上游已经取消，再发只换来 response_cancel_not_active（11-01 XVF3800 设备侧打断真机里每次都有）
+            self.stats["barge_dup"] += 1
+            self.logger.bind(tag=TAG).info(f"打断（{reason}，重复）：本条回复已被（{self._interrupted}）打断，不再取消")
+            return
         had_audio = self.speaker.speaking or self.speaker.frames_sent > 0
         played = self.speaker.played_ms()
         self.suppress = True
@@ -300,6 +307,8 @@ class S2SProvider(S2SProviderBase):
             await self._send({"type": "conversation.item.truncate", "item_id": self.item_id,
                               "content_index": 0, "audio_end_ms": played})
         self.stats[f"barge_{reason}"] = self.stats.get(f"barge_{reason}", 0) + 1
+        if not self.resp_done:
+            self._interrupted = reason
         self.logger.bind(tag=TAG).info(f"打断（{reason}）：截到 {played if had_audio else -1} ms")
 
     async def _barge(self, reason: str) -> None:
@@ -343,6 +352,7 @@ class S2SProvider(S2SProviderBase):
         elif et == "response.created":
             self.resp_done = False
             self.suppress = False
+            self._interrupted = None
             self.t_response_requested = None
             self.item_id = None
             await self.speaker.begin()
@@ -440,6 +450,7 @@ class S2SProvider(S2SProviderBase):
             self.logger.bind(tag=TAG).info(f"空转写：开口 {dur_txt} s ≥ {self.empty_cancel_max_s:g} s，当作真提问被压碎：只删除该输入，让模型回应")
         elif unvoiced:
             self.suppress = True
+            self._interrupted = "empty"
             await self._send({"type": "response.cancel"})
             self.stats["empty_cancelled"] += 1
             self.logger.bind(tag=TAG).info(f"空转写：开口 {dur_txt} s，删除该输入并取消尚未出声的回复")
