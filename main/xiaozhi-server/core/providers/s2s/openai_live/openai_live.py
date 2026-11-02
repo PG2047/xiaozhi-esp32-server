@@ -77,6 +77,7 @@ class S2SProvider(S2SProviderBase):
         # 工具：tools: false 关掉 delegation；后台模型默认 gpt-6-luna（官方示例）
         self.tools_enabled = bool(c.get("tools", True))
         self.delegation_model = str(c.get("delegation_model") or "gpt-6-luna")
+        self.delegation_reasoning = str(c.get("delegation_reasoning") or "").strip()   # 后台推理强度（low / medium …），空 = 模型默认
         self.delegation_instructions = str(c.get("delegation_instructions") or
                                            "你是小智的后台，负责调用工具（家居控制、设备音量等）并给出一两句中文结论；不需要工具的问题直接简短回答。")
         self.tools = ToolRunner(conn, conn.logger, per_minute=int(c.get("tool_calls_per_minute", 12)),
@@ -155,9 +156,11 @@ class S2SProvider(S2SProviderBase):
         if self.tools_enabled:
             tools = self._tool_list()
             self._session_sig = (instructions, tuple(sorted(t["name"] for t in tools)))
-            out["delegation"] = {"type": "responses", "responses": {
-                "model": self.delegation_model, "instructions": f"{instructions}\n\n{self.delegation_instructions}",
-                "tools": tools, "tool_choice": "auto"}}
+            responses = {"model": self.delegation_model, "instructions": f"{instructions}\n\n{self.delegation_instructions}",
+                         "tools": tools, "tool_choice": "auto"}
+            if self.delegation_reasoning:
+                responses["reasoning"] = {"effort": self.delegation_reasoning}
+            out["delegation"] = {"type": "responses", "responses": responses}
         else:
             self._session_sig = (instructions, ())
         return out
