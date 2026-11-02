@@ -27,7 +27,7 @@ from websockets.exceptions import ConnectionClosed
 
 from core.handle.abortHandle import handleAbortMessage
 from core.providers.s2s.audio import Resampler
-from core.providers.s2s.base import DeviceSpeaker, S2SProviderBase
+from core.providers.s2s.base import DeviceSpeaker, S2SProviderBase, UplinkTrace
 from core.providers.s2s.echo_gate import EchoGate, load_vad
 from core.providers.s2s.tools import ToolRunner, to_realtime_tools
 
@@ -101,6 +101,7 @@ class S2SProvider(S2SProviderBase):
         self.tools = ToolRunner(conn, conn.logger, per_minute=int(c.get("tool_calls_per_minute", 12)),
                                 allow=c.get("tools_allow") or None)
         self.up_rs = Resampler(DEVICE_RATE, RT_RATE)
+        self.trace = UplinkTrace(conn.logger, TAG, "Realtime", int(c.get("onset_rms", 800)))  # 上行开口 / 收声日志，0 关掉
 
         self.ws = None
         self.rx_task = None
@@ -267,6 +268,7 @@ class S2SProvider(S2SProviderBase):
     async def on_pcm(self, pcm16k: bytes) -> None:
         if self.closing or not pcm16k:
             return
+        self.trace.feed(pcm16k, self.speaker.speaking)
         if self.gate is not None:
             pcm16k, info = self.gate.process(pcm16k, time.monotonic(), self.speaker.speaking)
             if self.local_barge_frames:

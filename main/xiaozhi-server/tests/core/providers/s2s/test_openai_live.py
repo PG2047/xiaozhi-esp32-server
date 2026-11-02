@@ -104,3 +104,42 @@ def test_wake_audio_forwarded_by_default():
         await p.on_pcm(b"\x01\x00" * 960)
         await wait_until(lambda: any(m["type"] == "session.input_audio.append" for m in lv.received), what="上行")
     run(sc)
+
+
+def test_instructions_suffix_appended():
+    async def go():
+        lv = FakeLive()
+        async with serve(lv.handler, "127.0.0.1", 0) as srv:
+            url = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}/v1/live/sessions"
+            conn = FakeConn(asyncio.get_running_loop())
+            p = S2SProvider({"api_key": "k", "url": url, "echo_gate": False, "idle_close_s": 0,
+                             "instructions_suffix": "附和时继续说。"}, conn)
+            conn.s2s = p
+            await p.open()
+            assert lv.received[0]["session"]["instructions"] == "你是测试助手\n\n附和时继续说。"
+            await p.close()
+    asyncio.run(go())
+
+
+def test_uplink_trace_logs_onset_then_offset():
+    from core.providers.s2s.base import UplinkTrace
+
+    class L:
+        def __init__(self):
+            self.msgs = []
+
+        def bind(self, **_):
+            return self
+
+        def info(self, m):
+            self.msgs.append(m)
+
+    lg = L()
+    tr = UplinkTrace(lg, "t", "Live", rms=800, quiet_s=0.0)
+    loud = (np.ones(960, np.int16) * 3000).tobytes()
+    quiet = (np.ones(960, np.int16) * 10).tobytes()
+    tr.feed(quiet, False)
+    tr.feed(loud, True)
+    tr.feed(loud, True)
+    tr.feed(quiet, True)
+    assert len(lg.msgs) == 2 and "上行开口" in lg.msgs[0] and "playing=True" in lg.msgs[0] and "上行收声" in lg.msgs[1]
