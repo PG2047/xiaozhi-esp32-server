@@ -41,6 +41,9 @@ SPEECH_GRACE_S = 3.0          # 刚说完这么久内不按空闲关闭：留给
 BENIGN_ERRORS = ("response_cancel_not_active", "conversation_already_has_active_response")
 LAG_WINDOW_S = 0.25            # 锁定滞后之前，参考窗只在先验 ±这么多秒内找回声（窗越宽门槛越高：取的是窗内最大功率）
 _LAST_LAG: dict[str, float] = {}   # device-id → 上一段会话锁定的滞后（秒）：同一台设备的滞后很稳，下次会话直接当先验
+# 用记忆值当先验的会话，估了这么多次滞后都没确认，就在会话结束时清掉记忆，下一段回到配置先验。11-02 XVF3800：一个坏值
+# （落在搜索上限的 1420～1500 ms）连续 3 段会话没被确认却一直当先验，真实约 1 秒的候选全因"离记忆值远"被拒
+LAG_FORGET_AFTER = 3
 
 
 class S2SProvider(S2SProviderBase):
@@ -251,6 +254,13 @@ class S2SProvider(S2SProviderBase):
                                       g=None if self.gate.g is None else round(self.gate.g, 4))
             if self.gate.lag_corr is not None and self.device_id:
                 _LAST_LAG[self.device_id] = self.gate.lag   # 下一段会话的先验
+            elif (self.device_id and self.lag_prior_remembered
+                  and self.gate.stats.get("lag_est", 0) >= LAG_FORGET_AFTER):
+                _LAST_LAG.pop(self.device_id, None)
+                self.stats["gate"]["lag_forgotten"] = True
+                self.logger.bind(tag=TAG).info(
+                    f"滞后记忆 {self.lag_prior_ms} ms 本段估了 {self.gate.stats['lag_est']} 次都没确认，清掉，"
+                    f"下一段回到配置先验 {int(self.config.get('gate_lag_prior_ms', 200))} ms")
         self.logger.bind(tag=TAG).info(f"Realtime 会话结束: {self.stats}")
 
     # ---------- 设备 → 模型 ----------

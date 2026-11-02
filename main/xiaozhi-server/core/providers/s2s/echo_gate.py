@@ -116,7 +116,7 @@ class EchoGate:
         self._seg = None   # 本段诊断：各判决计数与电平，尾窗过完记一行
         self._idle_pow = collections.deque(maxlen=3000)   # 两段播放之间直通帧的功率：用户说话的电平（与残余回声、门槛比）
         self.stats = {"frames": 0, "bypass": 0, "pass": 0, "echo": 0, "lag_est": 0, "lag_reject": 0, "noref": 0,
-                      "lag_skip_barge": 0}
+                      "lag_skip_barge": 0, "lag_edge": 0}
 
     # ---------- 事件 ----------
     @property
@@ -233,15 +233,26 @@ class EchoGate:
             if c > best_c:
                 best_c, best_lag = c, float(lag)
         self.stats["lag_est"] += 1
-        if best_lag is not None and self._accept_lag(best_lag, best_c):
+        edge = best_lag is not None and self._at_search_edge(best_lag)
+        if edge:
+            self.stats["lag_edge"] += 1
+        if best_lag is not None and not edge and self._accept_lag(best_lag, best_c):
             old = self.lag
             self.lag, self.lag_corr = best_lag, best_c
             self.log(f"echo gate lag {old * 1000:.0f} -> {best_lag * 1000:.0f} ms (corr {best_c:.2f})")
         else:
             self.stats["lag_reject"] += 1
             if best_lag is not None and best_c >= 0.25:
-                self.log(f"echo gate lag candidate {best_lag * 1000:.0f} ms (corr {best_c:.2f}) rejected, keep {self.lag * 1000:.0f} ms")
+                why = "at search edge, rejected" if edge else "rejected"
+                self.log(f"echo gate lag candidate {best_lag * 1000:.0f} ms (corr {best_c:.2f}) {why}, keep {self.lag * 1000:.0f} ms")
             self.t_last_lag = t - period + 1.0
+
+    def _at_search_edge(self, lag: float) -> bool:
+        """候选是扫描范围的第一个或最后一个点：相关最大值落在边界，说明真峰可能在范围外（或是假峰），不是一个被两侧
+        夹住的峰。11-02 真机：一次 corr 0.82 落在上限 1500 ms 被直接采用，又被记成下一段会话的先验，之后 860～1100 ms
+        的候选都因"离当前值远"被拒，播放开头 1.0～1.4 秒的回声按 noref 原样漏给模型侧 VAD。"""
+        half = self.lag_step / 2
+        return lag >= self.lag_max - half or lag <= self.lag_min + half
 
     def _accept_lag(self, lag: float, corr: float) -> bool:
         """滞后估计的接受规则（near = 候选与当前值相差 ≤ 100 ms）：

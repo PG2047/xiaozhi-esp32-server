@@ -99,6 +99,19 @@ def test_lag_estimate_converges_from_far_prior():
     assert abs(gate.lag - 0.25) <= 0.04 and gate.lag_corr is not None
 
 
+def test_lag_candidate_at_search_edge_is_rejected():
+    """真实滞后在上限附近 / 之外：相关最大值落在扫描范围的最后一个点，corr 再高也不采用（11-02 真机 corr 0.82 落在 1500 ms 上限）。"""
+    gate = EchoGate(vad=None, lag_max=1.5)
+    assert gate._at_search_edge(1.5) and gate._at_search_edge(0.0)
+    assert not gate._at_search_edge(1.48) and not gate._at_search_edge(0.9)
+    logs = []
+    gate, *_ = _run(lag=0.31, barge_gain=0.0, log_fn=logs.append)       # 上限 0.30
+    assert gate.lag_corr is None and gate.lag == pytest.approx(0.08)
+    assert gate.stats["lag_edge"] >= 1 and any("at search edge" in m for m in logs)
+    gate, *_ = _run(lag=0.27, barge_gain=0.0)                            # 离上限两步以上：照常锁定
+    assert gate.lag_corr is not None and abs(gate.lag - 0.27) <= 0.04 and gate.stats["lag_edge"] == 0
+
+
 def test_lag_retry_pacing_before_and_after_lock():
     """估不出 / 被拒后 1 秒再试：锁定前触发周期是 2.4 秒，重试时间不能按 5 秒的周期倒推（否则下一帧就又估一次）。"""
     gate = EchoGate(vad=None)

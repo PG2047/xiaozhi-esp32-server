@@ -273,6 +273,31 @@ def test_remembered_lag_becomes_next_sessions_prior():
     asyncio.run(go())
 
 
+def test_unconfirmed_remembered_lag_is_forgotten():
+    """用记忆值当先验的会话估了 ≥ LAG_FORGET_AFTER 次滞后都没确认：结束时清掉记忆，下一段回到配置先验；估得少（回复短）则保留。"""
+    from core.providers.s2s.openai_realtime import openai_realtime as mod
+
+    async def go():
+        conn = FakeConn(asyncio.get_running_loop())
+        conn.device_id = "test-dev-forget"
+        mod._LAST_LAG[conn.device_id] = 1.42
+        short = make_provider(conn, "ws://unused", echo_gate=True, gate_lag_prior_ms=900)
+        assert short.lag_prior_remembered and short.lag_prior_ms == 1420
+        short.gate.stats["lag_est"] = mod.LAG_FORGET_AFTER - 1       # 估得太少：不足以判定记忆值坏了
+        await short.close()
+        assert mod._LAST_LAG[conn.device_id] == pytest.approx(1.42) and "lag_forgotten" not in short.stats["gate"]
+        p = make_provider(conn, "ws://unused", echo_gate=True, gate_lag_prior_ms=900)
+        p.gate.stats["lag_est"] = mod.LAG_FORGET_AFTER
+        await p.close()
+        assert conn.device_id not in mod._LAST_LAG and p.stats["gate"]["lag_forgotten"] is True
+        q = make_provider(conn, "ws://unused", echo_gate=True, gate_lag_prior_ms=900)
+        assert not q.lag_prior_remembered and q.lag_prior_ms == 900
+        q.gate.stats["lag_est"] = 9                                   # 先验来自配置、不是记忆：没东西可清
+        await q.close()
+        assert conn.device_id not in mod._LAST_LAG and "lag_forgotten" not in q.stats["gate"]
+    asyncio.run(go())
+
+
 def test_local_barge_counts_only_fresh_pass_frames():
     """本地插话：最近 2N 帧里数门控新判出的人声帧（pass）；保持期（pass-hold）和回声判决记 0 但不清窗；停播即清窗。"""
     class StubGate:
