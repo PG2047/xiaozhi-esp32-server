@@ -16,6 +16,7 @@ provider 的生命周期（都在连接的事件循环上，open() 除外由 cor
 from __future__ import annotations
 
 import asyncio
+import audioop
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -140,6 +141,31 @@ class DeviceSpeaker:
 
     async def _mark_sent_async(self) -> None:
         self._mark_sent()
+
+
+class UplinkTrace:
+    """上行开口 / 收声日志：设备送来的音频 RMS 越过 rms 记"开口"、之后连续 quiet_s 秒没越过记"收声"，都带毫秒墙钟时间戳。
+    只写日志、不改音频；探针用它把"用户开口 / 说完"和服务端的打断、段开始对到同一个时钟上（日志自带的时间只到秒）。"""
+
+    def __init__(self, logger, tag: str, label: str, rms: int = 800, quiet_s: float = 0.4):
+        self.logger, self.tag, self.label = logger, tag, label
+        self.rms, self.quiet_s = int(rms), float(quiet_s)
+        self.loud = False
+        self.t_last = 0.0      # 最后一帧响的墙钟时间
+
+    def feed(self, pcm16k: bytes, playing: bool) -> None:
+        if self.rms <= 0 or not pcm16k:
+            return
+        now = time.time()
+        level = audioop.rms(pcm16k, 2)
+        if level > self.rms:
+            if not self.loud:
+                self.loud = True
+                self.logger.bind(tag=self.tag).info(f"{self.label} 上行开口 t={now:.3f} rms={level} playing={playing}")
+            self.t_last = now
+        elif self.loud and now - self.t_last > self.quiet_s:
+            self.loud = False
+            self.logger.bind(tag=self.tag).info(f"{self.label} 上行收声 t={self.t_last:.3f} playing={playing}")
 
 
 class S2SProviderBase(ABC):

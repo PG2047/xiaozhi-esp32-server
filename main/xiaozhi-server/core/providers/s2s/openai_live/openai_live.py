@@ -26,7 +26,7 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
 from core.providers.s2s.audio import Resampler
-from core.providers.s2s.base import DeviceSpeaker, S2SProviderBase
+from core.providers.s2s.base import DeviceSpeaker, S2SProviderBase, UplinkTrace
 from core.providers.s2s.echo_gate import EchoGate, load_vad
 
 TAG = __name__
@@ -51,6 +51,10 @@ class S2SProvider(S2SProviderBase):
         self.speech_rms = int(c.get("speech_rms", 30))          # 下行帧 RMS 超过它算"在说话"（模型静音时发的是全零）
         self.end_silence_ms = int(c.get("end_silence_ms", 700))  # 段内连续静音这么久算一段结束
         self.log_text = bool(c.get("log_text", False))
+        # 按设备追加到提示词末尾的一段话（登记表 s2s: 里写字符串即可），用来试附和 / 旁人这类轮次规则
+        self.instructions_suffix = str(c.get("instructions_suffix") or "").strip()
+        # 上行开口 / 收声日志（量插话和应答延迟用，onset_rms: 0 关掉）
+        self.trace = UplinkTrace(conn.logger, TAG, "Live", int(c.get("onset_rms", 800)))
 
         gate = None
         if c.get("echo_gate", True):
@@ -89,7 +93,10 @@ class S2SProvider(S2SProviderBase):
     def _instructions(self) -> str:
         instructions = (getattr(self.conn, "prompt", None) or (self.conn.config.get("prompt") if isinstance(getattr(self.conn, "config", None), dict) else None)
                         or self.config.get("instructions") or "")
-        return str(instructions)
+        instructions = str(instructions)
+        if self.instructions_suffix:
+            instructions = f"{instructions}\n\n{self.instructions_suffix}"
+        return instructions
 
     # ---------- 会话 ----------
     async def open(self) -> None:
@@ -145,6 +152,7 @@ class S2SProvider(S2SProviderBase):
     async def on_pcm(self, pcm16k: bytes) -> None:
         if self.closing or not pcm16k:
             return
+        self.trace.feed(pcm16k, self.in_seg)
         if self.gate is not None:
             pcm16k, _ = self.gate.process(pcm16k, time.monotonic(), self.speaker.speaking)
         if not self.forward_before_listen and not getattr(self.conn, "client_is_listening", False):
