@@ -42,6 +42,10 @@ class S2SProvider(S2SProviderBase):
         self.api_key = str(c.get("api_key") or "")
         self.url = str(c.get("url") or "wss://api.openai.com/v1/live/sessions")
         self.model = str(c.get("model_name") or "gpt-live-1")
+        self.voice = str(c.get("voice") or "marin")
+        # Live 没有"让模型先开口"的入口（session.instructions.append 只对 delegation 有效，11-02 实测）：
+        # 默认把设备 listen start 之前的音频（唤醒词那几十帧）也送给模型，让它自己听到"你好小智"再回应
+        self.forward_before_listen = bool(c.get("forward_before_listen", True))
         self.connect_timeout_s = float(c.get("connect_timeout_s", 4))
         self.idle_close_s = float(c.get("idle_close_s", 45))
         self.speech_rms = int(c.get("speech_rms", 30))          # 下行帧 RMS 超过它算"在说话"（模型静音时发的是全零）
@@ -68,6 +72,7 @@ class S2SProvider(S2SProviderBase):
         self._idle_handle = None
         self.t_activity = time.monotonic()
         self.t_last_input_text = None
+        self.t_seg = time.monotonic()
         self.stats = {"segments": 0, "barge_device": 0, "up_frames": 0, "seg_after_input_ms": [],
                       "input_utts": 0}
 
@@ -96,7 +101,7 @@ class S2SProvider(S2SProviderBase):
                                max_size=None, open_timeout=None, ping_interval=20, ping_timeout=20)
             try:
                 session = {"model": self.model, "instructions": self._instructions(),
-                           "audio": {"format": {"type": "audio/pcm", "rate": LIVE_RATE}}}
+                           "audio": {"format": {"type": "audio/pcm", "rate": LIVE_RATE}, "output": {"voice": self.voice}}}
                 await ws.send(json.dumps({"type": "session.start", "session": session}, ensure_ascii=False))
                 while True:
                     ev = json.loads(await ws.recv())
@@ -114,7 +119,8 @@ class S2SProvider(S2SProviderBase):
         self.spawn(self._rx_loop())
         self._arm_idle()
         self.logger.bind(tag=TAG).info(
-            f"Live 会话已建立 model={self.model} echo_gate={'on' if self.gate else 'off'} in {time.monotonic() - t0:.2f}s")
+            f"Live 会话已建立 model={self.model} voice={self.voice} echo_gate={'on' if self.gate else 'off'} "
+            f"speech_rms={self.speech_rms} end_silence_ms={self.end_silence_ms} in {time.monotonic() - t0:.2f}s")
 
     async def _send(self, obj: dict) -> None:
         if self.ws is None:
@@ -141,7 +147,7 @@ class S2SProvider(S2SProviderBase):
             return
         if self.gate is not None:
             pcm16k, _ = self.gate.process(pcm16k, time.monotonic(), self.speaker.speaking)
-        if not getattr(self.conn, "client_is_listening", False):
+        if not self.forward_before_listen and not getattr(self.conn, "client_is_listening", False):
             return
         await self._send({"type": "session.input_audio.append", "audio": base64.b64encode(pcm16k).decode()})
         self.stats["up_frames"] += 1
@@ -158,7 +164,7 @@ class S2SProvider(S2SProviderBase):
         self.suppress = self.in_seg
         await self._end_segment(interrupted=True)
         self.stats["barge_device"] += 1
-        self.logger.bind(tag=TAG).info(f"打断（{reason}）：本段已播 {played} ms")
+        self.logger.bind(tag=TAG).info(f"打断（{reason}）：本段已播 {played} ms t={time.time():.3f}")
 
     # ---------- 模型 → 设备 ----------
     async def _rx_loop(self) -> None:
@@ -183,9 +189,13 @@ class S2SProvider(S2SProviderBase):
         if et == "session.output_audio.delta":
             await self._on_audio(base64.b64decode(ev.get("delta") or ev.get("audio") or ""))
         elif et == "session.input_transcript.delta":
+            now = time.monotonic()
+            if self.t_last_input_text is None or now - self.t_last_input_text > 1.5:
+                # 一句话的第一个转写片段：探针用它对齐"用户开口 → 模型听到"（时间戳给毫秒，日志自带的只到秒）
+                self.logger.bind(tag=TAG).info(f"Live 听到用户 t={time.time():.3f} playing={self.in_seg}")
             self.in_text.append(ev.get("delta") or "")
-            self.t_last_input_text = time.monotonic()
-            self.t_activity = time.monotonic()
+            self.t_last_input_text = now
+            self.t_activity = now
         elif et == "session.output_transcript.delta":
             self.out_text.append(ev.get("delta") or "")
         elif "error" in et:
@@ -221,7 +231,9 @@ class S2SProvider(S2SProviderBase):
 
     async def _begin_segment(self) -> None:
         self.in_seg = True
+        self.t_seg = time.monotonic()
         self.stats["segments"] += 1
+        self.logger.bind(tag=TAG).info(f"Live 段开始 #{self.stats['segments']} t={time.time():.3f}")
         await self._flush_input_text()
         if self.t_last_input_text is not None:
             self.stats["seg_after_input_ms"].append(round(1000 * (time.monotonic() - self.t_last_input_text)))
@@ -231,7 +243,11 @@ class S2SProvider(S2SProviderBase):
         if not self.in_seg:
             return
         self.in_seg = False
+        tail = self.silence_ms
         self.silence_ms = 0.0
+        self.logger.bind(tag=TAG).info(
+            f"Live 段结束 #{self.stats['segments']} t={time.time():.3f} dur={round(1000 * (time.monotonic() - self.t_seg) - tail)}ms"
+            f"{' interrupted' if interrupted else ''}")
         txt = "".join(self.out_text).strip()
         self.out_text.clear()
         if self.log_text and txt:

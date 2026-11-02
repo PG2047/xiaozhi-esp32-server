@@ -87,11 +87,20 @@ def test_device_abort_drops_rest_of_segment_until_model_goes_quiet():
     run(sc)
 
 
-def test_uplink_only_while_listening():
+def test_uplink_only_while_listening_when_configured():
     async def sc(lv, conn, p):
+        p.forward_before_listen = False
         await p.on_pcm(b"\x01\x00" * 960)
         conn.client_is_listening = True
         await p.on_pcm(b"\x01\x00" * 960)
         await wait_until(lambda: any(m["type"] == "session.input_audio.append" for m in lv.received), what="上行")
         assert sum(m["type"] == "session.input_audio.append" for m in lv.received) == 1
+    run(sc)
+
+
+def test_wake_audio_forwarded_by_default():
+    async def sc(lv, conn, p):
+        assert p.forward_before_listen and lv.received[0]["session"]["audio"]["output"]["voice"] == "marin"
+        await p.on_pcm(b"\x01\x00" * 960)
+        await wait_until(lambda: any(m["type"] == "session.input_audio.append" for m in lv.received), what="上行")
     run(sc)
