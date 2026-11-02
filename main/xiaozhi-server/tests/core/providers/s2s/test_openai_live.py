@@ -233,3 +233,26 @@ def test_trim_silence_keeps_speech_with_padding():
     out = _trim_silence(sil + voice + sil, rate)
     ms = len(out) / 2 / rate * 1000
     assert 200 <= ms <= 300
+
+
+def test_goodbye_closes_after_playback():
+    async def sc(lv, conn, p):
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "好了，再见"})
+        await lv.emit({"type": "session.output_transcript.delta", "delta": "再见。"})
+        await lv.audio(6, 2000)
+        await lv.audio(5, 0)
+        await wait_until(lambda: conn.closed, timeout=8, what="告别后关连接")
+        assert conn.close_after_chat
+    run(sc)
+
+
+def test_goodbye_word_inside_a_question_does_not_close():
+    async def sc(lv, conn, p):
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "再见用英语怎么说"})
+        await lv.emit({"type": "session.output_transcript.delta", "delta": "再见用英语说是 goodbye，也可以说 bye。"})
+        await lv.audio(6, 2000)
+        await lv.audio(5, 0)
+        await wait_until(lambda: ("tts", "stop") in conn.websocket.states(), timeout=8, what="tts stop")
+        await _real_sleep(0.2)
+        assert not conn.closed and not conn.close_after_chat
+    run(sc)

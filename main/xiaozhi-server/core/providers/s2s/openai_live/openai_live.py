@@ -69,6 +69,12 @@ class S2SProvider(S2SProviderBase):
         self.greeting_tts_model = str(c.get("greeting_tts_model") or "gpt-4o-mini-tts")
         self.tts_url = str(c.get("tts_url") or "https://api.openai.com/v1/audio/speech")
         self._greeting_task = None
+        # 告别：Live 说完"再见"不会自己结束会话（11-03 R19：要等 45 秒空闲关闭）。用户这句里有告别词、
+        # 模型这段回复又短又是告别，就在这段播完后关连接；工具（handle_exit_intent）置了 close_after_chat 也照办
+        self.close_on_goodbye = bool(c.get("close_on_goodbye", True))
+        self.goodbye_words = tuple(c.get("goodbye_words") or ("再见", "拜拜", "回头见", "下次聊"))
+        self.last_user_text = ""
+        self._t_close_flag = None
         self.connect_timeout_s = float(c.get("connect_timeout_s", 4))
         self.idle_close_s = float(c.get("idle_close_s", 45))
         self.speech_rms = int(c.get("speech_rms", 30))          # 下行帧 RMS 超过它算"在说话"（模型静音时发的是全零）
@@ -439,17 +445,28 @@ class S2SProvider(S2SProviderBase):
             self.logger.bind(tag=TAG).info(f"assistant: {txt}")
         if txt:
             await self.show_assistant_text(txt)
+        if not interrupted and self._is_goodbye(txt):
+            self.logger.bind(tag=TAG).info("Live 告别：这段播完后结束会话")
+            self.conn.close_after_chat = True    # speaker.end() 等设备播完、发 tts stop 后关连接
         if interrupted:
             await self.speaker.interrupt()
         else:
             self.spawn(self.speaker.end())
         await self._flush_input_text()
 
+    def _is_goodbye(self, assistant_txt: str) -> bool:
+        if not self.close_on_goodbye or not assistant_txt:
+            return False
+        said = (self.last_user_text + "".join(self.in_text))
+        return (any(w in said for w in self.goodbye_words) and len(assistant_txt) <= 16
+                and any(w in assistant_txt for w in self.goodbye_words))
+
     async def _flush_input_text(self) -> None:
         txt = "".join(self.in_text).strip()
         self.in_text.clear()
         if not txt:
             return
+        self.last_user_text = txt
         self.stats["input_utts"] += 1
         if self.log_text:
             self.logger.bind(tag=TAG).info(f"user: {txt}")
@@ -464,6 +481,17 @@ class S2SProvider(S2SProviderBase):
     def _idle_tick(self) -> None:
         if self.closing:
             return
+        # 工具（handle_exit_intent）置了"说完就结束"，而模型没有再出声（没有段结束去触发 speaker.end 里的关闭）
+        if getattr(self.conn, "close_after_chat", False) and not self.speaker.speaking and not self.in_seg:
+            now = time.monotonic()
+            self._t_close_flag = self._t_close_flag or now
+            if now - self._t_close_flag > 2.0:
+                self.logger.bind(tag=TAG).info("Live 结束会话（close_after_chat）")
+                self.closing = True
+                self.spawn(self.conn.close())
+                return
+        else:
+            self._t_close_flag = None
         if not self.speaker.speaking and not self.in_seg and time.monotonic() - self.t_activity > self.idle_close_s:
             self.logger.bind(tag=TAG).info(f"空闲超过 {self.idle_close_s:.0f} 秒，关闭连接")
             self.closing = True
