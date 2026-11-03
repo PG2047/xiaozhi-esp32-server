@@ -5,10 +5,12 @@
 {"type": "function", "name", "description", "parameters"}。执行走 conn.func_handler.handle_llm_function_call，拿到
 ActionResponse 后翻成一段交给模型的文字（模型据此开口）。
 
-接线层自己做、不改原版工具包：白名单（tools_allow，空 = 全部）、每会话每分钟调用次数上限、request_id 与耗时日志。
+接线层自己做、不改原版工具包：白名单（tools_allow，空 = 全部）、每会话每分钟调用次数上限、request_id 与耗时日志
+（log_args 打开时日志带调用参数）。
 """
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from collections import deque
@@ -39,11 +41,13 @@ def to_realtime_tools(functions: Iterable[dict[str, Any]] | None, allow: set[str
 class ToolRunner:
     """给一条连接用的工具执行器。"""
 
-    def __init__(self, conn, logger, per_minute: int = 12, allow: Iterable[str] | None = None):
+    def __init__(self, conn, logger, per_minute: int = 12, allow: Iterable[str] | None = None, log_args: bool = False):
         self.conn = conn
         self.logger = logger
         self.per_minute = int(per_minute)
         self.allow = {str(a) for a in allow} if allow else set()
+        # 日志带不带调用参数：参数里可能有用户的原话（广播内容、搜索词），所以跟 provider 的 log_text 一起开
+        self.log_args = bool(log_args)
         self._recent: deque[float] = deque()
         self.calls = 0
 
@@ -83,8 +87,20 @@ class ToolRunner:
         except Exception as e:  # noqa: BLE001
             text, action = f"工具 {name} 执行出错：{type(e).__name__}", "EXCEPTION"
         ms = round((time.monotonic() - t0) * 1000)
-        self.logger.bind(tag=TAG).info(f"tool {name} rid={rid} {action} {ms} ms, output {len(text)} chars")
+        args = f" args={self._args_text(arguments)}" if self.log_args else ""
+        self.logger.bind(tag=TAG).info(f"tool {name} rid={rid} {action} {ms} ms, output {len(text)} chars{args}")
         return text
+
+    @staticmethod
+    def _args_text(arguments, limit: int = 300) -> str:
+        if isinstance(arguments, str):
+            s = arguments
+        else:
+            try:
+                s = json.dumps(arguments, ensure_ascii=False)
+            except (TypeError, ValueError):
+                s = str(arguments)
+        return s if len(s) <= limit else s[:limit] + "…"
 
     @staticmethod
     def _to_text(resp) -> tuple[str, str]:

@@ -90,7 +90,7 @@ class S2SProvider(S2SProviderBase):
         self.delegation_instructions = str(c.get("delegation_instructions") or
                                            "你是小智的后台，负责调用工具（家居控制、设备音量等）并给出一两句中文结论；不需要工具的问题直接简短回答。")
         self.tools = ToolRunner(conn, conn.logger, per_minute=int(c.get("tool_calls_per_minute", 12)),
-                                allow=c.get("tools_allow") or None)
+                                allow=c.get("tools_allow") or None, log_args=self.log_text)
         # 委托方式：responses = Live 自己调后台 Responses 模型（带整段对话上下文，11-03 真人测工具答复 16 s）；
         # client = Live 只发 delegation.created，这里用小模型 + 最近几句话选工具、执行、session.commentary.append 交回，
         # Live 自己转述（API 探针：说完到说出答案 3.7 s）
