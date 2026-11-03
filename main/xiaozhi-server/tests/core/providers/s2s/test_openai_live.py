@@ -310,6 +310,35 @@ def test_echo_right_after_the_cut_does_not_end_the_hold():
     run(sc)
 
 
+def test_ack_is_fetched_again_when_the_first_tts_failed():
+    async def sc(lv, conn, p):          # 11-04：重启后第一次取"好。"的 TTS 超时，那个会话就一直没有应答
+        pcm = (np.ones(conn.sample_rate * 3 // 10, np.int16) * 2000).tobytes()
+        calls = []
+
+        async def flaky():
+            calls.append(1)
+            return b"" if len(calls) == 1 else pcm
+        p.stop_ack_text = "好。"
+        p._ack_pcm = flaky
+        p._ack_task = asyncio.ensure_future(flaky())
+        await _stop_while_playing(lv, p)
+        await lv.audio(2, 0)            # 第一次喊停：没有应答可放，再取一次
+        await wait_until(lambda: len(calls) == 2, what="重新取 TTS")
+        await _user_speaks_again(p)
+        await lv.audio(1, 0)
+        await lv.audio(3, 2000)
+        await wait_until(lambda: p.in_seg, what="回答段")
+        p.t_last_input_text -= 2
+        n = len(conn.websocket.frames())
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "停一下"})   # 第二次喊停
+        await wait_until(lambda: p._stop is not None, what="再次停下")
+        m = len(conn.websocket.frames())
+        await lv.audio(2, 0)
+        await wait_until(lambda: len(conn.websocket.frames()) > m, what="这次有应答")
+        assert m >= n and len(calls) == 2
+    run(sc)
+
+
 def test_new_user_sentence_ends_the_hold():
     async def sc(lv, conn, p):
         await _stop_while_playing(lv, p)

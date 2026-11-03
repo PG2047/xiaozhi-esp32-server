@@ -393,8 +393,10 @@ class S2SProvider(S2SProviderBase):
         import aiohttp
         body = {"model": self.greeting_tts_model, "voice": self.voice, "input": text,
                 "response_format": "pcm", "instructions": "自然、亲切、简短地应一声。"}
+        # 后台预取，超时放宽到 30 s：11-04 Tokyo 实测同样的请求有时 19 s 才回（"好。"19.0 s、2.0 s，"我在。"1.1 s），
+        # 6 s 超时会让重启后缓存还空的那批会话一直没有应答。播放那边最多只等 2.5 s，取得慢不耽误
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
                 async with s.post(self.tts_url, json=body, headers={"Authorization": f"Bearer {self.api_key}"}) as r:
                     if r.status != 200:
                         self.logger.bind(tag=TAG).warning(f"{what} TTS 失败 HTTP {r.status}")
@@ -506,8 +508,12 @@ class S2SProvider(S2SProviderBase):
             pcm = await asyncio.wait_for(asyncio.shield(self._ack_task), 2.5) if self._ack_task else b""
         except (asyncio.TimeoutError, Exception):  # noqa: BLE001
             pcm = b""
+        if not pcm:
+            if self._ack_task is None or self._ack_task.done():
+                self._ack_task = self.spawn(self._ack_pcm())   # 上次没取到（TTS 慢或失败）：再取一次，下次喊停用
+            return
         s = self._stop
-        if not pcm or s is None or self.in_seg or self.speaker.speaking:
+        if s is None or self.in_seg or self.speaker.speaking:
             return
         dur = len(pcm) / 2 / self.speaker.sample_rate
         now = time.monotonic()
