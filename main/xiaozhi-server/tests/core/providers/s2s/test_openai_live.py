@@ -525,3 +525,14 @@ def test_dispatch_tools_drops_lunar_dont_call_hint():
     t = [{"name": "get_lunar", "description": "用于农历。对于'今天农历是多少'、'今天农历日期'这样的基本查询，请直接使用context中的信息，不要调用此工具。"}]
     d = P._dispatch_tools(t)[0]["description"]
     assert "不要调用此工具" not in d and "今天的农历日期也用它查" in d
+
+
+def test_dispatch_instructions_read_ha_devices_from_conn_prompt():
+    """HA 设备清单由 hass_init.append_devices_to_prompt 追加到 conn.prompt（func_handler 初始化时，晚于 Live 会话建立）。
+    client 委托的调度指令每次现读 conn.prompt，decisions 选工具和小模型填 entity_id 都看得到清单，Live 侧不用另外带。"""
+    async def sc(lv, conn, p):
+        assert "light.study_lamp" not in p._dispatch_instructions()
+        conn.prompt += "\n下面是我家智能设备列表（位置，设备名，entity_id），可以通过homeassistant控制\n北京书房,书房灯,light.study_lamp\n"
+        assert "北京书房,书房灯,light.study_lamp" in p._dispatch_instructions()
+        assert p.tools.log_args is True          # log_text 打开时工具日志带参数
+    _run_client(sc, log_text=True)

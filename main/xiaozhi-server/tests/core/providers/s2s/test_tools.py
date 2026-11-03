@@ -69,3 +69,32 @@ def test_whitelist_rate_limit_and_exceptions():
     assert _run(ToolRunner(_Conn(_Handler(raise_exc=True)), log), "hass_state").startswith("工具 hass_state 执行出错")
     assert _run(ToolRunner(_Conn(None), log), "hass_state") == "服务器还没准备好工具，请稍后再试。"
     assert _run(r, "") == "工具名为空，无法执行。"
+
+
+class _Log:
+    """只记 info / warning 文本的假 logger。"""
+
+    def __init__(self):
+        self.lines = []
+
+    def bind(self, **_kw):
+        return self
+
+    def info(self, msg):
+        self.lines.append(msg)
+
+    warning = info
+
+
+def test_arguments_logged_only_when_log_args():
+    h = _Handler(ActionResponse(Action.REQLLM, "设备已打开", None))
+    quiet, loud = _Log(), _Log()
+    _run(ToolRunner(_Conn(h), quiet), "hass_set_state", '{"entity_id": "light.study"}')
+    assert "args=" not in quiet.lines[0]
+    r = ToolRunner(_Conn(h), loud, log_args=True)
+    _run(r, "hass_set_state", '{"entity_id": "light.study"}')
+    asyncio.run(r.run("hass_set_state", {"entity_id": "light.书房", "state": {"type": "turn_on"}}))
+    _run(r, "hass_set_state", "x" * 400)
+    assert loud.lines[0].endswith('args={"entity_id": "light.study"}')
+    assert loud.lines[1].endswith('args={"entity_id": "light.书房", "state": {"type": "turn_on"}}')   # dict 参数转 JSON、中文不转义
+    assert loud.lines[2].endswith("args=" + "x" * 300 + "…")                                          # 太长截断

@@ -115,7 +115,7 @@ class S2SProvider(S2SProviderBase):
         self.gate = gate
         self.speaker = DeviceSpeaker(conn, getattr(conn, "sample_rate", RT_RATE), gate=gate)
         self.tools = ToolRunner(conn, conn.logger, per_minute=int(c.get("tool_calls_per_minute", 12)),
-                                allow=c.get("tools_allow") or None)
+                                allow=c.get("tools_allow") or None, log_args=self.log_text)
         self.up_rs = Resampler(DEVICE_RATE, RT_RATE)
         self.trace = UplinkTrace(conn.logger, TAG, "Realtime", int(c.get("onset_rms", 800)))  # 上行开口 / 收声日志，0 关掉
 
