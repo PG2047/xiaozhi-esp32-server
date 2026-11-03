@@ -300,7 +300,7 @@ def test_early_audio_buffered_then_drained_in_order_only_for_willing_provider():
     asyncio.run(go())
 
 
-def test_greeting_skipped_when_user_keeps_talking():
+def _greeting_case(after_wake):
     async def go():
         lv = FakeLive()
         async with serve(lv.handler, "127.0.0.1", 0) as srv:
@@ -313,12 +313,28 @@ def test_greeting_skipped_when_user_keeps_talking():
             p._greeting_pcm = fake_tts
             conn.s2s = p
             await p.open()
-            await p.on_pcm((np.ones(960, np.int16) * 3000).tobytes())   # 唤醒后用户接着在说
-            await p.on_text("嘿，你好呀")
+            task = asyncio.ensure_future(p.on_text("嘿，你好呀"))
+            await _real_sleep(0.05)
+            await after_wake(lv, p)
+            await task
             await _real_sleep(0.2)
-            assert ("tts", "start") not in conn.websocket.states()
+            played = ("tts", "start") in conn.websocket.states()
             await p.close()
-    asyncio.run(go())
+            return played
+    return asyncio.run(go())
+
+
+def test_greeting_skipped_when_user_keeps_talking():
+    async def speak(lv, p):
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "一年有"})   # 模型转写出了人话
+        await _real_sleep(0.05)
+    assert _greeting_case(speak) is False
+
+
+def test_greeting_plays_when_only_noise_after_wake():
+    async def noise(lv, p):
+        await p.on_pcm((np.ones(960, np.int16) * 13000).tobytes())   # 很响但不是人声（11-03 复测：13780 的响声让"我在"被跳过）
+    assert _greeting_case(noise) is True
 
 
 def _run_client(scenario, **over):
@@ -380,3 +396,52 @@ def test_client_delegation_long_tool_result_gets_summarised():
         m = [m for m in lv.received if m["type"] == "session.commentary.append"][0]
         assert m["content"] == "客厅灯开着。" and n["i"] == 2
     _run_client(sc)
+
+
+
+class FakeVAD:
+    """按帧里的幅度给人声概率：幅度 ≥ 1000 的窗口算人声。"""
+
+    def __call__(self, chunk):
+        return 0.9 if float(np.abs(chunk).max()) * 32768 >= 1000 else 0.05
+
+
+def _frame(amp):
+    return (np.ones(960, np.int16) * amp).tobytes()
+
+
+def test_speech_gate_silences_noise_and_keeps_speech_with_lookahead_and_hold():
+    from core.providers.s2s.speech_gate import SpeechGate
+    g = SpeechGate(FakeVAD(), threshold=0.5, hold_ms=120, lookahead_ms=120)   # 前瞻 2 帧、保持 2 帧
+    seq = [500] * 4 + [3000] * 2 + [500] * 6           # 噪声 4 帧 → 人声 2 帧 → 噪声 6 帧
+    outs = [g.process(_frame(a)) for a in seq]
+    assert outs[:2] == [b"", b""]                       # 前瞻队列没满
+    sent = [o for o in outs[2:]]                        # 对应输入第 0～9 帧
+    kept = [o != b"\x00" * len(o) for o in sent]
+    # silero 每 512 样本一窗、一帧 960 样本：第 6 帧开头还带着第 5 帧剩下的人声样本，也判成人声。
+    # 第 0、1 帧离人声还远 → 静音；第 2、3 帧在人声之前 2 帧以内 → 前瞻保留；第 4～6 帧是人声；第 7、8 帧在保持期；第 9 帧静音
+    assert kept == [False, False, True, True, True, True, True, True, True, False]
+    assert g.stats == {"pass": 7, "silenced": 3}
+
+
+def test_live_uses_speech_gate_when_enabled(monkeypatch):
+    import core.providers.s2s.openai_live.openai_live as mod
+    monkeypatch.setattr(mod, "load_vad", lambda path=None: FakeVAD())
+
+    async def go():
+        lv = FakeLive()
+        async with serve(lv.handler, "127.0.0.1", 0) as srv:
+            url = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}/v1/live/sessions"
+            conn = FakeConn(asyncio.get_running_loop())
+            p = S2SProvider({"api_key": "k", "url": url, "echo_gate": False, "idle_close_s": 0, "wake_greeting_text": "",
+                             "speech_gate": True, "speech_gate_lookahead_ms": 0, "speech_gate_hold_ms": 0}, conn)
+            conn.s2s = p
+            await p.open()
+            assert p.speech_gate is not None
+            await p.on_pcm(_frame(500))     # 噪声 → 送全零
+            await p.on_pcm(_frame(3000))    # 人声 → 原样
+            await wait_until(lambda: sum(m["type"] == "session.input_audio.append" for m in lv.received) == 2, what="两帧上行")
+            ups = [base64.b64decode(m["audio"]) for m in lv.received if m["type"] == "session.input_audio.append"]
+            assert ups[0] == b"\x00" * 1920 and ups[1] == _frame(3000)
+            await p.close()
+    asyncio.run(go())
