@@ -79,7 +79,7 @@ class S2SProvider(S2SProviderBase):
         self.goodbye_words = tuple(c.get("goodbye_words") or ("再见", "拜拜", "回头见", "下次聊"))
         # 喊停兜底：Live 听到"停一下"后会先把正在说的那句讲完（11-03 讲故事中 2.5～3.5 s 才停），设备侧又没判出时，
         # 播放中用户这句的转写里一出现停止词就由服务端截断（同设备 abort：发 tts stop、丢掉本段剩下的音频）。
-        # 转写跟不上说话：第一个转写片段在出声后 0.8～1.8 s 才到（11-04 实测），"停"字更晚，所以只是兜底，快的那条路仍是设备。stop_words: [] 关掉
+        # 转写跟不上说话：第一个转写片段在出声后 0.8～1.8 s 才到（11-03 实测），"停"字更晚，所以只是兜底，快的那条路仍是设备。stop_words: [] 关掉
         self.stop_words = tuple(c["stop_words"] if "stop_words" in c else
                                 ("停", "等一下", "等等", "别说了", "暂停", "打住", "闭嘴", "安静"))
         self._pending_barge = None
