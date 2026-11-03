@@ -12,6 +12,7 @@ response.item.create(function_call_output)，这一轮的调用全部交回且 r
 所以这里按能量把下行流切成"回复段"：段内的帧（含短停顿）照发，连续静音超过 end_silence_ms 算一段结束（等设备播完发 tts stop）；
 段外的静音帧直接丢，不让设备一直处在播放状态（否则回声门控永远当作在播放）。
 设备 abort（按键 / 固件侧插话）时丢掉未发的帧，并丢弃本段剩下的音频，直到模型下一次静音再开口。
+播放中用户的转写里出现停止词时，服务端照设备 abort 截断；截在半句时还要丢到输出转写出现句末（见 _tail_frame）。
 上行：设备 16 kHz PCM → 残余回声门控（可关，echo_gate: false）→ 直接 16 kHz 送上游。
 日志只记事件、时长、字数，不记转写正文（log_text: true 才记）；api_key 不打印。
 """
@@ -44,6 +45,9 @@ TTS_RATE = 24000        # /v1/audio/speech 的 pcm 是 24 kHz 16-bit 单声道
 CONTEXT_CHUNK_CHARS = 400   # session.thinking.append 每条 content 上限 500 token，中文按 400 字切
 _GREETING_CACHE: dict[tuple, bytes] = {}   # (voice, 文本, 设备采样率) → PCM，进程内共用：只有第一次唤醒要等 TTS
 _HA_CACHE: dict = {"t": 0.0, "entries": []}  # GetLiveContext 解析出的设备表，进程内各连接共用（见 _load_ha_names）；只按一个 HA 缓存
+# 一句话说完的记号：句末标点、省略号，还有模型自己掐断时转写里的"-"（11-03 f3 设备打断后："指向-好。""匠-好。"）
+_SENTENCE_END = ("。", "！", "？", "!", "?", "…", "...", "-", "—")
+_CLOSERS = "。！？!?….-—”\"’'」』）)"   # 句末记号后面紧跟着的引号、括号、重复的标点，算在这句里
 
 
 def _trim_silence(pcm: bytes, rate: int, rms: int = 200, pad_ms: int = 40) -> bytes:
@@ -55,6 +59,22 @@ def _trim_silence(pcm: bytes, rate: int, rms: int = 200, pad_ms: int = 40) -> by
         return pcm
     pad = pad_ms // 10
     return b"".join(frames[max(0, loud[0] - pad):loud[-1] + 1 + pad])
+
+
+def _sentence_end(text: str) -> int:
+    """text 里第一句话结束的位置（句末记号和紧跟着的引号、标点之后）；还没说完一句返回 -1。"""
+    hits = [i + len(m) for m in _SENTENCE_END if (i := text.find(m)) >= 0]
+    if not hits:
+        return -1
+    i = min(hits)
+    while i < len(text) and text[i] in _CLOSERS:
+        i += 1
+    return i
+
+
+def _ends_sentence(text: str) -> bool:
+    """这段转写是不是正好停在一句话末尾（末尾的引号、括号不算）。"""
+    return text.rstrip().rstrip("”\"’'」』）)").endswith(_SENTENCE_END)
 
 
 class S2SProvider(S2SProviderBase):
@@ -138,6 +158,9 @@ class S2SProvider(S2SProviderBase):
         self.trace = UplinkTrace(conn.logger, TAG, "Live", int(c.get("onset_rms", 800)))
         self.resume_after_user_s = float(c.get("resume_after_user_ms", 300)) / 1000
         self.resume_max_wait_s = float(c.get("resume_max_wait_ms", 1500)) / 1000
+        # 转写截断截在半句时，丢到输出转写出现句末、之后又静了 tail_gap_ms 才放行；最多丢 tail_max_ms，0 = 不丢（见 _tail_frame）
+        self.tail_gap_s = float(c.get("tail_gap_ms", 150)) / 1000
+        self.tail_max_s = float(c.get("tail_max_ms", 6000)) / 1000
 
         gate = None
         if c.get("echo_gate", True):
@@ -166,6 +189,7 @@ class S2SProvider(S2SProviderBase):
         self.silence_ms = 0.0      # 段内连续静音时长
         self.suppress = False      # 设备 abort 后丢掉模型的音频，直到用户说完、模型也静音（见 _may_resume）
         self.t_abort = 0.0
+        self._tail = None          # 转写截断后正在丢被截那句的后半句：{t0, boundary, quiet_s, dropped_s}
         self.in_text = []
         self.out_text = []
         self._idle_handle = None
@@ -422,9 +446,15 @@ class S2SProvider(S2SProviderBase):
         played = self.speaker.played_ms()
         self.suppress = True
         self.t_abort = time.time()
+        cut = "".join(self.out_text)          # _end_segment 会清掉，先留下被截这段的转写
         await self._end_segment(interrupted=True)
         self.stats[f"barge_{reason}"] = self.stats.get(f"barge_{reason}", 0) + 1
         self.logger.bind(tag=TAG).info(f"打断（{reason}）：本段已播 {played} ms t={time.time():.3f}")
+        # 设备 abort 不走这条：设备误停后模型接着讲才是想要的恢复（11-03 f2 / f3 的误停）
+        if reason == "transcript" and self.tail_max_s > 0 and not _ends_sentence(cut):
+            self._tail = {"t0": time.monotonic(), "boundary": False, "quiet_s": 0.0, "dropped_s": 0.0}
+            last = f"（末尾「{cut.rstrip()[-4:]}」）" if self.log_text and cut.strip() else ""
+            self.logger.bind(tag=TAG).info(f"Live 截在半句{last}：丢掉这句剩下的，等转写到句末 t={time.time():.3f}")
 
     async def _barge(self, reason: str) -> None:
         self._pending_barge = reason
@@ -468,6 +498,8 @@ class S2SProvider(S2SProviderBase):
                 # 一句话的第一个转写片段：探针用它对齐"用户开口 → 模型听到"（时间戳给毫秒，日志自带的只到秒）
                 self.logger.bind(tag=TAG).info(f"Live 听到用户 t={time.time():.3f} playing={self.in_seg}")
                 self.spawn(self._maybe_refresh())   # 用户开口到后台调工具之间还有一两秒，够把新注册的工具同步上去
+                if self._tail is not None:
+                    self._end_tail("用户又开口")        # 模型接下来回应这句新话，不再当旧句的后半句丢
             self.in_text.append(ev.get("delta") or "")
             self.t_last_input_text = now
             self.t_activity = now
@@ -478,6 +510,10 @@ class S2SProvider(S2SProviderBase):
                     await self._barge("transcript")
         elif et == "session.output_transcript.delta":
             self.out_text.append(ev.get("delta") or "")
+            if self._tail is not None and not self._tail["boundary"] and _sentence_end("".join(self.out_text)) >= 0:
+                self._tail["boundary"] = True
+                said = f"：{''.join(self.out_text)}" if self.log_text else ""
+                self.logger.bind(tag=TAG).info(f"Live 截断后转写到了句末 t={time.time():.3f}{said}")
         elif et == "response.event":
             await self._on_backend_event(ev.get("event") or {})
         elif et == "session.delegation.created":
@@ -696,6 +732,8 @@ class S2SProvider(S2SProviderBase):
             return
         ms = len(pcm) / 2 / LIVE_RATE * 1000
         loud = audioop.rms(pcm, 2) > self.speech_rms
+        if self._tail is not None and self._tail_frame(loud, ms):
+            return
         if not loud:
             if self.suppress and self._may_resume():
                 self.suppress = False  # 用户说完了、模型也停了：下一次开口是对用户的回应
@@ -725,6 +763,37 @@ class S2SProvider(S2SProviderBase):
         if tr.t_last >= self.t_abort - 0.5:          # 打断前后用户在说话
             return not tr.loud and now - tr.t_last >= self.resume_after_user_s
         return now - self.t_abort >= self.resume_max_wait_s
+
+    def _tail_frame(self, loud: bool, ms: float) -> bool:
+        """转写截断截在半句时，丢掉这句剩下的；返回 True = 这一帧丢掉，不再往下走。
+        转写里的"停"在出声后约 2 s 才到，这时用户多半已经说完，_may_resume 0.3 s 后就放行，模型把被截那句讲完的半句
+        跟着放出来（11-03 T1："了指山顶,说"被截，0.9 s 后又放了"那儿有答案。好。"）。Live 的下行是连续流、没有回复边界；
+        段间静音也分不开：那半句和"好"之间停不到 end_silence_ms，模型截断后先停一下再接着讲又会超过它。
+        所以看输出转写：转写里出现句末、之后又静了 tail_gap_s，才算这句讲完，后面的照常（仍要过 _may_resume）。
+        模型不接旧句、直接回"好。"时这个"好"也会被丢掉，只是听不到应答。"""
+        t = self._tail
+        if time.monotonic() - t["t0"] >= self.tail_max_s:
+            self._end_tail("没等到句末")
+            return False
+        if loud:
+            t["quiet_s"] = 0.0
+            t["dropped_s"] += ms / 1000
+            return True
+        t["quiet_s"] += ms / 1000
+        if t["boundary"] and t["quiet_s"] >= self.tail_gap_s:
+            self._end_tail("句末")
+            return False
+        return True    # 静音帧也不往下走：_may_resume 在这期间不许把 suppress 清掉
+
+    def _end_tail(self, why: str) -> None:
+        t, self._tail = self._tail, None
+        # 丢掉的那半句不显示、不进 history：输出转写只留句末之后的（多半是"好"）
+        txt = "".join(self.out_text)
+        i = _sentence_end(txt)
+        self.out_text[:] = [txt[i:]] if i >= 0 else []
+        self.stats.setdefault("tail_dropped_ms", []).append(round(t["dropped_s"] * 1000))
+        self.logger.bind(tag=TAG).info(
+            f"Live 截断后的半句丢完（{why}）：丢了 {round(t['dropped_s'] * 1000)} ms 有声帧 t={time.time():.3f}")
 
     async def _begin_segment(self) -> None:
         self.in_seg = True

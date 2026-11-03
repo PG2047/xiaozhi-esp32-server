@@ -156,6 +156,97 @@ def test_stop_words_can_be_turned_off():
     run(sc)
 
 
+async def _cut(lv, p, played="老乌鸦指了指山顶,说"):
+    """播放中由转写截断：本段的输出转写停在 played。"""
+    p.resume_max_wait_s = 0.0
+    await lv.audio(4, 2000)
+    await wait_until(lambda: p.in_seg, what="进段")
+    await lv.emit({"type": "session.output_transcript.delta", "delta": played})
+    await lv.emit({"type": "session.input_transcript.delta", "delta": "停一下"})
+    await wait_until(lambda: p.stats["barge_transcript"] == 1, what="停止词截断")
+
+
+def _shown(conn):
+    return [t.get("text") for t in conn.websocket.texts() if t.get("state") == "sentence_start"]
+
+
+def test_transcript_cut_mid_sentence_drops_rest_of_that_sentence():
+    async def sc(lv, conn, p):          # 11-03 T1："了指山顶,说"被截，0.9 s 后又放了"那儿有答案。好。"
+        await _cut(lv, p)
+        assert p._tail is not None
+        n = len(conn.websocket.frames())
+        await lv.audio(3, 0)            # 模型先停一下，比 end_silence_ms 还长
+        await lv.audio(3, 2000)         # 再把那句讲完：丢
+        await lv.emit({"type": "session.output_transcript.delta", "delta": "那儿有答案。"})
+        await lv.emit({"type": "session.output_transcript.delta", "delta": "好。"})
+        await lv.audio(1, 2000)
+        await _real_sleep(0.1)
+        assert len(conn.websocket.frames()) == n and p.stats["segments"] == 1
+        await lv.audio(2, 0)            # 句末之后的停顿
+        await wait_until(lambda: p._tail is None, what="半句丢完")
+        await lv.audio(3, 2000)         # "好"：新的一段照常放
+        await wait_until(lambda: p.stats["segments"] == 2, what="应答段")
+        await lv.audio(5, 0)
+        await wait_until(lambda: "好。" in _shown(conn), what="应答文字")
+        assert not any("答案" in s for s in _shown(conn))      # 丢掉的半句不显示
+        assert p.stats["tail_dropped_ms"] == [400]
+    run(sc)
+
+
+def test_transcript_cut_at_sentence_end_resumes_as_before():
+    async def sc(lv, conn, p):
+        await _cut(lv, p, played="一个迷路的男孩闯了进去。")
+        assert p._tail is None          # 那句已经说完，后面是新的话
+        await lv.audio(1, 0)
+        await lv.audio(3, 2000)
+        await wait_until(lambda: p.stats["segments"] == 2, what="下一段")
+    run(sc)
+
+
+def test_tail_drop_gives_up_without_a_sentence_end():
+    async def sc(lv, conn, p):
+        p.tail_max_s = 0.3
+        await _cut(lv, p)
+        await lv.audio(3, 2000)         # 转写一直没到句末
+        await _real_sleep(0.35)
+        await lv.audio(1, 0)            # 超时：回到原来的恢复逻辑
+        await wait_until(lambda: p._tail is None, what="超时放弃")
+        await lv.audio(3, 2000)
+        await wait_until(lambda: p.stats["segments"] == 2, what="下一段")
+    run(sc)
+
+
+def test_new_user_utterance_ends_tail_drop():
+    async def sc(lv, conn, p):
+        await _cut(lv, p)
+        p.t_last_input_text -= 2        # 隔了 2 秒，用户又说了一句新的
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "讲个笑话吧"})
+        await wait_until(lambda: p._tail is None, what="新话结束丢半句")
+        await lv.audio(1, 0)
+        await lv.audio(3, 2000)         # 对新话的回应照常放
+        await wait_until(lambda: p.stats["segments"] == 2, what="回应段")
+    run(sc)
+
+
+def test_tail_drop_can_be_turned_off():
+    async def sc(lv, conn, p):
+        p.tail_max_s = 0
+        await _cut(lv, p)
+        assert p._tail is None
+    run(sc)
+
+
+def test_sentence_end_marks():
+    from core.providers.s2s.openai_live.openai_live import _ends_sentence, _sentence_end
+    assert _sentence_end("那儿有答案。好。") == 6
+    assert _sentence_end("指向-好。") == 3                # 模型自己掐断的"-"
+    assert _sentence_end("......好那我停") == 6
+    assert _sentence_end("“你想去哪儿？”他问") == 8       # 引号算在这句里
+    assert _sentence_end("了指山顶,说那儿") == -1
+    assert _ends_sentence("闯了进去。") and _ends_sentence("都能找到归处。”")
+    assert not _ends_sentence("了指山顶,说") and not _ends_sentence("五、六、") and not _ends_sentence("")
+
+
 def test_uplink_only_while_listening_when_configured():
     async def sc(lv, conn, p):
         p.forward_before_listen = False
