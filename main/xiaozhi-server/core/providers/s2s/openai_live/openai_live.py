@@ -325,14 +325,12 @@ class S2SProvider(S2SProviderBase):
         return pcm
 
     def _user_spoke_since_wake(self) -> bool:
-        """唤醒后用户是不是接着在说话。只认人声，不看电平：11-03 v9 复测时唤醒后上行一阵 13780 的响声（不是人在说话）
-        让"我在"被跳过，用户以为没唤醒。人声门判出人声，或者模型已经转写出了话，才算。"""
+        """唤醒后用户是不是接着在说话：只认模型转写出了话。
+        不看电平：11-03 v9 复测，唤醒后一阵 13780 的非人声响声让"我在"被跳过，用户以为没唤醒。
+        也不看人声门：设备连上后会把唤醒词音频再发一遍，人声门把它判成人声，"我在"同样被跳过（11-03 12:19）。"""
         t0 = self.t_wake_trigger
         if t0 is None:
             return False
-        sg = self.speech_gate
-        if sg is not None and sg.t_last_speech is not None and sg.t_last_speech >= t0:
-            return True
         return self.t_last_input_text is not None and self.t_last_input_text >= t0
 
     async def _play_greeting(self) -> None:
