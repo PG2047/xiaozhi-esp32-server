@@ -442,6 +442,45 @@ def test_client_delegation_long_tool_result_gets_summarised():
     _run_client(sc)
 
 
+def test_client_delegation_long_tool_result_raw_text_goes_to_thinking_first():
+    """总结会删细节（农历的宜忌），原文按 400 字切成 thinking 先发，再发 commentary；总长截到 tool_context_max_chars。"""
+    async def sc(lv, conn, p):
+        n = {"i": 0}
+        raw = "宜: " + "祭祀、" * 300          # 903 字
+
+        async def fake(items, tools):
+            n["i"] += 1
+            if n["i"] == 1:
+                return {"output": [{"type": "function_call", "call_id": "c1", "name": "get_lunar", "arguments": "{}"}]}
+            return {"output": [{"type": "message", "content": [{"type": "output_text", "text": "今天是农历九月廿五。"}]}]}
+
+        async def run(name, args):
+            return raw
+        p._responses_call = fake
+        p.tools.run = run
+        p.context_max_chars = 850
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d3", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        sent = [m for m in lv.received if m["type"] in ("session.thinking.append", "session.commentary.append")]
+        assert [m["type"] for m in sent] == ["session.thinking.append"] * 3 + ["session.commentary.append"]
+        assert all(m["delegation_id"] == "d3" for m in sent)
+        assert [len(m["content"]) for m in sent[:3]] == [400, 400, 50]
+        assert "".join(m["content"] for m in sent[:3]) == raw[:850]
+        assert sent[3]["content"] == "今天是农历九月廿五。"
+    _run_client(sc)
+
+
+def test_client_delegation_short_tool_result_sends_no_thinking():
+    async def sc(lv, conn, p):
+        async def fake(items, tools):
+            return {"output": [{"type": "function_call", "call_id": "c1", "name": "hass_state", "arguments": "{}"}]}
+        p._responses_call = fake
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d4", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        assert not any(m["type"] == "session.thinking.append" for m in lv.received)
+    _run_client(sc)
+
+
 
 class FakeVAD:
     """按帧里的幅度给人声概率：幅度 ≥ 1000 的窗口算人声。"""
@@ -564,11 +603,84 @@ def test_decisions_low_confidence_or_none_falls_back_to_model():
         assert rec["commentary"] == "模型自己答了。" and rec["calls"] == []
 
 
+def test_responses_tools_sent_non_strict(monkeypatch):
+    """Responses 的工具不写 strict 会按严格模式出参，可选参数全被填上（11-03 空跑：HA intent 补出 floor:""、
+    device_class:["switch"]）。强制填参和退回自选两种请求都要带 strict: false，且不改传进来的工具对象。"""
+    import aiohttp
+    sent = []
+
+    class Reply:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def json(self):
+            return {"output": []}
+
+    class Session(Reply):
+        def __init__(self, *a, **kw):
+            pass
+
+        def post(self, url, json=None, headers=None):
+            sent.append(json)
+            return Reply()
+    monkeypatch.setattr(aiohttp, "ClientSession", Session)
+    tool = {"type": "function", "name": "intent__HassTurnOn", "description": "打开设备",
+            "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "floor": {"type": "string"}}}}
+
+    async def go():
+        p = S2SProvider({"api_key": "k", "delegation_mode": "client", "tool_picker": "decisions", "echo_gate": False,
+                         "wake_greeting_text": ""}, FakeConn(asyncio.get_running_loop()))
+
+        async def fake_dec(ctx, tools):
+            return "intent__HassTurnOn", 0.9
+        p._decisions_call = fake_dec
+        items = [{"role": "user", "content": "用户：打开风扇"}]
+        await p._decide_first("用户：打开风扇", items, [tool])      # decisions 选中 → 强制只填这一个工具
+        await p._responses_call(items, [tool])                     # 退回小模型自选
+    asyncio.run(go())
+    assert [b["tool_choice"] for b in sent] == [{"type": "function", "name": "intent__HassTurnOn"}, "auto"]
+    assert all(b["tools"] == [dict(tool, strict=False)] for b in sent)
+    assert "strict" not in tool
+
+
 def test_dispatch_tools_drops_lunar_dont_call_hint():
     from core.providers.s2s.openai_live.openai_live import S2SProvider as P
     t = [{"name": "get_lunar", "description": "用于农历。对于'今天农历是多少'、'今天农历日期'这样的基本查询，请直接使用context中的信息，不要调用此工具。"}]
     d = P._dispatch_tools(t)[0]["description"]
     assert "不要调用此工具" not in d and "今天的农历日期也用它查" in d
+
+
+def test_dispatch_tools_explains_ha_position_direction_without_touching_input():
+    """HA 意图工具的 position 没写哪头是开，小模型把"把纱帘拉上"填成 100（HA 里 100 是全开）：补上方向。
+    顶层说明不变（decisions 只看它），已有说明不覆盖，非 HA 工具和没有 position 的工具不动，传进来的工具对象不改。"""
+    import copy
+
+    from core.providers.s2s.openai_live.openai_live import S2SProvider as P
+    pos = {"type": "integer", "minimum": 0, "maximum": 100}
+    tools = [
+        {"type": "function", "name": "intent__HassSetPosition", "description": "Sets the position of a device or entity",
+         "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "position": dict(pos)},
+                        "required": ["position"]}},
+        {"type": "function", "name": "cover__HassSetPosition", "description": "Sets the position",
+         "parameters": {"type": "object", "properties": {"position": dict(pos, description="已有说明")}}},
+        {"type": "function", "name": "play_music", "description": "播放音乐",
+         "parameters": {"type": "object", "properties": {"position": {"type": "integer"}}}},
+        {"type": "function", "name": "intent__HassTurnOff", "description": "Turns off/closes a device or entity",
+         "parameters": {"type": "object", "properties": {"name": {"type": "string"}}}},
+    ]
+    before = copy.deepcopy(tools)
+    out = P._dispatch_tools(tools)
+    assert tools == before
+    got = out[0]["parameters"]["properties"]["position"]
+    assert got == dict(pos, description="位置百分比：0 是全关（拉上、合上），100 是全开（拉开）。")
+    assert out[0]["description"] == before[0]["description"]
+    assert out[0]["parameters"]["required"] == ["position"] and out[0]["parameters"]["properties"]["name"] == {"type": "string"}
+    assert out[1:] == before[1:]
 
 
 def test_dispatch_instructions_read_ha_devices_from_conn_prompt():
@@ -580,3 +692,137 @@ def test_dispatch_instructions_read_ha_devices_from_conn_prompt():
         assert "北京书房,书房灯,light.study_lamp" in p._dispatch_instructions()
         assert p.tools.log_args is True          # log_text 打开时工具日志带参数
     _run_client(sc, log_text=True)
+
+
+class _HAFuncHandler:
+    """带 HA MCP 工具的假 func_handler：GetLiveContext 回 ha_names 测试里的虚构设备，其他调用只记下来。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def get_functions(self):
+        from tests.core.providers.s2s.test_ha_names import HA_TOOLS
+        return [{"type": "function", "function": {k: t[k] for k in ("name", "description", "parameters")}} for t in HA_TOOLS]
+
+    async def handle_llm_function_call(self, conn, data):
+        from plugins_func.register import Action, ActionResponse
+        from tests.core.providers.s2s.test_ha_names import LIVE_RESULT
+        self.calls.append(data)
+        if data["name"].endswith("GetLiveContext"):
+            return ActionResponse(Action.REQLLM, LIVE_RESULT, None)
+        return ActionResponse(Action.REQLLM, "{'response_type': 'action_done'}", None)
+
+
+def _ha_client(scenario, **over):
+    from core.providers.s2s.openai_live import openai_live as mod
+    mod._HA_CACHE.update(t=0.0, entries=[])            # 进程内缓存，测试之间清掉
+
+    async def sc(lv, conn, p):
+        conn.func_handler = _HAFuncHandler()
+        await p._load_ha_names()
+        await scenario(lv, conn, p)
+    _run_client(sc, **over)
+
+
+async def _delegate(lv, p, said: str | None, call: dict, did: str) -> str:
+    """said=None：委托时这句转写还没到（in_text 是空的）。"""
+    async def fake(items, tools):
+        return {"output": [dict(call, type="function_call", call_id="c1")]}
+    p._responses_call = fake
+    if said is not None:
+        await lv.emit({"type": "session.input_transcript.delta", "delta": said})
+        await _real_sleep(0.05)
+    await lv.emit({"type": "session.delegation.created", "delegation": {"id": did, "target": "client"}})
+    await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+    return [m for m in lv.received if m["type"] == "session.commentary.append"][0]["content"]
+
+
+def test_ha_names_go_into_dispatch_instructions_and_are_cached():
+    """组件就绪后只读调一次 GetLiveContext：调度指令带上规则和名单（Live 主模型的指令不带）；缓存期内别的连接不再调。"""
+    async def sc(lv, conn, p):
+        d = p._dispatch_instructions()
+        assert "- 甲地1号客厅纱帘 / 客厅纱帘 / 甲地客厅纱帘" in d and "不要把地点或房间拆到 area" in d
+        assert "甲地1号客厅纱帘" not in lv.received[0]["session"]["instructions"]
+        assert [c["name"] for c in conn.func_handler.calls] == ["homeassistant__GetLiveContext"]
+        other = S2SProvider({"api_key": "k", "delegation_mode": "client", "echo_gate": False, "wake_greeting_text": ""}, conn)
+        await other._load_ha_names()
+        assert other._ha_entries == p._ha_entries and len(conn.func_handler.calls) == 1
+    _ha_client(sc)
+
+
+def test_place_guard_blocks_device_in_another_area_before_running_it():
+    """用户说乙地，小模型照抄了甲地设备不带地名的别名：不执行，交给 Live 的说明讲清楚。"""
+    async def sc(lv, conn, p):
+        content = await _delegate(lv, p, "把乙地的除醛净化器关了",
+                                  {"name": "intent__HassTurnOff", "arguments": "{\"name\": \"除醛净化器\"}"}, "g1")
+        assert "没有执行" in content and "乙地老家" in content
+        assert [c["name"] for c in conn.func_handler.calls] == ["homeassistant__GetLiveContext"]
+    _ha_client(sc)
+
+
+def test_same_area_ha_call_runs_with_device_class_moved_out_of_domain():
+    async def sc(lv, conn, p):
+        await _delegate(lv, p, "把甲地的窗帘都关上",
+                        {"name": "intent__HassTurnOff", "arguments": "{\"area\": \"甲地楼下1号\", \"domain\": [\"curtain\"]}"}, "g2")
+        call = conn.func_handler.calls[-1]
+        assert call["name"] == "intent__HassTurnOff"
+        assert json.loads(call["arguments"]) == {"area": "甲地楼下1号", "device_class": ["curtain"]}
+    _ha_client(sc)
+
+
+def test_ha_names_off_keeps_dispatch_and_calls_as_before():
+    async def sc(lv, conn, p):
+        assert p._ha_entries == [] and "不要把地点或房间拆到 area" not in p._dispatch_instructions()
+        await _delegate(lv, p, "把乙地的除醛净化器关了",
+                        {"name": "intent__HassTurnOff", "arguments": "{\"name\": \"除醛净化器\"}"}, "g3")
+        assert [c["name"] for c in conn.func_handler.calls] == ["intent__HassTurnOff"]
+    _ha_client(sc, ha_names=False)
+
+
+def test_place_guard_only_reads_what_user_said_since_last_delegation():
+    """上一轮（上次委托之前）提到的地方不算：这一轮没说地点、或者转写还没到，就不拦；
+    这期间落进 history 的用户发言（Live 先开口时会把转写刷进去）照样算。"""
+    off = "intent__HassTurnOff"
+
+    async def sc(lv, conn, p):
+        p.history += [("user", "把乙地的风扇打开"), ("assistant", "好了。")]
+        p._guard_mark = len(p.history)                      # 上一次委托在这之后结束
+        await _delegate(lv, p, None, {"name": off, "arguments": "{\"name\": \"甲地除醛净化器\"}"}, "h1")
+        assert conn.func_handler.calls[-1]["name"] == off
+    _ha_client(sc)
+
+    async def sc2(lv, conn, p):
+        p.history += [("user", "把乙地的风扇打开"), ("assistant", "好了。")]
+        p._guard_mark = len(p.history)
+        await _delegate(lv, p, "把甲地的除醛净化器关了", {"name": off, "arguments": "{\"name\": \"除醛净化器\"}"}, "h2")
+        assert conn.func_handler.calls[-1]["name"] == off
+    _ha_client(sc2)
+
+    async def sc3(lv, conn, p):
+        p.history += [("user", "把乙地的除醛净化器关了"), ("assistant", "好，我来关。")]   # 上次委托之后才落进来
+        content = await _delegate(lv, p, None, {"name": off, "arguments": "{\"name\": \"除醛净化器\"}"}, "h3")
+        assert "没有执行" in content and [c["name"] for c in conn.func_handler.calls] == ["homeassistant__GetLiveContext"]
+        assert p._guard_mark == len(p.history)
+    _ha_client(sc3)
+
+
+def test_ha_names_wait_for_tool_handler_init():
+    """工具处理器在后台初始化，组件就绪时 HA 的 MCP 工具常常还没挂上（finish_init=False、清单里没有 GetLiveContext）：
+    要等它初始化完再取名单（11-03 部署后探针：没等，名单一直没取到）。"""
+    from core.providers.s2s.openai_live import openai_live as mod
+    mod._HA_CACHE.update(t=0.0, entries=[])
+
+    async def sc(lv, conn, p):
+        fh = _HAFuncHandler()
+        fh.finish_init = False
+        full = fh.get_functions
+        fh.get_functions = lambda: full() if fh.finish_init else full()[:1]     # 初始化完之前只有插件工具
+        conn.func_handler = fh
+
+        async def init_done():
+            await _real_sleep(0.3)
+            fh.finish_init = True
+        asyncio.ensure_future(init_done())
+        await p._load_ha_names()
+        assert p._ha_entries and [c["name"] for c in fh.calls] == ["homeassistant__GetLiveContext"]
+    _run_client(sc)
