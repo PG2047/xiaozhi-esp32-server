@@ -323,6 +323,69 @@ def test_new_user_sentence_ends_the_hold():
     run(sc)
 
 
+def test_question_after_the_stop_word_in_the_same_sentence_gets_answered():
+    async def sc(lv, conn, p):          # "小智，等一下，一加一等于几"连着说：停下的同时等这句说完放回答
+        await _stop_while_playing(lv, p, said="小智,等一下,")
+        assert p.stats["barge_transcript"] == 1
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "一加一等于几"})
+        await wait_until(lambda: p._stop is None, what="停下结束")
+        await lv.audio(1, 0)
+        await lv.audio(3, 2000)         # 回答照常放
+        await wait_until(lambda: p.stats["segments"] == 2, what="回答段")
+    run(sc)
+
+
+def test_question_in_the_same_fragment_as_the_stop_word_gets_answered():
+    async def sc(lv, conn, p):
+        p.resume_max_wait_s = 0.0
+        await lv.audio(4, 2000)
+        await wait_until(lambda: p.in_seg, what="进段")
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "等一下,一加一等于几"})
+        await wait_until(lambda: p.stats["barge_transcript"] == 1, what="截断旧内容")
+        assert p._stop is None and p.stats["stop_holds"] == 1
+        await lv.audio(1, 0)
+        await lv.audio(3, 2000)
+        await wait_until(lambda: p.stats["segments"] == 2, what="回答段")
+    run(sc)
+
+
+def test_question_after_the_stop_word_following_a_device_abort_gets_answered():
+    async def sc(lv, conn, p):
+        p.resume_after_user_s = 0.2
+        await lv.audio(4, 2000)
+        await wait_until(lambda: p.in_seg, what="进段")
+        await p.on_pcm(LOUD_UP)
+        await p.cancel("device")
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "小智,停一下,"})
+        await wait_until(lambda: p._stop is not None, what="停下")
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "现在几点"})
+        await wait_until(lambda: p._stop is None, what="停下结束")
+        await lv.audio(2, 0)
+        await lv.audio(3, 2000)         # 用户还没说完：先丢
+        await _real_sleep(0.1)
+        assert p.stats["segments"] == 1
+        await _real_sleep(0.45)
+        await p.on_pcm(QUIET_UP)        # 说完
+        await lv.audio(1, 0)
+        await lv.audio(3, 2000)         # 回答
+        await wait_until(lambda: p.stats["segments"] == 2, what="回答段")
+    run(sc)
+
+
+def test_stop_word_with_only_fillers_still_holds():
+    async def sc(lv, conn, p):
+        await _stop_while_playing(lv, p, said="小智,停一下")
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "吧。"})
+        await lv.audio(1, 0)
+        await lv.audio(3, 2000)
+        await _real_sleep(0.1)
+        assert p._stop is not None and p.stats["segments"] == 1
+        assert not p._has_more("一下") and not p._has_more("一下好吗") and not p._has_more("下来")
+        assert not p._has_more("一点") and not p._has_more("一下,谢谢") and not p._has_more(",小智,停一下")
+        assert p._has_more(",一加一等于几") and p._has_more("一下,现在几点") and p._has_more("一下我问你个问题")
+    run(sc)
+
+
 def test_heard_as_listen_counts_as_stop():
     async def sc(lv, conn, p):          # 11-03 23:37：Mac 17 外放三次"停一下"有两次被转写成"听一下"
         await _stop_while_playing(lv, p, said="小智,听一下")

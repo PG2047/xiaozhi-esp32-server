@@ -45,6 +45,9 @@ TTS_RATE = 24000        # /v1/audio/speech 的 pcm 是 24 kHz 16-bit 单声道
 CONTEXT_CHUNK_CHARS = 400   # session.thinking.append 每条 content 上限 500 token，中文按 400 字切
 _GREETING_CACHE: dict[tuple, bytes] = {}   # (voice, 文本, 设备采样率) → PCM，进程内共用：只有第一次唤醒要等 TTS
 _HA_CACHE: dict = {"t": 0.0, "entries": []}  # GetLiveContext 解析出的设备表，进程内各连接共用（见 _load_ha_names）；只按一个 HA 缓存
+# 喊停那句里不算"别的话"的词：口头的"一下 / 一点 / 下来"、称呼、客气话和语气词（见 _has_more），长的在前
+_STOP_FILLERS = ("好不好", "可以吗", "一下", "一点", "下来", "好吗", "行吗", "好的", "谢谢", "那个", "先", "你", "我", "好",
+                 "吧", "啊", "呀", "呢", "嗯", "哦", "噢", "喔", "唉", "诶", "欸", "哎", "嘛", "啦", "了", "吗")
 
 
 def _trim_silence(pcm: bytes, rate: int, rms: int = 200, pad_ms: int = 40) -> bytes:
@@ -450,12 +453,13 @@ class S2SProvider(S2SProviderBase):
         self._pending_barge = reason
         await handleAbortMessage(self.conn)  # 发 tts stop、清队列，再经 abortHandle 调到 cancel()
 
-    async def _stop_on(self, word: str) -> None:
+    async def _stop_on(self, word: str, after: str) -> None:
         """用户这句里有停止词：不论设备是否已经 abort、是否在 suppress 期间，都不再按 _may_resume 放出模型接下来的话，
         一直丢模型的声音，直到用户再开口（上行开口，或新的一句转写）。11-03 T4：设备 1.37 s 判停后，模型没理会"别说了"，
         等用户说完又接着讲了约 20 s；转写截断之后，模型也常把被截那句讲完再说"好"（T1："那儿有答案。好。"）。
         模型自己的"好"也一起丢了，所以等用户说完补一声缓存的"好"（只补一次），让用户知道它听到了。
-        只有设备 abort、转写里没有停止词（误停、打字）时，照旧按 _may_resume 接着讲。"""
+        只有设备 abort、转写里没有停止词（误停、打字）时，照旧按 _may_resume 接着讲。
+        喊停后同一句里还接着问了别的（"等一下，一加一等于几"），认出来就结束停下（见 _has_more）。"""
         playing = (self.in_seg or self.speaker.speaking) and not self.suppress
         how = "播放中由服务端截断" if playing else ("设备已经停了" if self.suppress else "刚停")
         self.logger.bind(tag=TAG).info(f"Live 转写里有停止词「{word}」，{how}；停到用户再开口 t={time.time():.3f}")
@@ -466,8 +470,20 @@ class S2SProvider(S2SProviderBase):
         now = time.monotonic()
         # 进停下后 0.6 s 内的上行开口不算：转写截断时设备还要约 0.1 s 才停，残余回声再拖一两百毫秒；
         # 11-03 T1 讲故事中没人说话时也一直有"上行开口 playing=True"（回声过了 onset_rms）
-        self._stop = {"ack": bool(self.stop_ack_text), "onset_ok": now + 0.6, "text_ok": now, "dropped_s": 0.0}
+        self._stop = {"ack": bool(self.stop_ack_text), "onset_ok": now + 0.6, "text_ok": now, "dropped_s": 0.0,
+                      "after": after}
         self.stats["stop_holds"] = self.stats.get("stop_holds", 0) + 1
+        if self._has_more(after):
+            await self._end_stop("喊停后接着说了别的")
+
+    def _has_more(self, after: str) -> bool:
+        """喊停那句里，停止词后面还有没有别的话：去掉"小智"、停止词、语气词和标点，还剩 2 个字以上就算。
+        有的话停下就结束，交回 _may_resume：等用户说完 0.3 s，模型的回答照常放（"停一下，现在几点"）。
+        Live 没有"这句转写定稿"的事件，所以不等这一句结束再判。"""
+        t = after.replace("小智", "")
+        for w in sorted(self.stop_words, key=len, reverse=True) + list(_STOP_FILLERS):
+            t = t.replace(w, "")
+        return sum(1 for ch in t if ch.isalnum()) >= 2
 
     async def _end_stop(self, why: str) -> None:
         s, self._stop = self._stop, None
@@ -502,13 +518,13 @@ class S2SProvider(S2SProviderBase):
         self.spawn(self.speaker.end())
         self.logger.bind(tag=TAG).info(f"Live 停下应答「{self.stop_ack_text}」{round(dur * 1000)} ms t={time.time():.3f}")
 
-    def _stop_word_in(self, text: str) -> str | None:
-        """用户这句里的停止词；"不要停""别停"这类否定的不算（"给我讲个故事，不要停"）。"""
+    def _stop_word_at(self, text: str) -> tuple[str, int] | None:
+        """用户这句里的停止词和它后面的位置；"不要停""别停"这类否定的不算（"给我讲个故事，不要停"）。"""
         for w in self.stop_words:
             i = text.find(w)
             while i >= 0:
                 if not (w == "停" and text[max(0, i - 2):i].endswith(("不要", "别", "不", "没"))):
-                    return w
+                    return w, i + len(w)
                 i = text.find(w, i + 1)
         return None
 
@@ -536,19 +552,26 @@ class S2SProvider(S2SProviderBase):
             await self._on_audio(base64.b64decode(ev.get("delta") or ev.get("audio") or ""))
         elif et == "session.input_transcript.delta":
             now = time.monotonic()
-            if self.t_last_input_text is None or now - self.t_last_input_text > 1.5:
+            delta = ev.get("delta") or ""
+            new_utt = self.t_last_input_text is None or now - self.t_last_input_text > 1.5
+            if new_utt:
                 # 一句话的第一个转写片段：探针用它对齐"用户开口 → 模型听到"（时间戳给毫秒，日志自带的只到秒）
                 self.logger.bind(tag=TAG).info(f"Live 听到用户 t={time.time():.3f} playing={self.in_seg}")
                 self.spawn(self._maybe_refresh())   # 用户开口到后台调工具之间还有一两秒，够把新注册的工具同步上去
                 if self._stop is not None and now >= self._stop["text_ok"]:
                     await self._end_stop("用户新的一句")
-            self.in_text.append(ev.get("delta") or "")
+            self.in_text.append(delta)
             self.t_last_input_text = now
             self.t_activity = now
-            if self.stop_words and self._stop is None:
-                w = self._stop_word_in("".join(self.in_text))
-                if w and (self.in_seg or self.suppress or self.speaker.speaking or now - self.t_seg_end <= self.stop_recent_s):
-                    await self._stop_on(w)
+            if self._stop is not None and not new_utt:       # 喊停那句还没说完
+                self._stop["after"] += delta
+                if self._has_more(self._stop["after"]):
+                    await self._end_stop("喊停后接着说了别的")
+            elif self.stop_words and self._stop is None:
+                text = "".join(self.in_text)
+                hit = self._stop_word_at(text)
+                if hit and (self.in_seg or self.suppress or self.speaker.speaking or now - self.t_seg_end <= self.stop_recent_s):
+                    await self._stop_on(hit[0], text[hit[1]:])
         elif et == "session.output_transcript.delta":
             self.out_text.append(ev.get("delta") or "")
         elif et == "response.event":
