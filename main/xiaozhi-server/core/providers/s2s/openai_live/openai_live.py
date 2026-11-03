@@ -116,6 +116,7 @@ class S2SProvider(S2SProviderBase):
         self.ha_names = bool(c.get("ha_names", True))
         self.ha_names_domains = tuple(c.get("ha_names_domains") or ha_names.DEFAULT_DOMAINS)
         self.ha_names_ttl_s = float(c.get("ha_names_ttl_s", 600))
+        self.ha_names_wait_s = float(c.get("ha_names_wait_s", 15))   # 等工具处理器初始化完（HA MCP 连上）的上限
         self._ha_entries: list[dict] = []
         self._guard_mark = 0          # 上次委托结束时 history 的长度：地点守卫只看这之后用户说的话
         self.history: list[tuple[str, str]] = []
@@ -230,15 +231,21 @@ class S2SProvider(S2SProviderBase):
 
     async def _load_ha_names(self) -> None:
         """只读调一次 HA 的 GetLiveContext，解析成名单 / 守卫用的设备表，进程内缓存 ha_names_ttl_s 秒（各连接共用）。
-        HA 工具在会话建立之后才挂上，所以等组件就绪再取；取到之前、取不到、解析不出时，调度照旧不带名单。"""
+        取到之前、取不到、解析不出时，调度照旧不带名单。"""
         if not self.ha_names:
             return
         if _HA_CACHE["entries"] and time.monotonic() - _HA_CACHE["t"] < self.ha_names_ttl_s:
             self._ha_entries = _HA_CACHE["entries"]
             return
-        name = next((t["name"] for t in self._tool_list() if t["name"].endswith("GetLiveContext")), None)
         fh = getattr(self.conn, "func_handler", None)
+        # 工具处理器在后台初始化（connection._initialize_intent 用 run_coroutine_threadsafe 起，不等它），组件就绪时
+        # HA 的 MCP 工具常常还没挂上（11-03 部署后探针：会话建立时 tools=0），所以等它 finish_init，最多 ha_names_wait_s 秒
+        t_end = time.monotonic() + self.ha_names_wait_s
+        while fh is not None and not getattr(fh, "finish_init", True) and time.monotonic() < t_end:
+            await asyncio.sleep(0.2)
+        name = next((t["name"] for t in self._tool_list() if t["name"].endswith("GetLiveContext")), None)
         if not name or fh is None:
+            self.logger.bind(tag=TAG).info("Live HA 设备名单：工具清单里没有 GetLiveContext，调度不带名单")
             return
         t0 = time.time()
         try:
