@@ -398,6 +398,45 @@ def test_client_delegation_long_tool_result_gets_summarised():
     _run_client(sc)
 
 
+def test_client_delegation_long_tool_result_raw_text_goes_to_thinking_first():
+    """总结会删细节（农历的宜忌），原文按 400 字切成 thinking 先发，再发 commentary；总长截到 tool_context_max_chars。"""
+    async def sc(lv, conn, p):
+        n = {"i": 0}
+        raw = "宜: " + "祭祀、" * 300          # 903 字
+
+        async def fake(items, tools):
+            n["i"] += 1
+            if n["i"] == 1:
+                return {"output": [{"type": "function_call", "call_id": "c1", "name": "get_lunar", "arguments": "{}"}]}
+            return {"output": [{"type": "message", "content": [{"type": "output_text", "text": "今天是农历九月廿五。"}]}]}
+
+        async def run(name, args):
+            return raw
+        p._responses_call = fake
+        p.tools.run = run
+        p.context_max_chars = 850
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d3", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        sent = [m for m in lv.received if m["type"] in ("session.thinking.append", "session.commentary.append")]
+        assert [m["type"] for m in sent] == ["session.thinking.append"] * 3 + ["session.commentary.append"]
+        assert all(m["delegation_id"] == "d3" for m in sent)
+        assert [len(m["content"]) for m in sent[:3]] == [400, 400, 50]
+        assert "".join(m["content"] for m in sent[:3]) == raw[:850]
+        assert sent[3]["content"] == "今天是农历九月廿五。"
+    _run_client(sc)
+
+
+def test_client_delegation_short_tool_result_sends_no_thinking():
+    async def sc(lv, conn, p):
+        async def fake(items, tools):
+            return {"output": [{"type": "function_call", "call_id": "c1", "name": "hass_state", "arguments": "{}"}]}
+        p._responses_call = fake
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d4", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        assert not any(m["type"] == "session.thinking.append" for m in lv.received)
+    _run_client(sc)
+
+
 
 class FakeVAD:
     """按帧里的幅度给人声概率：幅度 ≥ 1000 的窗口算人声。"""

@@ -39,6 +39,7 @@ TAG = __name__
 LIVE_RATE = 16000       # 上下行都用 16 kHz（Live 支持 16 k / 24 k）
 WAKE_TRIGGER = "嘿，你好呀"
 TTS_RATE = 24000        # /v1/audio/speech 的 pcm 是 24 kHz 16-bit 单声道
+CONTEXT_CHUNK_CHARS = 400   # session.thinking.append 每条 content 上限 500 token，中文按 400 字切
 _GREETING_CACHE: dict[tuple, bytes] = {}   # (voice, 文本, 设备采样率) → PCM，进程内共用：只有第一次唤醒要等 TTS
 
 
@@ -100,6 +101,7 @@ class S2SProvider(S2SProviderBase):
         self.ack_delay_ms = int(c.get("ack_delay_ms", 800))
         self.tool_rounds = int(c.get("tool_rounds", 3))
         self.direct_max_chars = int(c.get("tool_direct_max_chars", 200))   # 单个工具结果不超过这么长就直接交给 Live 转述，省一轮
+        self.context_max_chars = int(c.get("tool_context_max_chars", 1200))  # 更长的结果总结后，原文作背景给 Live 的上限（0 关掉）
         # 选工具的第一步：model = tool_model 自己选；decisions = 先用 /v1/decisions（gpt-6-luna，只做多选一）挑工具，
         # 不要参数的直接调用、要参数的再让 tool_model 强制只填这一个工具的参数；拿不准（置信度 < decision_min_confidence）
         # 或判成"不需要工具"就退回 model 的做法。11-03 夜 72 题对比：两种都 72/72，decisions 选工具中位 0.21 s（mini 0.94 s）
@@ -523,7 +525,7 @@ class S2SProvider(S2SProviderBase):
         ctx = "\n".join(f"{'用户' if r == 'user' else '小智'}：{t}" for r, t in turns) or self.last_user_text
         items: list = [{"role": "user", "content": ctx}]
         tools = self._dispatch_tools(self._tool_list())
-        answer, used = "", []
+        answer, used, raw = "", [], []
         try:
             first = await self._decide_first(ctx, items, tools) if self.tool_picker == "decisions" else None
             for i in range(max(1, self.tool_rounds)):
@@ -552,13 +554,22 @@ class S2SProvider(S2SProviderBase):
                     call = calls[0]
                     answer = f"已调用 {call.get('name')}（参数 {call.get('arguments') or '{}'}），结果：{outputs[0]}"
                     break
+                # 长结果交给小模型总结成一两句，总结常会删掉细节（农历插件自己写着"仅在要求查询宜忌时才返回宜忌"），
+                # 用户接着问宜忌时 Live 手边没有真数据，就凭记忆编（11-03 直连 API：10 次接话 2 次编）；原文另作背景交给 Live
+                raw += [o for o in outputs if len(o) > self.direct_max_chars]
             else:
                 answer = answer or "这个我暂时没查到。"
         except Exception as e:  # noqa: BLE001
             self.logger.bind(tag=TAG).warning(f"Live 工具调度失败 {type(e).__name__}: {e}")
             answer = "这个我暂时查不到，稍后再试。"
+        # 背景用 session.thinking.append：只当上下文、不要求念出来；每条 content 上限 500 token，按 400 字切，总长有上限
+        context = "\n".join(raw)[:self.context_max_chars]
+        for i in range(0, len(context), CONTEXT_CHUNK_CHARS):
+            await self._send({"type": "session.thinking.append", "delegation_id": did,
+                              "content": context[i:i + CONTEXT_CHUNK_CHARS]})
         await self._send({"type": "session.commentary.append", "delegation_id": did, "content": (answer or "好的。")[:1500]})
-        self.logger.bind(tag=TAG).info(f"Live 委托交回 tools={used} {round(1000 * (time.time() - t0))} ms 答复 {len(answer)} 字 t={time.time():.3f}")
+        self.logger.bind(tag=TAG).info(f"Live 委托交回 tools={used} {round(1000 * (time.time() - t0))} ms 答复 {len(answer)} 字"
+                                       f"{f'，背景 {len(context)} 字' if context else ''} t={time.time():.3f}")
 
     async def _maybe_continue(self) -> None:
         """这一轮后台回复里的函数调用全部交回、且回复已 completed，才让后台继续（否则报 function_call_outputs_required）。"""
