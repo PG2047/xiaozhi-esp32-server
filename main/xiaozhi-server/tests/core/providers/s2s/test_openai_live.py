@@ -112,6 +112,50 @@ def test_after_device_abort_waits_until_user_finished():
     run(sc)
 
 
+def test_stop_word_in_transcript_while_playing_cuts_like_a_device_abort():
+    async def sc(lv, conn, p):
+        p.resume_max_wait_s = 0.0
+        await lv.audio(4, 2000)
+        await wait_until(lambda: p.in_seg, what="进段")
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "小智,"})
+        await _real_sleep(0.05)
+        assert p.in_seg and p.stats["barge_transcript"] == 0     # 只有名字：不截
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "停一下"})
+        await wait_until(lambda: p.stats["barge_transcript"] == 1, what="停止词截断")
+        assert ("tts", "stop") in conn.websocket.states() and p.suppress and not p.in_seg
+        assert p.stats["barge_device"] == 0
+        n = len(conn.websocket.frames())
+        await lv.audio(3, 2000)                                   # 模型还在把那句讲完：丢
+        await _real_sleep(0.1)
+        assert len(conn.websocket.frames()) == n
+    run(sc)
+
+
+def test_backchannel_negated_stop_and_idle_stop_word_do_not_cut():
+    async def sc(lv, conn, p):
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "停一下"})   # 设备不在播放
+        await _real_sleep(0.05)
+        assert p.stats["barge_transcript"] == 0
+        await lv.audio(4, 2000)
+        await wait_until(lambda: p.in_seg, what="进段")
+        for d in ("对对", "嗯,", "闭嘴", "不要停", "别停,接着讲"):   # "闭嘴"：11-03 一声附和"对对"被转写成它
+            await lv.emit({"type": "session.input_transcript.delta", "delta": d})
+        await _real_sleep(0.1)
+        assert p.in_seg and p.stats["barge_transcript"] == 0 and ("tts", "stop") not in conn.websocket.states()
+    run(sc)
+
+
+def test_stop_words_can_be_turned_off():
+    async def sc(lv, conn, p):
+        p.stop_words = ()
+        await lv.audio(4, 2000)
+        await wait_until(lambda: p.in_seg, what="进段")
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "停一下"})
+        await _real_sleep(0.1)
+        assert p.in_seg and p.stats["barge_transcript"] == 0
+    run(sc)
+
+
 def test_uplink_only_while_listening_when_configured():
     async def sc(lv, conn, p):
         p.forward_before_listen = False
