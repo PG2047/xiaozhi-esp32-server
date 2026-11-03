@@ -179,7 +179,7 @@ async def _stop_while_playing(lv, p, said="小智,别说了"):
 
 
 async def _user_speaks_again(p):
-    await _real_sleep(0.45)            # 喊停那句之后静了 0.4 s 以上
+    await _real_sleep(0.65)            # 喊停那句之后静了 0.4 s 以上，也过了进停下后的 0.6 s
     await p.on_pcm(LOUD_UP)            # 用户又开口
     await wait_until(lambda: p._stop is None, what="停下结束")
     await _real_sleep(0.45)
@@ -294,6 +294,19 @@ def test_stop_plays_cached_ack_once_and_its_echo_does_not_end_the_hold():
         await lv.audio(10, 0)
         await _real_sleep(0.2)
         assert p._stop is not None and p.stats["stop_holds"] == 1 and len(conn.websocket.frames()) == m
+    run(sc)
+
+
+def test_echo_right_after_the_cut_does_not_end_the_hold():
+    async def sc(lv, conn, p):          # 截断时设备还在出声，回声过了 onset_rms 也会记一次"上行开口"
+        await _stop_while_playing(lv, p)
+        await p.on_pcm(LOUD_UP)
+        await _real_sleep(0.05)
+        assert p._stop is not None
+        await _real_sleep(0.6)
+        await p.on_pcm(QUIET_UP)        # 回声过去了
+        await p.on_pcm(LOUD_UP)         # 0.6 s 之后再响：算用户开口
+        await wait_until(lambda: p._stop is None, what="停下结束")
     run(sc)
 
 

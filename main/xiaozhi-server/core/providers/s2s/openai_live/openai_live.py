@@ -464,7 +464,9 @@ class S2SProvider(S2SProviderBase):
         elif not self.suppress:
             self.suppress, self.t_abort = True, time.time()
         now = time.monotonic()
-        self._stop = {"ack": bool(self.stop_ack_text), "onset_ok": now, "text_ok": now, "dropped_s": 0.0}
+        # 进停下后 0.6 s 内的上行开口不算：转写截断时设备还要约 0.1 s 才停，残余回声再拖一两百毫秒；
+        # 11-03 T1 讲故事中没人说话时也一直有"上行开口 playing=True"（回声过了 onset_rms）
+        self._stop = {"ack": bool(self.stop_ack_text), "onset_ok": now + 0.6, "text_ok": now, "dropped_s": 0.0}
         self.stats["stop_holds"] = self.stats.get("stop_holds", 0) + 1
 
     async def _end_stop(self, why: str) -> None:
