@@ -42,7 +42,7 @@ WAKE_TRIGGER = "嘿，你好呀"
 TTS_RATE = 24000        # /v1/audio/speech 的 pcm 是 24 kHz 16-bit 单声道
 CONTEXT_CHUNK_CHARS = 400   # session.thinking.append 每条 content 上限 500 token，中文按 400 字切
 _GREETING_CACHE: dict[tuple, bytes] = {}   # (voice, 文本, 设备采样率) → PCM，进程内共用：只有第一次唤醒要等 TTS
-_HA_CACHE: dict = {"t": 0.0, "entries": []}  # GetLiveContext 解析出的设备表，进程内各连接共用（见 _load_ha_names）
+_HA_CACHE: dict = {"t": 0.0, "entries": []}  # GetLiveContext 解析出的设备表，进程内各连接共用（见 _load_ha_names）；只按一个 HA 缓存
 
 
 def _trim_silence(pcm: bytes, rate: int, rms: int = 200, pad_ms: int = 40) -> bytes:
@@ -117,6 +117,7 @@ class S2SProvider(S2SProviderBase):
         self.ha_names_domains = tuple(c.get("ha_names_domains") or ha_names.DEFAULT_DOMAINS)
         self.ha_names_ttl_s = float(c.get("ha_names_ttl_s", 600))
         self._ha_entries: list[dict] = []
+        self._guard_mark = 0          # 上次委托结束时 history 的长度：地点守卫只看这之后用户说的话
         self.history: list[tuple[str, str]] = []
         self._session_sig = None
         self._calls: dict[str, asyncio.Task] = {}   # call_id → 执行中的工具
@@ -584,8 +585,10 @@ class S2SProvider(S2SProviderBase):
         ctx = "\n".join(f"{'用户' if r == 'user' else '小智'}：{t}" for r, t in turns) or self.last_user_text
         items: list = [{"role": "user", "content": ctx}]
         tools = self._dispatch_tools(self._tool_list())
-        # 地点守卫只看用户最近一句：前几轮提到的地方不算（"打开甲地的风扇……再把乙地的也关了"）
-        last_user = pending or next((t for r, t in reversed(self.history) if r == "user"), "") or self.last_user_text
+        # 地点守卫看的是上次委托之后用户说的话：还没落进 history 的转写，加上这期间落进 history 的用户发言
+        # （Live 先开口说一句时会把转写刷进 history）。更早的不看，否则上一轮提到的地方会误拦这一轮；
+        # 多看到的地点只会让守卫放行，一句都看不到（转写还没到）就不拦
+        said = [t for r, t in self.history[self._guard_mark:] if r == "user"] + ([pending] if pending else [])
         intents = ha_names.device_intents(tools) if self.ha_names and self._ha_entries else {}
         answer, used, raw = "", [], []
         try:
@@ -605,7 +608,7 @@ class S2SProvider(S2SProviderBase):
                 outputs = []
                 for call in calls:
                     used.append(call.get("name"))
-                    blocked = self._check_ha_call(call, intents, last_user) if call.get("name") in intents else None
+                    blocked = self._check_ha_call(call, intents, "\n".join(said)) if call.get("name") in intents else None
                     result = blocked or await self.tools.run(call.get("name") or "", call.get("arguments") or "{}")
                     outputs.append(result)
                     items.append({"type": "function_call", "call_id": call.get("call_id"), "name": call.get("name"),
@@ -630,6 +633,7 @@ class S2SProvider(S2SProviderBase):
         for i in range(0, len(context), CONTEXT_CHUNK_CHARS):
             await self._send({"type": "session.thinking.append", "delegation_id": did,
                               "content": context[i:i + CONTEXT_CHUNK_CHARS]})
+        self._guard_mark = len(self.history)
         await self._send({"type": "session.commentary.append", "delegation_id": did, "content": (answer or "好的。")[:1500]})
         self.logger.bind(tag=TAG).info(f"Live 委托交回 tools={used} {round(1000 * (time.time() - t0))} ms 答复 {len(answer)} 字"
                                        f"{f'，背景 {len(context)} 字' if context else ''} t={time.time():.3f}")

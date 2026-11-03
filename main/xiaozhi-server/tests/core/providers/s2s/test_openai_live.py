@@ -652,12 +652,14 @@ def _ha_client(scenario, **over):
     _run_client(sc, **over)
 
 
-async def _delegate(lv, p, said: str, call: dict, did: str) -> str:
+async def _delegate(lv, p, said: str | None, call: dict, did: str) -> str:
+    """said=None：委托时这句转写还没到（in_text 是空的）。"""
     async def fake(items, tools):
         return {"output": [dict(call, type="function_call", call_id="c1")]}
     p._responses_call = fake
-    await lv.emit({"type": "session.input_transcript.delta", "delta": said})
-    await _real_sleep(0.05)
+    if said is not None:
+        await lv.emit({"type": "session.input_transcript.delta", "delta": said})
+        await _real_sleep(0.05)
     await lv.emit({"type": "session.delegation.created", "delegation": {"id": did, "target": "client"}})
     await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
     return [m for m in lv.received if m["type"] == "session.commentary.append"][0]["content"]
@@ -703,3 +705,30 @@ def test_ha_names_off_keeps_dispatch_and_calls_as_before():
                         {"name": "intent__HassTurnOff", "arguments": "{\"name\": \"除醛净化器\"}"}, "g3")
         assert [c["name"] for c in conn.func_handler.calls] == ["intent__HassTurnOff"]
     _ha_client(sc, ha_names=False)
+
+
+def test_place_guard_only_reads_what_user_said_since_last_delegation():
+    """上一轮（上次委托之前）提到的地方不算：这一轮没说地点、或者转写还没到，就不拦；
+    这期间落进 history 的用户发言（Live 先开口时会把转写刷进去）照样算。"""
+    off = "intent__HassTurnOff"
+
+    async def sc(lv, conn, p):
+        p.history += [("user", "把乙地的风扇打开"), ("assistant", "好了。")]
+        p._guard_mark = len(p.history)                      # 上一次委托在这之后结束
+        await _delegate(lv, p, None, {"name": off, "arguments": "{\"name\": \"甲地除醛净化器\"}"}, "h1")
+        assert conn.func_handler.calls[-1]["name"] == off
+    _ha_client(sc)
+
+    async def sc2(lv, conn, p):
+        p.history += [("user", "把乙地的风扇打开"), ("assistant", "好了。")]
+        p._guard_mark = len(p.history)
+        await _delegate(lv, p, "把甲地的除醛净化器关了", {"name": off, "arguments": "{\"name\": \"除醛净化器\"}"}, "h2")
+        assert conn.func_handler.calls[-1]["name"] == off
+    _ha_client(sc2)
+
+    async def sc3(lv, conn, p):
+        p.history += [("user", "把乙地的除醛净化器关了"), ("assistant", "好，我来关。")]   # 上次委托之后才落进来
+        content = await _delegate(lv, p, None, {"name": off, "arguments": "{\"name\": \"除醛净化器\"}"}, "h3")
+        assert "没有执行" in content and [c["name"] for c in conn.func_handler.calls] == ["homeassistant__GetLiveContext"]
+        assert p._guard_mark == len(p.history)
+    _ha_client(sc3)
