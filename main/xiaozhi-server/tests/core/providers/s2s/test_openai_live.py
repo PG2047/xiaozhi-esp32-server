@@ -141,7 +141,7 @@ def test_backchannel_negated_stop_and_idle_stop_word_do_not_cut():
         for d in ("对对", "嗯,", "闭嘴", "不要停", "别停,接着讲"):   # "闭嘴"：11-03 一声附和"对对"被转写成它
             await lv.emit({"type": "session.input_transcript.delta", "delta": d})
         await _real_sleep(0.1)
-        assert p.in_seg and p.stats["barge_transcript"] == 0 and ("tts", "stop") not in conn.websocket.states()
+        assert p.in_seg and p.stats["barge_transcript"] == 0 and ("tts", "stop") not in conn.websocket.states() and p._stop is None
     run(sc)
 
 
@@ -156,95 +156,178 @@ def test_stop_words_can_be_turned_off():
     run(sc)
 
 
-async def _cut(lv, p, played="老乌鸦指了指山顶,说"):
-    """播放中由转写截断：本段的输出转写停在 played。"""
+LOUD_UP = (np.ones(960, np.int16) * 3000).tobytes()     # 上行 60 ms：用户在说话
+QUIET_UP = (np.ones(960, np.int16) * 10).tobytes()
+
+
+@pytest.fixture(autouse=True)
+def _no_ack_tts(monkeypatch):
+    """停下应答的 TTS 预取不出网；要测应答的用例自己塞 PCM。"""
+    async def none(self):
+        return b""
+    monkeypatch.setattr(S2SProvider, "_ack_pcm", none)
+
+
+async def _stop_while_playing(lv, p, said="小智,别说了"):
     p.resume_max_wait_s = 0.0
+    p.resume_after_user_s = 0.2
     await lv.audio(4, 2000)
     await wait_until(lambda: p.in_seg, what="进段")
-    await lv.emit({"type": "session.output_transcript.delta", "delta": played})
-    await lv.emit({"type": "session.input_transcript.delta", "delta": "停一下"})
-    await wait_until(lambda: p.stats["barge_transcript"] == 1, what="停止词截断")
+    await lv.emit({"type": "session.output_transcript.delta", "delta": "老乌鸦指了指山顶,说"})
+    await lv.emit({"type": "session.input_transcript.delta", "delta": said})
+    await wait_until(lambda: p._stop is not None, what="停下")
+
+
+async def _user_speaks_again(p):
+    await _real_sleep(0.65)            # 喊停那句之后静了 0.4 s 以上，也过了进停下后的 0.6 s
+    await p.on_pcm(LOUD_UP)            # 用户又开口
+    await wait_until(lambda: p._stop is None, what="停下结束")
+    await _real_sleep(0.45)
+    await p.on_pcm(QUIET_UP)           # 说完（上行静了 0.4 s 以上才算收声）
 
 
 def _shown(conn):
     return [t.get("text") for t in conn.websocket.texts() if t.get("state") == "sentence_start"]
 
 
-def test_transcript_cut_mid_sentence_drops_rest_of_that_sentence():
+def test_stop_word_while_playing_holds_until_user_speaks_again():
     async def sc(lv, conn, p):          # 11-03 T1："了指山顶,说"被截，0.9 s 后又放了"那儿有答案。好。"
-        await _cut(lv, p)
-        assert p._tail is not None
+        await _stop_while_playing(lv, p)
+        assert p.stats["barge_transcript"] == 1 and p.suppress and not p.in_seg
         n = len(conn.websocket.frames())
-        await lv.audio(3, 0)            # 模型先停一下，比 end_silence_ms 还长
-        await lv.audio(3, 2000)         # 再把那句讲完：丢
-        await lv.emit({"type": "session.output_transcript.delta", "delta": "那儿有答案。"})
-        await lv.emit({"type": "session.output_transcript.delta", "delta": "好。"})
-        await lv.audio(1, 2000)
+        await lv.audio(3, 0)            # 模型停一下（resume_max_wait 早过了也不放行）
+        await lv.audio(3, 2000)         # 把那句讲完、再说"好"：都丢
+        await lv.emit({"type": "session.output_transcript.delta", "delta": "那儿有答案。好。"})
+        await lv.audio(5, 0)
+        await _real_sleep(0.1)
+        assert len(conn.websocket.frames()) == n and p.stats["segments"] == 1 and p._stop is not None
+        await _user_speaks_again(p)
+        await lv.audio(1, 0)
+        await lv.audio(3, 2000)         # 对新一句的回答照常放
+        await wait_until(lambda: p.stats["segments"] == 2, what="回答段")
+        await lv.emit({"type": "session.output_transcript.delta", "delta": "现在九点。"})
+        await lv.audio(5, 0)
+        await wait_until(lambda: "现在九点。" in _shown(conn), what="回答文字")
+        assert not any("答案" in t for t in _shown(conn))       # 停下期间丢掉的话不显示
+    run(sc)
+
+
+def test_stop_word_after_device_abort_holds_instead_of_resuming():
+    async def sc(lv, conn, p):          # 11-03 T4：设备 1.37 s 判停，模型没理会"别说了"，又讲了约 20 s
+        p.resume_after_user_s = 0.2
+        await lv.audio(4, 2000)
+        await wait_until(lambda: p.in_seg, what="进段")
+        await p.on_pcm(LOUD_UP)
+        await p.cancel("device")
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "小智,别说了"})
+        await wait_until(lambda: p._stop is not None, what="停下")
+        assert p.stats["barge_transcript"] == 0     # 设备已经停了，不再截一次
+        n = len(conn.websocket.frames())
+        await _real_sleep(0.45)
+        await p.on_pcm(QUIET_UP)        # 用户说完：原来这里会放行
+        await lv.audio(2, 0)
+        await lv.audio(4, 2000)         # 模型接着讲故事：丢
         await _real_sleep(0.1)
         assert len(conn.websocket.frames()) == n and p.stats["segments"] == 1
-        await lv.audio(2, 0)            # 句末之后的停顿
-        await wait_until(lambda: p._tail is None, what="半句丢完")
-        await lv.audio(3, 2000)         # "好"：新的一段照常放
-        await wait_until(lambda: p.stats["segments"] == 2, what="应答段")
+        await _user_speaks_again(p)
+        await lv.audio(1, 0)
+        await lv.audio(3, 2000)
+        await wait_until(lambda: p.stats["segments"] == 2, what="回答段")
+    run(sc)
+
+
+def _false_device_abort(said):
+    async def sc(lv, conn, p):          # 误停：转写里没有停止词，照旧接着讲
+        p.resume_after_user_s = 0.2
+        await lv.audio(4, 2000)
+        await wait_until(lambda: p.in_seg, what="进段")
+        await p.on_pcm(LOUD_UP)         # 打字 / 附和
+        await p.cancel("device")
+        if said:
+            await lv.emit({"type": "session.input_transcript.delta", "delta": said})
+        await _real_sleep(0.45)
+        await p.on_pcm(QUIET_UP)
+        assert p._stop is None
+        await lv.audio(1, 0)
+        await lv.audio(3, 2000)         # 模型接着讲
+        await wait_until(lambda: p.stats["segments"] == 2, what="接着讲")
+    return sc
+
+
+def test_false_device_abort_by_typing_still_resumes():
+    run(_false_device_abort(None))
+
+
+def test_false_device_abort_by_backchannel_still_resumes():
+    run(_false_device_abort("对对"))
+
+
+def test_stop_word_right_after_a_segment_ends_also_holds():
+    async def sc(lv, conn, p):          # 模型听到用户开口先停一下，段已经结束，"停"的转写才到
+        await lv.audio(4, 2000)
         await lv.audio(5, 0)
-        await wait_until(lambda: "好。" in _shown(conn), what="应答文字")
-        assert not any("答案" in s for s in _shown(conn))      # 丢掉的半句不显示
-        assert p.stats["tail_dropped_ms"] == [400]
-    run(sc)
-
-
-def test_transcript_cut_at_sentence_end_resumes_as_before():
-    async def sc(lv, conn, p):
-        await _cut(lv, p, played="一个迷路的男孩闯了进去。")
-        assert p._tail is None          # 那句已经说完，后面是新的话
-        await lv.audio(1, 0)
+        await wait_until(lambda: ("tts", "stop") in conn.websocket.states() and not p.speaker.speaking, timeout=8,
+                         what="段结束、设备播完")
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "停一下"})
+        await wait_until(lambda: p._stop is not None, what="停下")
+        assert p.suppress and p.stats["barge_transcript"] == 0
         await lv.audio(3, 2000)
-        await wait_until(lambda: p.stats["segments"] == 2, what="下一段")
+        await _real_sleep(0.1)
+        assert p.stats["segments"] == 1
     run(sc)
 
 
-def test_tail_drop_gives_up_without_a_sentence_end():
+def test_stop_plays_cached_ack_once_and_its_echo_does_not_end_the_hold():
     async def sc(lv, conn, p):
-        p.tail_max_s = 0.3
-        await _cut(lv, p)
-        await lv.audio(3, 2000)         # 转写一直没到句末
-        await _real_sleep(0.35)
-        await lv.audio(1, 0)            # 超时：回到原来的恢复逻辑
-        await wait_until(lambda: p._tail is None, what="超时放弃")
-        await lv.audio(3, 2000)
-        await wait_until(lambda: p.stats["segments"] == 2, what="下一段")
+        pcm = (np.ones(conn.sample_rate * 3 // 10, np.int16) * 2000).tobytes()   # 0.3 秒
+        p.stop_ack_text = "好。"
+        p._ack_task = asyncio.ensure_future(asyncio.sleep(0, result=pcm))
+        await _stop_while_playing(lv, p)
+        n = len(conn.websocket.frames())
+        await lv.audio(2, 0)            # 用户已经说完：补一声"好"
+        await wait_until(lambda: len(conn.websocket.frames()) > n, what="停下应答")
+        await p.on_pcm(LOUD_UP)         # 这声"好"的回声
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "停"})   # 同一句里又一个停止词
+        await lv.audio(10, 0)
+        await _real_sleep(0.3)
+        m = len(conn.websocket.frames())
+        await lv.audio(10, 0)
+        await _real_sleep(0.2)
+        assert p._stop is not None and p.stats["stop_holds"] == 1 and len(conn.websocket.frames()) == m
     run(sc)
 
 
-def test_new_user_utterance_ends_tail_drop():
+def test_echo_right_after_the_cut_does_not_end_the_hold():
+    async def sc(lv, conn, p):          # 截断时设备还在出声，回声过了 onset_rms 也会记一次"上行开口"
+        await _stop_while_playing(lv, p)
+        await p.on_pcm(LOUD_UP)
+        await _real_sleep(0.05)
+        assert p._stop is not None
+        await _real_sleep(0.6)
+        await p.on_pcm(QUIET_UP)        # 回声过去了
+        await p.on_pcm(LOUD_UP)         # 0.6 s 之后再响：算用户开口
+        await wait_until(lambda: p._stop is None, what="停下结束")
+    run(sc)
+
+
+def test_new_user_sentence_ends_the_hold():
     async def sc(lv, conn, p):
-        await _cut(lv, p)
-        p.t_last_input_text -= 2        # 隔了 2 秒，用户又说了一句新的
+        await _stop_while_playing(lv, p)
+        p.t_last_input_text -= 2        # 隔了 2 秒，用户又说了一句新的（上行没录到开口）
         await lv.emit({"type": "session.input_transcript.delta", "delta": "讲个笑话吧"})
-        await wait_until(lambda: p._tail is None, what="新话结束丢半句")
+        await wait_until(lambda: p._stop is None, what="停下结束")
+        assert p.stats["stop_holds"] == 1
         await lv.audio(1, 0)
-        await lv.audio(3, 2000)         # 对新话的回应照常放
-        await wait_until(lambda: p.stats["segments"] == 2, what="回应段")
+        await lv.audio(3, 2000)
+        await wait_until(lambda: p.stats["segments"] == 2, what="回答段")
     run(sc)
 
 
-def test_tail_drop_can_be_turned_off():
-    async def sc(lv, conn, p):
-        p.tail_max_s = 0
-        await _cut(lv, p)
-        assert p._tail is None
+def test_heard_as_listen_counts_as_stop():
+    async def sc(lv, conn, p):          # 11-03 23:37：Mac 17 外放三次"停一下"有两次被转写成"听一下"
+        await _stop_while_playing(lv, p, said="小智,听一下")
+        assert p.stats["barge_transcript"] == 1
     run(sc)
-
-
-def test_sentence_end_marks():
-    from core.providers.s2s.openai_live.openai_live import _ends_sentence, _sentence_end
-    assert _sentence_end("那儿有答案。好。") == 6
-    assert _sentence_end("指向-好。") == 3                # 模型自己掐断的"-"
-    assert _sentence_end("......好那我停") == 6
-    assert _sentence_end("“你想去哪儿？”他问") == 8       # 引号算在这句里
-    assert _sentence_end("了指山顶,说那儿") == -1
-    assert _ends_sentence("闯了进去。") and _ends_sentence("都能找到归处。”")
-    assert not _ends_sentence("了指山顶,说") and not _ends_sentence("五、六、") and not _ends_sentence("")
 
 
 def test_uplink_only_while_listening_when_configured():
