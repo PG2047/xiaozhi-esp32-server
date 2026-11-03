@@ -732,3 +732,25 @@ def test_place_guard_only_reads_what_user_said_since_last_delegation():
         assert "没有执行" in content and [c["name"] for c in conn.func_handler.calls] == ["homeassistant__GetLiveContext"]
         assert p._guard_mark == len(p.history)
     _ha_client(sc3)
+
+
+def test_ha_names_wait_for_tool_handler_init():
+    """工具处理器在后台初始化，组件就绪时 HA 的 MCP 工具常常还没挂上（finish_init=False、清单里没有 GetLiveContext）：
+    要等它初始化完再取名单（11-03 部署后探针：没等，名单一直没取到）。"""
+    from core.providers.s2s.openai_live import openai_live as mod
+    mod._HA_CACHE.update(t=0.0, entries=[])
+
+    async def sc(lv, conn, p):
+        fh = _HAFuncHandler()
+        fh.finish_init = False
+        full = fh.get_functions
+        fh.get_functions = lambda: full() if fh.finish_init else full()[:1]     # 初始化完之前只有插件工具
+        conn.func_handler = fh
+
+        async def init_done():
+            await _real_sleep(0.3)
+            fh.finish_init = True
+        asyncio.ensure_future(init_done())
+        await p._load_ha_names()
+        assert p._ha_entries and [c["name"] for c in fh.calls] == ["homeassistant__GetLiveContext"]
+    _run_client(sc)
