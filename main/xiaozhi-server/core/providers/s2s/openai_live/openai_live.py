@@ -28,6 +28,7 @@ import time
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
+from core.providers.s2s import ha_names
 from core.providers.s2s.audio import Resampler
 from core.providers.s2s.base import DeviceSpeaker, S2SProviderBase, UplinkTrace
 from core.providers.s2s.echo_gate import EchoGate, load_vad
@@ -41,6 +42,7 @@ WAKE_TRIGGER = "嘿，你好呀"
 TTS_RATE = 24000        # /v1/audio/speech 的 pcm 是 24 kHz 16-bit 单声道
 CONTEXT_CHUNK_CHARS = 400   # session.thinking.append 每条 content 上限 500 token，中文按 400 字切
 _GREETING_CACHE: dict[tuple, bytes] = {}   # (voice, 文本, 设备采样率) → PCM，进程内共用：只有第一次唤醒要等 TTS
+_HA_CACHE: dict = {"t": 0.0, "entries": []}  # GetLiveContext 解析出的设备表，进程内各连接共用（见 _load_ha_names）
 
 
 def _trim_silence(pcm: bytes, rate: int, rms: int = 200, pad_ms: int = 40) -> bytes:
@@ -109,6 +111,12 @@ class S2SProvider(S2SProviderBase):
         self.decision_url = str(c.get("decision_url") or "https://api.openai.com/v1/decisions")
         self.decision_model = str(c.get("decision_model") or "gpt-6-luna")
         self.decision_min_conf = float(c.get("decision_min_confidence", 0.6))
+        # 智能设备列表以外的 HA 设备（风扇、窗帘……）：调度指令带上从 GetLiveContext 生成的名单，HA 意图调用执行前过地点守卫
+        # （core/providers/s2s/ha_names.py）。只在 client 委托里用；ha_names: false 关掉，取不到 GetLiveContext 时照旧不带名单
+        self.ha_names = bool(c.get("ha_names", True))
+        self.ha_names_domains = tuple(c.get("ha_names_domains") or ha_names.DEFAULT_DOMAINS)
+        self.ha_names_ttl_s = float(c.get("ha_names_ttl_s", 600))
+        self._ha_entries: list[dict] = []
         self.history: list[tuple[str, str]] = []
         self._session_sig = None
         self._calls: dict[str, asyncio.Task] = {}   # call_id → 执行中的工具
@@ -216,6 +224,35 @@ class S2SProvider(S2SProviderBase):
         await self._maybe_refresh()
         from core.utils.s2s import drain_pending_texts
         await drain_pending_texts(self.conn)   # provider 建成前到的唤醒词 detect 现在补送（要播唤醒应答）
+        if self.tools_enabled and self.delegation_mode == "client" and self.ha_names:
+            self.spawn(self._load_ha_names())
+
+    async def _load_ha_names(self) -> None:
+        """只读调一次 HA 的 GetLiveContext，解析成名单 / 守卫用的设备表，进程内缓存 ha_names_ttl_s 秒（各连接共用）。
+        HA 工具在会话建立之后才挂上，所以等组件就绪再取；取到之前、取不到、解析不出时，调度照旧不带名单。"""
+        if not self.ha_names:
+            return
+        if _HA_CACHE["entries"] and time.monotonic() - _HA_CACHE["t"] < self.ha_names_ttl_s:
+            self._ha_entries = _HA_CACHE["entries"]
+            return
+        name = next((t["name"] for t in self._tool_list() if t["name"].endswith("GetLiveContext")), None)
+        fh = getattr(self.conn, "func_handler", None)
+        if not name or fh is None:
+            return
+        t0 = time.time()
+        try:
+            text, _ = ToolRunner._to_text(await fh.handle_llm_function_call(self.conn, {"name": name, "arguments": "{}"}))
+            entries = ha_names.parse_live_context(text)
+        except Exception as e:  # noqa: BLE001
+            self.logger.bind(tag=TAG).warning(f"Live 取 HA 设备名单失败 {type(e).__name__}: {e}")
+            return
+        if not entries:
+            self.logger.bind(tag=TAG).warning(f"Live 取 HA 设备名单：{name} 没解析出设备（{len(text)} 字），调度不带名单")
+            return
+        _HA_CACHE.update(t=time.monotonic(), entries=entries)
+        self._ha_entries = entries
+        self.logger.bind(tag=TAG).info(f"Live HA 设备名单：{len(entries)} 个实体、{len(ha_names.area_table(entries))} 个区域，"
+                                       f"{round(1000 * (time.time() - t0))} ms")
 
     async def _maybe_refresh(self) -> None:
         """提示词或工具清单变了就 session.update（HA 设备清单、MCP 工具都在会话建立之后才挂上）。"""
@@ -447,11 +484,13 @@ class S2SProvider(S2SProviderBase):
     # ---------- 工具（client delegation：自己选工具） ----------
     def _dispatch_instructions(self) -> str:
         now = time.strftime("%Y-%m-%d %H:%M %A", time.localtime())
+        # HA 意图工具的填法规则 + 智能设备列表以外的设备名单（decisions 和小模型都看；Live 主模型的指令里没有）
+        ha = ha_names.dispatch_text(self._tool_list(), self._ha_entries, self.ha_names_domains) if self.ha_names else ""
         return (f"{self._instructions()}\n\n你现在是小智的工具调度：根据对话里用户最后一句话决定调用哪个工具。"
                 "日期、农历、时间、天气、家里设备的状态和控制、本机音量这类实时信息必须调用工具，不要凭记忆回答。"
                 # 11-03 夜对比：没有这一句时 gpt-4.1-mini 4/4 把"停一下"当成告别去调 handle_exit_intent
                 "“停一下”“等一下”“别说了”只是让小智先停下，不是结束对话，不要调用 handle_exit_intent；只有用户明确告别（再见、拜拜、没事了）才结束对话。"
-                f"拿到工具结果后用一两句中文说出结论；不需要工具就直接用一句话回答。当前时间：{now}")
+                f"拿到工具结果后用一两句中文说出结论；不需要工具就直接用一句话回答。当前时间：{now}" + (f"\n{ha}" if ha else ""))
 
     @staticmethod
     def _dispatch_tools(tools: list) -> list:
@@ -517,6 +556,26 @@ class S2SProvider(S2SProviderBase):
         calls = [o for o in (resp.get("output") or []) if o.get("type") == "function_call"]
         return calls or None
 
+    def _check_ha_call(self, call: dict, intents: dict, utterance: str) -> str | None:
+        """HA 意图调用执行前：domain 误填成 device_class 的挪过去（改写 call 里的参数，后面记进对话的也是改后的）；
+        用户说的地点和会命中的设备不在一处时返回交给 Live 的说明、不执行。"""
+        name = call.get("name") or ""
+        try:
+            args = json.loads(call.get("arguments") or "{}")
+        except ValueError:
+            return None
+        if not isinstance(args, dict):
+            return None
+        tidy = ha_names.tidy_args(intents[name], args, self._ha_entries)
+        if tidy != args:
+            self.logger.bind(tag=TAG).info(f"Live HA 参数整理 {name}：domain {args.get('domain')} → "
+                                           f"domain {tidy.get('domain')} / device_class {tidy.get('device_class')}")
+            call["arguments"] = json.dumps(tidy, ensure_ascii=False)
+        blocked = ha_names.place_conflict(utterance, name, tidy, self._ha_entries)
+        if blocked:
+            self.logger.bind(tag=TAG).info(f"Live 地点守卫拦下 {name}：{blocked}")
+        return blocked
+
     async def _client_delegation(self, did: str) -> None:
         """Live 把一件事委托出来（没有请求正文）：用最近几句对话拼出请求，小模型选工具、ToolRunner 执行，结果交回 Live 转述。"""
         t0 = time.time()
@@ -525,6 +584,9 @@ class S2SProvider(S2SProviderBase):
         ctx = "\n".join(f"{'用户' if r == 'user' else '小智'}：{t}" for r, t in turns) or self.last_user_text
         items: list = [{"role": "user", "content": ctx}]
         tools = self._dispatch_tools(self._tool_list())
+        # 地点守卫只看用户最近一句：前几轮提到的地方不算（"打开甲地的风扇……再把乙地的也关了"）
+        last_user = pending or next((t for r, t in reversed(self.history) if r == "user"), "") or self.last_user_text
+        intents = ha_names.device_intents(tools) if self.ha_names and self._ha_entries else {}
         answer, used, raw = "", [], []
         try:
             first = await self._decide_first(ctx, items, tools) if self.tool_picker == "decisions" else None
@@ -543,7 +605,8 @@ class S2SProvider(S2SProviderBase):
                 outputs = []
                 for call in calls:
                     used.append(call.get("name"))
-                    result = await self.tools.run(call.get("name") or "", call.get("arguments") or "{}")
+                    blocked = self._check_ha_call(call, intents, last_user) if call.get("name") in intents else None
+                    result = blocked or await self.tools.run(call.get("name") or "", call.get("arguments") or "{}")
                     outputs.append(result)
                     items.append({"type": "function_call", "call_id": call.get("call_id"), "name": call.get("name"),
                                   "arguments": call.get("arguments") or "{}"})
