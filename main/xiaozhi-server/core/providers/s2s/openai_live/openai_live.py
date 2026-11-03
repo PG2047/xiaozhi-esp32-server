@@ -90,6 +90,16 @@ class S2SProvider(S2SProviderBase):
                                            "你是小智的后台，负责调用工具（家居控制、设备音量等）并给出一两句中文结论；不需要工具的问题直接简短回答。")
         self.tools = ToolRunner(conn, conn.logger, per_minute=int(c.get("tool_calls_per_minute", 12)),
                                 allow=c.get("tools_allow") or None)
+        # 委托方式：responses = Live 自己调后台 Responses 模型（带整段对话上下文，11-03 真人测工具答复 16 s）；
+        # client = Live 只发 delegation.created，这里用小模型 + 最近几句话选工具、执行、session.commentary.append 交回，
+        # Live 自己转述（API 探针：说完到说出答案 3.7 s）
+        self.delegation_mode = str(c.get("delegation_mode") or "responses")
+        self.tool_model = str(c.get("tool_model") or "gpt-4.1-mini")
+        self.tool_url = str(c.get("tool_url") or "https://api.openai.com/v1/responses")
+        self.ack_delay_ms = int(c.get("ack_delay_ms", 800))
+        self.tool_rounds = int(c.get("tool_rounds", 3))
+        self.direct_max_chars = int(c.get("tool_direct_max_chars", 200))   # 单个工具结果不超过这么长就直接交给 Live 转述，省一轮
+        self.history: list[tuple[str, str]] = []
         self._session_sig = None
         self._calls: dict[str, asyncio.Task] = {}   # call_id → 执行中的工具
         self._resp_completed = False                # 当前后台回复已 completed，等工具结果交齐再 response.create
@@ -161,7 +171,12 @@ class S2SProvider(S2SProviderBase):
         之后才挂上的 HA 设备清单等经后台模型的 instructions 带过去。"""
         instructions = self._instructions()
         out = {} if update else {"instructions": instructions}
-        if self.tools_enabled:
+        if self.tools_enabled and self.delegation_mode == "client":
+            # client 模式工具清单在每次委托时现取，Live 这边没有要同步的
+            self._session_sig = (instructions, tuple(sorted(t["name"] for t in self._tool_list())))
+            if not update:
+                out["delegation"] = {"type": "client", "acknowledgement_delay_ms": self.ack_delay_ms}
+        elif self.tools_enabled:
             tools = self._tool_list()
             self._session_sig = (instructions, tuple(sorted(t["name"] for t in tools)))
             responses = {"model": self.delegation_model, "instructions": f"{instructions}\n\n{self.delegation_instructions}",
@@ -187,7 +202,10 @@ class S2SProvider(S2SProviderBase):
         sig = (self._instructions(), tuple(sorted(t["name"] for t in tools)))
         if sig == self._session_sig or self.ws is None:
             return
-        await self._send({"type": "session.update", "session": self._mutable_session(update=True)})
+        upd = self._mutable_session(update=True)
+        if not upd:
+            return
+        await self._send({"type": "session.update", "session": upd})
         self.logger.bind(tag=TAG).info(f"Live 会话配置已同步：指令 {len(sig[0])} 字、工具 {len(sig[1])} 个")
 
     async def open(self) -> None:
@@ -221,7 +239,8 @@ class S2SProvider(S2SProviderBase):
         self.logger.bind(tag=TAG).info(
             f"Live 会话已建立 model={self.model} voice={self.voice} echo_gate={'on' if self.gate else 'off'} "
             f"speech_rms={self.speech_rms} end_silence_ms={self.end_silence_ms} "
-            f"tools={'off' if not self.tools_enabled else len(self._session_sig[1])}@{self.delegation_model} in {time.monotonic() - t0:.2f}s")
+            f"tools={'off' if not self.tools_enabled else len(self._session_sig[1])}@"
+            f"{self.tool_model + '(client)' if self.delegation_mode == 'client' else self.delegation_model} in {time.monotonic() - t0:.2f}s")
 
     async def _send(self, obj: dict) -> None:
         if self.ws is None:
@@ -352,6 +371,8 @@ class S2SProvider(S2SProviderBase):
             d = ev.get("delegation") or {}
             self.stats["delegations"] = self.stats.get("delegations", 0) + 1
             self.logger.bind(tag=TAG).info(f"Live 委托后台 target={d.get('target')} t={time.time():.3f}")
+            if d.get("target") == "client" and d.get("id"):
+                self.spawn(self._client_delegation(str(d["id"])))
         elif "error" in et:
             err = ev.get("error") or {}
             self.logger.bind(tag=TAG).warning(f"Live error type={err.get('type')} code={err.get('code')} {str(err.get('message') or '')[:120]}")
@@ -384,6 +405,61 @@ class S2SProvider(S2SProviderBase):
         finally:
             self._calls.pop(call_id, None)
         await self._maybe_continue()
+
+    # ---------- 工具（client delegation：自己选工具） ----------
+    def _dispatch_instructions(self) -> str:
+        now = time.strftime("%Y-%m-%d %H:%M %A", time.localtime())
+        return (f"{self._instructions()}\n\n你现在是小智的工具调度：根据对话里用户最后一句话决定调用哪个工具。"
+                "日期、农历、时间、天气、家里设备的状态和控制、本机音量这类实时信息必须调用工具，不要凭记忆回答。"
+                f"拿到工具结果后用一两句中文说出结论；不需要工具就直接用一句话回答。当前时间：{now}")
+
+    async def _responses_call(self, items: list, tools: list) -> dict:
+        import aiohttp
+        body = {"model": self.tool_model, "instructions": self._dispatch_instructions(), "input": items,
+                "tools": tools, "tool_choice": "auto", "store": False}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
+            async with s.post(self.tool_url, json=body, headers={"Authorization": f"Bearer {self.api_key}"}) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"HTTP {r.status}")
+                return await r.json()
+
+    async def _client_delegation(self, did: str) -> None:
+        """Live 把一件事委托出来（没有请求正文）：用最近几句对话拼出请求，小模型选工具、ToolRunner 执行，结果交回 Live 转述。"""
+        t0 = time.time()
+        pending = "".join(self.in_text).strip()
+        turns = self.history[-6:] + ([("user", pending)] if pending else [])
+        ctx = "\n".join(f"{'用户' if r == 'user' else '小智'}：{t}" for r, t in turns) or self.last_user_text
+        items: list = [{"role": "user", "content": ctx}]
+        tools = self._tool_list()
+        answer, used = "", []
+        try:
+            for _ in range(max(1, self.tool_rounds)):
+                resp = await self._responses_call(items, tools)
+                out = resp.get("output") or []
+                calls = [o for o in out if o.get("type") == "function_call"]
+                text = "".join(c.get("text", "") for o in out if o.get("type") == "message"
+                               for c in (o.get("content") or []) if c.get("type") == "output_text").strip()
+                if not calls:
+                    answer = text
+                    break
+                outputs = []
+                for call in calls:
+                    used.append(call.get("name"))
+                    result = await self.tools.run(call.get("name") or "", call.get("arguments") or "{}")
+                    outputs.append(result)
+                    items.append({"type": "function_call", "call_id": call.get("call_id"), "name": call.get("name"),
+                                  "arguments": call.get("arguments") or "{}"})
+                    items.append({"type": "function_call_output", "call_id": call.get("call_id"), "output": result})
+                if len(calls) == 1 and len(outputs[0]) <= self.direct_max_chars:
+                    answer = outputs[0]          # 短结果直接交给 Live 转述，省一轮小模型
+                    break
+            else:
+                answer = answer or "这个我暂时没查到。"
+        except Exception as e:  # noqa: BLE001
+            self.logger.bind(tag=TAG).warning(f"Live 工具调度失败 {type(e).__name__}: {e}")
+            answer = "这个我暂时查不到，稍后再试。"
+        await self._send({"type": "session.commentary.append", "delegation_id": did, "content": (answer or "好的。")[:1500]})
+        self.logger.bind(tag=TAG).info(f"Live 委托交回 tools={used} {round(1000 * (time.time() - t0))} ms 答复 {len(answer)} 字 t={time.time():.3f}")
 
     async def _maybe_continue(self) -> None:
         """这一轮后台回复里的函数调用全部交回、且回复已 completed，才让后台继续（否则报 function_call_outputs_required）。"""
@@ -451,6 +527,7 @@ class S2SProvider(S2SProviderBase):
             self.logger.bind(tag=TAG).info(f"assistant: {txt}")
         if txt:
             await self.show_assistant_text(txt)
+            self.history.append(("assistant", txt))
         if not interrupted and self._is_goodbye(txt):
             self.logger.bind(tag=TAG).info("Live 告别：这段播完后结束会话")
             self.conn.close_after_chat = True    # speaker.end() 等设备播完、发 tts stop 后关连接
@@ -473,6 +550,7 @@ class S2SProvider(S2SProviderBase):
         if not txt:
             return
         self.last_user_text = txt
+        self.history.append(("user", txt))
         self.stats["input_utts"] += 1
         if self.log_text:
             self.logger.bind(tag=TAG).info(f"user: {txt}")
