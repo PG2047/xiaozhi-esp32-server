@@ -125,3 +125,41 @@ def test_tidy_args_moves_device_class_out_of_domain():
     assert H.tidy_args(tool, {"name": "乙地风扇", "domain": ["air purifier"]}, es) == {"name": "乙地风扇"}
     same = {"area": "乙地", "domain": ["fan"]}
     assert H.tidy_args(tool, same, es) is same and H.tidy_args(tool, {"domain": ["curtain"]}, []) == {"domain": ["curtain"]}
+
+
+def test_dispatch_text_query_rule_follows_get_live_context_tool():
+    t = H.dispatch_text(HA_TOOLS, entries())
+    assert "查这些设备的状态用 homeassistant__GetLiveContext：name 也照这样填完整的设备名" in t.split("\n")[0]
+    no_query = [x for x in HA_TOOLS if not x["name"].endswith("GetLiveContext")]
+    assert "GetLiveContext" not in H.dispatch_text(no_query, entries())
+
+
+def _area_entries():
+    """丙地两台 fan（风扇、净化器）加一个传感器；丁地一台 fan 加一个传感器。"""
+    return [
+        {"names": ["丙地风扇", "丙地大风扇"], "domain": "fan", "areas": ["丙地家", "丙地"], "device_class": None},
+        {"names": ["丙地净化器"], "domain": "fan", "areas": ["丙地家", "丙地"], "device_class": None},
+        {"names": ["丙地温度"], "domain": "sensor", "areas": ["丙地家", "丙地"], "device_class": "temperature"},
+        {"names": ["丁地风扇"], "domain": "fan", "areas": ["丁地家", "丁地"], "device_class": None},
+        {"names": ["丁地温度"], "domain": "sensor", "areas": ["丁地家", "丁地"], "device_class": "temperature"},
+    ]
+
+
+def test_area_ambiguity_asks_which_one_when_several_match_without_all_words():
+    es, speed, off = _area_entries(), "fan__HassFanSetSpeed", "intent__HassTurnOff"
+    msg = H.area_ambiguity("丙地的风扇风速调到最大", speed, {"area": "丙地", "percentage": 100}, es)
+    assert msg and msg.startswith("没有执行") and "2 台" in msg and "丙地风扇" in msg and "丙地净化器" in msg
+    # 设备名被转写错（"除甲醛"→"出价全"）时的"全"不算"全部"
+    assert H.area_ambiguity("把丙地的出价全净化器关了", off, {"area": "丙地", "domain": ["fan"]}, es)
+    # 没填区域、只填类别：全屋的 fan
+    assert "家里有 3 台" in H.area_ambiguity("关风扇", off, {"domain": ["fan"]}, es)
+
+
+def test_area_ambiguity_lets_through_all_words_single_device_and_named_calls():
+    es, speed, off = _area_entries(), "fan__HassFanSetSpeed", "intent__HassTurnOff"
+    for said in ("把丙地的风扇都调到最大", "丙地的风扇全部调到最大", "所有风扇调到最大", "丙地的风扇全开"):
+        assert H.area_ambiguity(said, speed, {"area": "丙地", "percentage": 100}, es) is None, said
+    assert H.area_ambiguity("丁地的风扇关了", off, {"area": "丁地", "domain": ["fan"]}, es) is None       # 只有一台
+    assert H.area_ambiguity("丁地的关了", off, {"area": "丁地"}, es) is None                              # 传感器不算可控设备
+    assert H.area_ambiguity("丙地风扇关了", off, {"name": "丙地风扇", "area": "丙地"}, es) is None         # 填了 name
+    assert H.area_ambiguity("把乙地的风扇关了", off, {"area": "没有的区域"}, es) is None                   # HA 本来就找不到
