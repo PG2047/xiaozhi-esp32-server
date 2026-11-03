@@ -138,7 +138,7 @@ def test_backchannel_negated_stop_and_idle_stop_word_do_not_cut():
         assert p.stats["barge_transcript"] == 0
         await lv.audio(4, 2000)
         await wait_until(lambda: p.in_seg, what="进段")
-        for d in ("对对", "嗯,", "不要停", "别停,接着讲"):
+        for d in ("对对", "嗯,", "闭嘴", "不要停", "别停,接着讲"):   # "闭嘴"：11-03 一声附和"对对"被转写成它
             await lv.emit({"type": "session.input_transcript.delta", "delta": d})
         await _real_sleep(0.1)
         assert p.in_seg and p.stats["barge_transcript"] == 0 and ("tts", "stop") not in conn.websocket.states()
