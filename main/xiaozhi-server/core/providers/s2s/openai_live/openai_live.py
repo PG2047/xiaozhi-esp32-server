@@ -28,6 +28,7 @@ import time
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
+from core.handle.abortHandle import handleAbortMessage
 from core.providers.s2s.audio import Resampler
 from core.providers.s2s.base import DeviceSpeaker, S2SProviderBase, UplinkTrace
 from core.providers.s2s.echo_gate import EchoGate, load_vad
@@ -76,6 +77,12 @@ class S2SProvider(S2SProviderBase):
         self.wants_early_audio = bool(c.get("early_audio", True))
         self.close_on_goodbye = bool(c.get("close_on_goodbye", True))
         self.goodbye_words = tuple(c.get("goodbye_words") or ("再见", "拜拜", "回头见", "下次聊"))
+        # 喊停兜底：Live 听到"停一下"后会先把正在说的那句讲完（11-03 讲故事中 2.5～3.5 s 才停），设备侧又没判出时，
+        # 播放中用户这句的转写里一出现停止词就由服务端截断（同设备 abort：发 tts stop、丢掉本段剩下的音频）。
+        # 转写跟不上说话：第一个转写片段在出声后 0.8～1.8 s 才到（11-04 实测），"停"字更晚，所以只是兜底，快的那条路仍是设备。stop_words: [] 关掉
+        self.stop_words = tuple(c["stop_words"] if "stop_words" in c else
+                                ("停", "等一下", "等等", "别说了", "暂停", "打住", "闭嘴", "安静"))
+        self._pending_barge = None
         self.last_user_text = ""
         self._t_close_flag = None
         self.connect_timeout_s = float(c.get("connect_timeout_s", 4))
@@ -152,7 +159,7 @@ class S2SProvider(S2SProviderBase):
         self.t_activity = time.monotonic()
         self.t_last_input_text = None
         self.t_seg = time.monotonic()
-        self.stats = {"segments": 0, "barge_device": 0, "up_frames": 0, "seg_after_input_ms": [],
+        self.stats = {"segments": 0, "barge_device": 0, "barge_transcript": 0, "up_frames": 0, "seg_after_input_ms": [],
                       "input_utts": 0}
 
     def _vad_model_path(self):
@@ -360,13 +367,30 @@ class S2SProvider(S2SProviderBase):
 
     # ---------- 打断 ----------
     async def cancel(self, reason: str) -> None:
-        """只会来自设备 abort（handleAbortMessage）：模型侧的插话 Live 自己处理，表现为下行变静音。"""
+        """来自 handleAbortMessage：设备 abort，或者 _barge（喊停兜底先调 handleAbortMessage，真正的原因放在 _pending_barge）。
+        模型侧的插话 Live 自己处理，表现为下行变静音。"""
+        if reason == "device" and self._pending_barge:
+            reason, self._pending_barge = self._pending_barge, None
         played = self.speaker.played_ms()
         self.suppress = True
         self.t_abort = time.time()
         await self._end_segment(interrupted=True)
-        self.stats["barge_device"] += 1
+        self.stats[f"barge_{reason}"] = self.stats.get(f"barge_{reason}", 0) + 1
         self.logger.bind(tag=TAG).info(f"打断（{reason}）：本段已播 {played} ms t={time.time():.3f}")
+
+    async def _barge(self, reason: str) -> None:
+        self._pending_barge = reason
+        await handleAbortMessage(self.conn)  # 发 tts stop、清队列，再经 abortHandle 调到 cancel()
+
+    def _stop_word_in(self, text: str) -> str | None:
+        """用户这句里的停止词；"不要停""别停"这类否定的不算（"给我讲个故事，不要停"）。"""
+        for w in self.stop_words:
+            i = text.find(w)
+            while i >= 0:
+                if not (w == "停" and text[max(0, i - 2):i].endswith(("不要", "别", "不", "没"))):
+                    return w
+                i = text.find(w, i + 1)
+        return None
 
     # ---------- 模型 → 设备 ----------
     async def _rx_loop(self) -> None:
@@ -399,6 +423,11 @@ class S2SProvider(S2SProviderBase):
             self.in_text.append(ev.get("delta") or "")
             self.t_last_input_text = now
             self.t_activity = now
+            if self.in_seg and not self.suppress and self.stop_words:
+                w = self._stop_word_in("".join(self.in_text))
+                if w:
+                    self.logger.bind(tag=TAG).info(f"Live 转写里有停止词「{w}」，播放中由服务端截断 t={time.time():.3f}")
+                    await self._barge("transcript")
         elif et == "session.output_transcript.delta":
             self.out_text.append(ev.get("delta") or "")
         elif et == "response.event":
