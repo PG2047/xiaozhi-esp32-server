@@ -88,7 +88,9 @@ class S2SProvider(S2SProviderBase):
         # 用户这句的转写里一出现停止词就进"停下"（见 _stop_on）；设备还在播就先由服务端截断（同设备 abort）。
         # 转写跟不上说话：第一个转写片段在出声后 1.2～2.2 s 才到（11-03 实测），"停"字更晚，所以截断只是兜底，快的那条路仍是设备。
         # 不收"闭嘴"：11-03 讲故事中一声附和"对对"被转写成了"闭嘴"。收"听一下"：11-03 23:37 Mac 17 外放三次"停一下"
-        # 有两次被转写成它，播放中说"听一下"本身也接近打断。stop_words: [] 关掉
+        # 有两次被转写成它，播放中说"听一下"本身也接近打断。"不要停""别停""要停"不算（"不"字最容易被转写丢：
+        # 11-04 00:35"给我讲一个两分钟的故事，不要停"被转写成"什么故事?要停"）；上一段刚结束、模型不在播的那几秒里，
+        # 单字"停"也不算，要"停一下""停下""停止"这样连着的才算（见 _stop_word_at）。stop_words: [] 关掉
         self.stop_words = tuple(c["stop_words"] if "stop_words" in c else
                                 ("停", "等一下", "等等", "别说了", "暂停", "打住", "安静", "听一下"))
         self._pending_barge = None
@@ -524,12 +526,14 @@ class S2SProvider(S2SProviderBase):
         self.spawn(self.speaker.end())
         self.logger.bind(tag=TAG).info(f"Live 停下应答「{self.stop_ack_text}」{round(dur * 1000)} ms t={time.time():.3f}")
 
-    def _stop_word_at(self, text: str) -> tuple[str, int] | None:
-        """用户这句里的停止词和它后面的位置；"不要停""别停"这类否定的不算（"给我讲个故事，不要停"）。"""
+    def _stop_word_at(self, text: str, bare_ting: bool = True) -> tuple[str, int] | None:
+        """用户这句里的停止词和它后面的位置；"不要停""别停""要停"这类否定的不算（"给我讲个故事，不要停"）。
+        bare_ting=False（上一段刚结束、模型不在播）时单字"停"不算，后面要跟着"一下 / 下 / 止 / 停"。"""
         for w in self.stop_words:
             i = text.find(w)
             while i >= 0:
-                if not (w == "停" and text[max(0, i - 2):i].endswith(("不要", "别", "不", "没"))):
+                if w != "停" or not (text[max(0, i - 2):i].endswith(("要", "别", "不", "没"))
+                                     or not bare_ting and not text[i + 1:].startswith(("一下", "下", "止", "停"))):
                     return w, i + len(w)
                 i = text.find(w, i + 1)
         return None
@@ -575,9 +579,11 @@ class S2SProvider(S2SProviderBase):
                     await self._end_stop("喊停后接着说了别的")
             elif self.stop_words and self._stop is None:
                 text = "".join(self.in_text)
-                hit = self._stop_word_at(text)
-                if hit and (self.in_seg or self.suppress or self.speaker.speaking or now - self.t_seg_end <= self.stop_recent_s):
-                    await self._stop_on(hit[0], text[hit[1]:])
+                live = self.in_seg or self.suppress or self.speaker.speaking      # 在播，或者设备刚 abort
+                if live or now - self.t_seg_end <= self.stop_recent_s:
+                    hit = self._stop_word_at(text, bare_ting=live)
+                    if hit:
+                        await self._stop_on(hit[0], text[hit[1]:])
         elif et == "session.output_transcript.delta":
             self.out_text.append(ev.get("delta") or "")
         elif et == "response.event":

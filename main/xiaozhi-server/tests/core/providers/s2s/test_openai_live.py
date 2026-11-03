@@ -415,6 +415,50 @@ def test_stop_word_with_only_fillers_still_holds():
     run(sc)
 
 
+async def _segment_just_ended(lv, conn, p):
+    await lv.audio(4, 2000)
+    await lv.audio(5, 0)
+    await wait_until(lambda: ("tts", "stop") in conn.websocket.states() and not p.speaker.speaking, timeout=8,
+                     what="段结束、设备播完")
+
+
+def test_story_request_heard_as_yao_ting_does_not_stop():
+    async def sc(lv, conn, p):          # 11-04 00:35："给我讲一个两分钟的故事，不要停"被转写成"什么故事?要停"
+        await _segment_just_ended(lv, conn, p)
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "什么故事?要停"})
+        await _real_sleep(0.1)
+        assert p._stop is None and not p.suppress
+        await lv.audio(4, 2000)         # 模型讲新故事：照常放
+        await wait_until(lambda: p.stats["segments"] == 2, what="新故事")
+        p.t_last_input_text -= 2
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "什么故事?要停"})   # 模型在播时也不算
+        await _real_sleep(0.1)
+        assert p._stop is None and p.in_seg
+    run(sc)
+
+
+def test_bare_ting_right_after_a_segment_does_not_stop_but_ting_yixia_does():
+    async def sc(lv, conn, p):
+        await _segment_just_ended(lv, conn, p)
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "小智,停"})
+        await _real_sleep(0.1)
+        assert p._stop is None
+        p.t_last_input_text -= 2
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "小智,停一下"})
+        await wait_until(lambda: p._stop is not None, what="停下")
+        assert p._stop_word_at("小智,停一下", bare_ting=False) == ("停", 4)
+        assert p._stop_word_at("停下来", bare_ting=False)[0] == "停" and p._stop_word_at("小智,停", bare_ting=False) is None
+        assert p._stop_word_at("什么故事?要停") is None and p._stop_word_at("小智,停") == ("停", 4)
+    run(sc)
+
+
+def test_bare_ting_while_playing_still_stops():
+    async def sc(lv, conn, p):
+        await _stop_while_playing(lv, p, said="小智,停")
+        assert p.stats["barge_transcript"] == 1
+    run(sc)
+
+
 def test_heard_as_listen_counts_as_stop():
     async def sc(lv, conn, p):          # 11-03 23:37：Mac 17 外放三次"停一下"有两次被转写成"听一下"
         await _stop_while_playing(lv, p, said="小智,听一下")
