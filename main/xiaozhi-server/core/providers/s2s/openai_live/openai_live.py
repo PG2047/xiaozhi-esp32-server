@@ -482,6 +482,10 @@ class S2SProvider(S2SProviderBase):
 
     async def _responses_call(self, items: list, tools: list, force: str | None = None) -> dict:
         import aiohttp
+        # 工具显式 strict: false。不写时 Responses 会尽量把 schema 规整成严格模式，可选参数全变必填，小模型只好硬填：
+        # HA intent 的 floor 填空串、device_class / domain 猜成 switch，HA 按猜出来的条件匹配不上设备；强制填参和自选都这样（11-03 空跑）。
+        # 级联走 chat completions，默认就是非严格。复制一份再加，传进来的工具对象 _decide_first 还在用
+        tools = [dict(t, strict=False) for t in tools]
         body = {"model": self.tool_model, "instructions": self._dispatch_instructions(), "input": items,
                 "tools": tools, "tool_choice": {"type": "function", "name": force} if force else "auto", "store": False}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:

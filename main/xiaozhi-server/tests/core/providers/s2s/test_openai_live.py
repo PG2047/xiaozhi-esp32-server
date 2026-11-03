@@ -520,6 +520,51 @@ def test_decisions_low_confidence_or_none_falls_back_to_model():
         assert rec["commentary"] == "模型自己答了。" and rec["calls"] == []
 
 
+def test_responses_tools_sent_non_strict(monkeypatch):
+    """Responses 的工具不写 strict 会按严格模式出参，可选参数全被填上（11-03 空跑：HA intent 补出 floor:""、
+    device_class:["switch"]）。强制填参和退回自选两种请求都要带 strict: false，且不改传进来的工具对象。"""
+    import aiohttp
+    sent = []
+
+    class Reply:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def json(self):
+            return {"output": []}
+
+    class Session(Reply):
+        def __init__(self, *a, **kw):
+            pass
+
+        def post(self, url, json=None, headers=None):
+            sent.append(json)
+            return Reply()
+    monkeypatch.setattr(aiohttp, "ClientSession", Session)
+    tool = {"type": "function", "name": "intent__HassTurnOn", "description": "打开设备",
+            "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "floor": {"type": "string"}}}}
+
+    async def go():
+        p = S2SProvider({"api_key": "k", "delegation_mode": "client", "tool_picker": "decisions", "echo_gate": False,
+                         "wake_greeting_text": ""}, FakeConn(asyncio.get_running_loop()))
+
+        async def fake_dec(ctx, tools):
+            return "intent__HassTurnOn", 0.9
+        p._decisions_call = fake_dec
+        items = [{"role": "user", "content": "用户：打开风扇"}]
+        await p._decide_first("用户：打开风扇", items, [tool])      # decisions 选中 → 强制只填这一个工具
+        await p._responses_call(items, [tool])                     # 退回小模型自选
+    asyncio.run(go())
+    assert [b["tool_choice"] for b in sent] == [{"type": "function", "name": "intent__HassTurnOn"}, "auto"]
+    assert all(b["tools"] == [dict(tool, strict=False)] for b in sent)
+    assert "strict" not in tool
+
+
 def test_dispatch_tools_drops_lunar_dont_call_hint():
     from core.providers.s2s.openai_live.openai_live import S2SProvider as P
     t = [{"name": "get_lunar", "description": "用于农历。对于'今天农历是多少'、'今天农历日期'这样的基本查询，请直接使用context中的信息，不要调用此工具。"}]
