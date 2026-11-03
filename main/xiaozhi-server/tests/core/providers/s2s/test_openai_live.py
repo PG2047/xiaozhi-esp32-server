@@ -611,6 +611,34 @@ def test_dispatch_tools_drops_lunar_dont_call_hint():
     assert "不要调用此工具" not in d and "今天的农历日期也用它查" in d
 
 
+def test_dispatch_tools_explains_ha_position_direction_without_touching_input():
+    """HA 意图工具的 position 没写哪头是开，小模型把"把纱帘拉上"填成 100（HA 里 100 是全开）：补上方向。
+    顶层说明不变（decisions 只看它），已有说明不覆盖，非 HA 工具和没有 position 的工具不动，传进来的工具对象不改。"""
+    import copy
+
+    from core.providers.s2s.openai_live.openai_live import S2SProvider as P
+    pos = {"type": "integer", "minimum": 0, "maximum": 100}
+    tools = [
+        {"type": "function", "name": "intent__HassSetPosition", "description": "Sets the position of a device or entity",
+         "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "position": dict(pos)},
+                        "required": ["position"]}},
+        {"type": "function", "name": "cover__HassSetPosition", "description": "Sets the position",
+         "parameters": {"type": "object", "properties": {"position": dict(pos, description="已有说明")}}},
+        {"type": "function", "name": "play_music", "description": "播放音乐",
+         "parameters": {"type": "object", "properties": {"position": {"type": "integer"}}}},
+        {"type": "function", "name": "intent__HassTurnOff", "description": "Turns off/closes a device or entity",
+         "parameters": {"type": "object", "properties": {"name": {"type": "string"}}}},
+    ]
+    before = copy.deepcopy(tools)
+    out = P._dispatch_tools(tools)
+    assert tools == before
+    got = out[0]["parameters"]["properties"]["position"]
+    assert got == dict(pos, description="位置百分比：0 是全关（拉上、合上），100 是全开（拉开）。")
+    assert out[0]["description"] == before[0]["description"]
+    assert out[0]["parameters"]["required"] == ["position"] and out[0]["parameters"]["properties"]["name"] == {"type": "string"}
+    assert out[1:] == before[1:]
+
+
 def test_dispatch_instructions_read_ha_devices_from_conn_prompt():
     """HA 设备清单由 hass_init.append_devices_to_prompt 追加到 conn.prompt（func_handler 初始化时，晚于 Live 会话建立）。
     client 委托的调度指令每次现读 conn.prompt，decisions 选工具和小模型填 entity_id 都看得到清单，Live 侧不用另外带。"""

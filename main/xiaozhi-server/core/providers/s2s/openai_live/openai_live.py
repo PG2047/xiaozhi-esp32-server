@@ -503,12 +503,22 @@ class S2SProvider(S2SProviderBase):
     @staticmethod
     def _dispatch_tools(tools: list) -> list:
         """农历插件的说明叫"今天农历是多少"这类问题别调工具（原版级联的提示词里带当天农历），Live 链路里没有这份上下文，
-        照说明做模型就会凭记忆答错，所以去掉那一句。"""
+        照说明做模型就会凭记忆答错，所以去掉那一句。HA 意图工具的 position 没有说明，补上方向（见下）。
+        都只改副本，传进来的工具对象不动。"""
         out = []
         for t in tools:
             d = t.get("description") or ""
             if t.get("name") == "get_lunar" and "对于'今天农历是多少'" in d:
                 t = dict(t, description=d.split("对于'今天农历是多少'")[0] + "今天的农历日期也用它查。")
+            props = (t.get("parameters") or {}).get("properties") or {}
+            pos = props.get("position")
+            # HA 意图工具（MCP 里叫"平台__Hass意图"，如 intent__HassSetPosition）的 position 只有 0～100，没说哪头是开：
+            # 11-03 空跑里 4 种"拉上"说法 16/16 被填成 100（HA 里 100 是全开），补上这句后 16/16 填 0。只补在参数说明里，
+            # decisions 只看顶层说明，不受影响；写进调度指令（"拉上是关"）则会让模型给没有窗帘的那家抄出别家窗帘的别名，3 次里 2 次控错房子
+            if (str(t.get("name") or "").rpartition("__")[2].startswith("Hass") and isinstance(pos, dict)
+                    and not pos.get("description")):
+                pos = dict(pos, description="位置百分比：0 是全关（拉上、合上），100 是全开（拉开）。")
+                t = dict(t, parameters=dict(t["parameters"], properties=dict(props, position=pos)))
             out.append(t)
         return out
 
