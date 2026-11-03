@@ -451,7 +451,10 @@ class S2SProvider(S2SProviderBase):
                                   "arguments": call.get("arguments") or "{}"})
                     items.append({"type": "function_call_output", "call_id": call.get("call_id"), "output": result})
                 if len(calls) == 1 and len(outputs[0]) <= self.direct_max_chars:
-                    answer = outputs[0]          # 短结果直接交给 Live 转述，省一轮小模型
+                    # 短结果直接交给 Live 转述，省一轮小模型。带上调用了什么、参数是什么：
+                    # 设音量这类工具只回"成功"，光给结果 Live 只会说"好了"（11-03 R26），带上参数它会说"调到六十了"
+                    call = calls[0]
+                    answer = f"已调用 {call.get('name')}（参数 {call.get('arguments') or '{}'}），结果：{outputs[0]}"
                     break
             else:
                 answer = answer or "这个我暂时没查到。"

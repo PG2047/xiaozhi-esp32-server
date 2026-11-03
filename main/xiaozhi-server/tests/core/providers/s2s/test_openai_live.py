@@ -357,7 +357,7 @@ def test_client_delegation_short_tool_result_goes_straight_to_live():
         await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d1", "target": "client"}})
         await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
         m = [m for m in lv.received if m["type"] == "session.commentary.append"][0]
-        assert m["delegation_id"] == "d1" and m["content"] == "客厅灯已打开"
+        assert m["delegation_id"] == "d1" and m["content"].endswith("结果：客厅灯已打开") and "hass_state" in m["content"]
         assert len(calls) == 1 and "把客厅灯打开" in calls[0][0]["content"]
         assert conn.func_handler.calls[0]["name"] == "hass_state"
     _run_client(sc)
