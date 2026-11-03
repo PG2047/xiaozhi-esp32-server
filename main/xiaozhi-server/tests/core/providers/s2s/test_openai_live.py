@@ -473,3 +473,55 @@ def test_greeting_not_skipped_by_resent_wake_audio_through_speech_gate(monkeypat
             assert ("tts", "start") in conn.websocket.states()
             await p.close()
     asyncio.run(go())
+
+
+def _client_with_decision(decide, picker_over=None):
+    """client 委托 + decisions 选工具：decide(ctx, tools) → (工具名, 置信度)；返回 (commentary, responses 调用记录, 工具调用名)。"""
+    rec = {"responses": [], "commentary": None}
+
+    async def sc(lv, conn, p):
+        async def fake_dec(ctx, tools):
+            return decide(ctx, tools)
+
+        async def fake_resp(items, tools, force=None):
+            rec["responses"].append({"force": force, "tools": [t["name"] for t in tools]})
+            if force:
+                return {"output": [{"type": "function_call", "call_id": "c9", "name": force, "arguments": "{\"entity_id\": \"light.x\"}"}]}
+            return {"output": [{"type": "message", "content": [{"type": "output_text", "text": "模型自己答了。"}]}]}
+        p._decisions_call = fake_dec
+        p._responses_call = fake_resp
+        if picker_over:
+            picker_over(p)
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "dd", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        rec["commentary"] = [m for m in lv.received if m["type"] == "session.commentary.append"][0]["content"]
+        rec["calls"] = [c["name"] for c in conn.func_handler.calls]
+    _run_client(sc, tool_picker="decisions")
+    return rec
+
+
+def test_decisions_no_arg_tool_runs_without_responses_call():
+    def over(p):
+        p._tool_list = lambda: [{"type": "function", "name": "get_lunar", "description": "农历",
+                                 "parameters": {"type": "object", "properties": {}}}]
+    rec = _client_with_decision(lambda ctx, tools: ("get_lunar", 0.95), over)
+    assert rec["responses"] == [] and rec["calls"] == ["get_lunar"] and rec["commentary"].endswith("结果：客厅灯已打开")
+
+
+def test_decisions_param_tool_forces_only_that_tool():
+    rec = _client_with_decision(lambda ctx, tools: ("hass_state", 0.9))
+    assert rec["responses"] == [{"force": "hass_state", "tools": ["hass_state"]}] and rec["calls"] == ["hass_state"]
+
+
+def test_decisions_low_confidence_or_none_falls_back_to_model():
+    for decide in (lambda ctx, tools: ("hass_state", 0.45), lambda ctx, tools: (None, 0.9)):
+        rec = _client_with_decision(decide)
+        assert rec["responses"] == [{"force": None, "tools": ["hass_state"]}]
+        assert rec["commentary"] == "模型自己答了。" and rec["calls"] == []
+
+
+def test_dispatch_tools_drops_lunar_dont_call_hint():
+    from core.providers.s2s.openai_live.openai_live import S2SProvider as P
+    t = [{"name": "get_lunar", "description": "用于农历。对于'今天农历是多少'、'今天农历日期'这样的基本查询，请直接使用context中的信息，不要调用此工具。"}]
+    d = P._dispatch_tools(t)[0]["description"]
+    assert "不要调用此工具" not in d and "今天的农历日期也用它查" in d

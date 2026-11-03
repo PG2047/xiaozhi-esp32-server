@@ -100,6 +100,13 @@ class S2SProvider(S2SProviderBase):
         self.ack_delay_ms = int(c.get("ack_delay_ms", 800))
         self.tool_rounds = int(c.get("tool_rounds", 3))
         self.direct_max_chars = int(c.get("tool_direct_max_chars", 200))   # 单个工具结果不超过这么长就直接交给 Live 转述，省一轮
+        # 选工具的第一步：model = tool_model 自己选；decisions = 先用 /v1/decisions（gpt-6-luna，只做多选一）挑工具，
+        # 不要参数的直接调用、要参数的再让 tool_model 强制只填这一个工具的参数；拿不准（置信度 < decision_min_confidence）
+        # 或判成"不需要工具"就退回 model 的做法。11-03 夜 72 题对比：两种都 72/72，decisions 选工具中位 0.21 s（mini 0.94 s）
+        self.tool_picker = str(c.get("tool_picker") or "model")
+        self.decision_url = str(c.get("decision_url") or "https://api.openai.com/v1/decisions")
+        self.decision_model = str(c.get("decision_model") or "gpt-6-luna")
+        self.decision_min_conf = float(c.get("decision_min_confidence", 0.6))
         self.history: list[tuple[str, str]] = []
         self._session_sig = None
         self._calls: dict[str, asyncio.Task] = {}   # call_id → 执行中的工具
@@ -440,17 +447,69 @@ class S2SProvider(S2SProviderBase):
         now = time.strftime("%Y-%m-%d %H:%M %A", time.localtime())
         return (f"{self._instructions()}\n\n你现在是小智的工具调度：根据对话里用户最后一句话决定调用哪个工具。"
                 "日期、农历、时间、天气、家里设备的状态和控制、本机音量这类实时信息必须调用工具，不要凭记忆回答。"
+                # 11-03 夜对比：没有这一句时 gpt-4.1-mini 4/4 把"停一下"当成告别去调 handle_exit_intent
+                "“停一下”“等一下”“别说了”只是让小智先停下，不是结束对话，不要调用 handle_exit_intent；只有用户明确告别（再见、拜拜、没事了）才结束对话。"
                 f"拿到工具结果后用一两句中文说出结论；不需要工具就直接用一句话回答。当前时间：{now}")
 
-    async def _responses_call(self, items: list, tools: list) -> dict:
+    @staticmethod
+    def _dispatch_tools(tools: list) -> list:
+        """农历插件的说明叫"今天农历是多少"这类问题别调工具（原版级联的提示词里带当天农历），Live 链路里没有这份上下文，
+        照说明做模型就会凭记忆答错，所以去掉那一句。"""
+        out = []
+        for t in tools:
+            d = t.get("description") or ""
+            if t.get("name") == "get_lunar" and "对于'今天农历是多少'" in d:
+                t = dict(t, description=d.split("对于'今天农历是多少'")[0] + "今天的农历日期也用它查。")
+            out.append(t)
+        return out
+
+    async def _decisions_call(self, ctx: str, tools: list) -> tuple:
+        """/v1/decisions 多选一：返回 (工具名或 None, 置信度)。"""
+        import aiohttp
+        choices = [{"value": t["name"], "description": (t.get("description") or "")[:300]} for t in tools]
+        choices.append({"value": "none", "description": "不需要工具：闲聊、讲故事、讲笑话、常识问答"})
+        body = {"model": self.decision_model, "input": f"{self._dispatch_instructions()}\n\n{ctx}",
+                "questions": [{"type": "choice", "name": "tool", "choices": choices,
+                               "instructions": "根据用户最后一句话，选出小智要调用的工具；不需要工具就选 none。"
+                                               "日期、时间、农历、设备状态和控制、音量这类实时信息必须选工具。"}]}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
+            async with s.post(self.decision_url, json=body, headers={"Authorization": f"Bearer {self.api_key}"}) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"HTTP {r.status}")
+                a = ((await r.json()).get("answers") or [{}])[0]
+        choice = a.get("choice")
+        return (None if choice in (None, "none") else str(choice)), a.get("confidence")
+
+    async def _responses_call(self, items: list, tools: list, force: str | None = None) -> dict:
         import aiohttp
         body = {"model": self.tool_model, "instructions": self._dispatch_instructions(), "input": items,
-                "tools": tools, "tool_choice": "auto", "store": False}
+                "tools": tools, "tool_choice": {"type": "function", "name": force} if force else "auto", "store": False}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
             async with s.post(self.tool_url, json=body, headers={"Authorization": f"Bearer {self.api_key}"}) as r:
                 if r.status != 200:
                     raise RuntimeError(f"HTTP {r.status}")
                 return await r.json()
+
+    async def _decide_first(self, ctx: str, items: list, tools: list):
+        """decisions 挑第一个工具；返回这一轮要执行的 function_call 列表，拿不准 / 不需要工具 / 出错时返回 None（退回 tool_model）。"""
+        t0 = time.time()
+        try:
+            name, conf = await self._decisions_call(ctx, tools)
+        except Exception as e:  # noqa: BLE001
+            self.logger.bind(tag=TAG).warning(f"Live decisions 失败，退回 {self.tool_model}：{type(e).__name__}: {e}")
+            return None
+        by = {t["name"]: t for t in tools}
+        ms = round(1000 * (time.time() - t0))
+        if not name or name not in by or conf is None or conf < self.decision_min_conf:
+            self.logger.bind(tag=TAG).info(f"Live decisions 选 {name}（置信度 {conf}）{ms} ms，退回 {self.tool_model}")
+            return None
+        self.logger.bind(tag=TAG).info(f"Live decisions 选 {name}（置信度 {conf}）{ms} ms")
+        tool = by[name]
+        if not (tool.get("parameters") or {}).get("properties"):
+            return [{"type": "function_call", "call_id": f"dec_{int(t0 * 1000)}", "name": name, "arguments": "{}"}]
+        resp = await self._responses_call(items, [tool], force=name)      # 只让小模型填这一个工具的参数
+        calls = [o for o in (resp.get("output") or []) if o.get("type") == "function_call"]
+        return calls or None
 
     async def _client_delegation(self, did: str) -> None:
         """Live 把一件事委托出来（没有请求正文）：用最近几句对话拼出请求，小模型选工具、ToolRunner 执行，结果交回 Live 转述。"""
@@ -459,13 +518,17 @@ class S2SProvider(S2SProviderBase):
         turns = self.history[-6:] + ([("user", pending)] if pending else [])
         ctx = "\n".join(f"{'用户' if r == 'user' else '小智'}：{t}" for r, t in turns) or self.last_user_text
         items: list = [{"role": "user", "content": ctx}]
-        tools = self._tool_list()
+        tools = self._dispatch_tools(self._tool_list())
         answer, used = "", []
         try:
-            for _ in range(max(1, self.tool_rounds)):
-                resp = await self._responses_call(items, tools)
-                out = resp.get("output") or []
-                calls = [o for o in out if o.get("type") == "function_call"]
+            first = await self._decide_first(ctx, items, tools) if self.tool_picker == "decisions" else None
+            for i in range(max(1, self.tool_rounds)):
+                if i == 0 and first:
+                    calls, out = first, []
+                else:
+                    resp = await self._responses_call(items, tools)
+                    out = resp.get("output") or []
+                    calls = [o for o in out if o.get("type") == "function_call"]
                 text = "".join(c.get("text", "") for o in out if o.get("type") == "message"
                                for c in (o.get("content") or []) if c.get("type") == "output_text").strip()
                 if not calls:
