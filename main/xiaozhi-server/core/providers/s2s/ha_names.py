@@ -8,7 +8,8 @@ HA 的意图工具（MCP 里叫"平台__Hass意图"，如 intent__HassTurnOn、f
 所以调度指令里加一条填法规则，再带一份从 GetLiveContext 生成的名单（每台设备第一个名字 + 最短的几个别名、区域名和区域别名），
 小模型照抄名字（同一批句子 51/52）。名单的副作用：HA 里有不带地名的别名时，用户说的地方没有这台设备，模型会照抄别处设备的
 别名（"把乙地的X关了"关掉甲地的 X）。规则又不让把地点拆到 area，HA 自己的区域过滤也就不起作用了，所以执行前过一道地点守卫：
-用户最后一句话提到的区域和这次调用会命中的设备不在一处，就不执行。
+用户最后一句话提到的区域和这次调用会命中的设备不在一处，就不执行。再加一道区域歧义检查：没填 name、会一次控制多台，
+用户又没说"都 / 全部"，也不执行、回问是哪一台（设备名没识别出来时小模型会退成只填区域）。
 
 名字、区域都来自 HA，这里不写任何地名。只读：只调 GetLiveContext。
 """
@@ -124,6 +125,10 @@ def dispatch_text(tools: Iterable[dict], entries: list[dict], domains: Iterable[
     parts = [f"{lead} {'、'.join(prefixes)} 开头的 Home Assistant 工具：控制某一个设备只填 name，"
              "把用户说的地点、房间和设备名照原话连起来（用户说“A的B”就填“AB”），不要把地点或房间拆到 area，"
              "也不要填 floor、domain、device_class；控制一个地方的整类设备时才填 area 和 domain。"]
+    # 查状态的 GetLiveContext 也按名字 / 别名全等过滤：11-03 外放验收"乙地的空气净化器开着吗"填了 name=空气净化器、area=乙地，没查到
+    query = next((str(t["name"]) for t in tools if str(t.get("name") or "").endswith("GetLiveContext")), None)
+    if query:
+        parts[0] += f"查这些设备的状态用 {query}：name 也照这样填完整的设备名（名单里有就整个照抄），不要拆出 area。"
     domains = set(domains)
     rows = []
     for e in entries or []:
@@ -198,6 +203,30 @@ def place_conflict(utterance: str, tool_name: str, args: dict, entries: list[dic
     where = "、".join(sorted({e["areas"][0] for e in off}))
     return (f"没有执行：用户说的是{'、'.join(sorted(said))}，名字对得上的设备在{where}，不是同一个地方。"
             "告诉用户那里没有这台设备，或者问清是哪一台。")
+
+
+# 用户明说要控制一类设备的词。"全"只认"全都 / 全部"和后面紧跟动作的（全关、全打开）：
+# 11-03 外放验收里"除甲醛"被转写成"出价全"，光认"全"会把这种转写错的设备名当成"全部"
+_ALL_WORDS = re.compile(r"都|全部|所有|全都|一起|统统|全(?=[关开打拉调停合])")
+_NOT_ACTIONABLE = {"sensor", "binary_sensor"}
+
+
+def area_ambiguity(utterance: str, tool_name: str, args: dict, entries: list[dict]) -> str | None:
+    """没填 name（只填区域 / 类别）的控制调用：用户没说"都 / 全部 / 所有 / 全…"、会命中的可控设备又不止一台时，
+    返回交给 Live 的说明（不执行，回问是哪一台）；只有一台、用户明说了要全部、或者填了 name，都放行。
+    设备名没识别出来时，小模型会退成只填 area + domain，一次控制那个地方的同类设备（"乙地的风扇风速调到最大"
+    把同处的净化器也调了）；"把书房的灯关了"这种区域里只有一盏的照常执行。"""
+    a = {k: v for k, v in (args or {}).items() if v is not None and not (isinstance(v, str) and not v.strip())}
+    if isinstance(a.get("name"), str) and norm(a["name"]) != "all":
+        return None
+    if _ALL_WORDS.search(utterance or ""):
+        return None
+    hits = [e for e in matched(tool_name, a, entries) if e["domain"] not in _NOT_ACTIONABLE]
+    if len(hits) <= 1:
+        return None
+    names = "、".join(e["names"][0] for e in hits[:4]) + ("等" if len(hits) > 4 else "")
+    where = f"{a['area']}" if isinstance(a.get("area"), str) else "家里"
+    return f"没有执行：用户没说是哪一台，{where}有 {len(hits)} 台对得上（{names}）。问用户要控制哪一台。"
 
 
 def tidy_args(tool: dict, args: dict, entries: list[dict]) -> dict:

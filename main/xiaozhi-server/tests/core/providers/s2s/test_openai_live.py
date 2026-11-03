@@ -917,3 +917,19 @@ def test_ha_names_wait_for_tool_handler_init():
         await p._load_ha_names()
         assert p._ha_entries and [c["name"] for c in fh.calls] == ["homeassistant__GetLiveContext"]
     _run_client(sc)
+
+
+def test_area_only_call_hitting_several_devices_asks_unless_user_said_all():
+    """没填 name、会一次控制甲地的风扇和窗帘两台：用户没说"都"就不执行、回问；说了"都"照常执行。"""
+    off = "intent__HassTurnOff"
+
+    async def sc(lv, conn, p):
+        content = await _delegate(lv, p, "把甲地的关了", {"name": off, "arguments": "{\"area\": \"甲地楼下1号\"}"}, "a1")
+        assert "没有执行" in content and "2 台" in content
+        assert [c["name"] for c in conn.func_handler.calls] == ["homeassistant__GetLiveContext"]
+    _ha_client(sc)
+
+    async def sc2(lv, conn, p):
+        await _delegate(lv, p, "把甲地的都关了", {"name": off, "arguments": "{\"area\": \"甲地楼下1号\"}"}, "a2")
+        assert conn.func_handler.calls[-1]["name"] == off
+    _ha_client(sc2)

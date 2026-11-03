@@ -658,6 +658,11 @@ class S2SProvider(S2SProviderBase):
         blocked = ha_names.place_conflict(utterance, name, tidy, self._ha_entries)
         if blocked:
             self.logger.bind(tag=TAG).info(f"Live 地点守卫拦下 {name}：{blocked}")
+            return blocked
+        # 没填 name、会一次控制多台、用户又没说"都 / 全部"：先问是哪一台（设备名没识别出来时小模型会退成只填区域）
+        blocked = ha_names.area_ambiguity(utterance, name, tidy, self._ha_entries)
+        if blocked:
+            self.logger.bind(tag=TAG).info(f"Live 区域歧义拦下 {name}：{blocked}")
         return blocked
 
     async def _client_delegation(self, did: str) -> None:
