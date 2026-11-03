@@ -445,3 +445,31 @@ def test_live_uses_speech_gate_when_enabled(monkeypatch):
             assert ups[0] == b"\x00" * 1920 and ups[1] == _frame(3000)
             await p.close()
     asyncio.run(go())
+
+
+def test_greeting_not_skipped_by_resent_wake_audio_through_speech_gate(monkeypatch):
+    """设备连上后会把唤醒词音频再发一遍；人声门把它判成人声也不能跳过"我在"（11-03 12:19 真机）。"""
+    import core.providers.s2s.openai_live.openai_live as mod
+    monkeypatch.setattr(mod, "load_vad", lambda path=None: FakeVAD())
+
+    async def go():
+        lv = FakeLive()
+        async with serve(lv.handler, "127.0.0.1", 0) as srv:
+            url = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}/v1/live/sessions"
+            conn = FakeConn(asyncio.get_running_loop())
+            p = S2SProvider({"api_key": "k", "url": url, "echo_gate": False, "idle_close_s": 0,
+                             "speech_gate": True, "speech_gate_lookahead_ms": 0}, conn)
+
+            async def fake_tts():
+                return (np.ones(conn.sample_rate // 5, np.int16) * 2000).tobytes()
+            p._greeting_pcm = fake_tts
+            conn.s2s = p
+            await p.open()
+            task = asyncio.ensure_future(p.on_text("嘿，你好呀"))
+            await _real_sleep(0.05)
+            await p.on_pcm(_frame(3000))       # 重发的唤醒词：人声门判成人声
+            await task
+            await _real_sleep(0.2)
+            assert ("tts", "start") in conn.websocket.states()
+            await p.close()
+    asyncio.run(go())
