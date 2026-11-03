@@ -31,6 +31,7 @@ from websockets.exceptions import ConnectionClosed
 from core.providers.s2s.audio import Resampler
 from core.providers.s2s.base import DeviceSpeaker, S2SProviderBase, UplinkTrace
 from core.providers.s2s.echo_gate import EchoGate, load_vad
+from core.providers.s2s.speech_gate import SpeechGate
 from core.providers.s2s.tools import ToolRunner, to_realtime_tools
 
 TAG = __name__
@@ -117,6 +118,17 @@ class S2SProvider(S2SProviderBase):
                             lag_prior=float(c.get("gate_lag_prior_ms", 200)) / 1000,
                             lag_max=float(c.get("gate_lag_max_ms", 1200)) / 1000)
         self.gate = gate
+        # 上行人声门（speech_gate: true 打开）：不是人声的帧换成静音再送模型，见 core/providers/s2s/speech_gate.py
+        self.speech_gate = None
+        if c.get("speech_gate", False):
+            vad = load_vad(self._vad_model_path())
+            if vad is None:
+                conn.logger.bind(tag=TAG).warning("speech_gate 打开了但 silero 模型不在，人声门不生效")
+            else:
+                self.speech_gate = SpeechGate(vad, threshold=float(c.get("speech_gate_threshold", 0.5)),
+                                              hold_ms=int(c.get("speech_gate_hold_ms", 600)),
+                                              lookahead_ms=int(c.get("speech_gate_lookahead_ms", 120)))
+        self.t_wake_trigger = None
         out_rate = getattr(conn, "sample_rate", LIVE_RATE)
         self.speaker = DeviceSpeaker(conn, out_rate, gate=gate)
         self.down_rs = Resampler(LIVE_RATE, out_rate) if out_rate != LIVE_RATE else None
@@ -238,6 +250,7 @@ class S2SProvider(S2SProviderBase):
         self._arm_idle()
         self.logger.bind(tag=TAG).info(
             f"Live 会话已建立 model={self.model} voice={self.voice} echo_gate={'on' if self.gate else 'off'} "
+            f"speech_gate={'on' if self.speech_gate else 'off'} "
             f"speech_rms={self.speech_rms} end_silence_ms={self.end_silence_ms} "
             f"tools={'off' if not self.tools_enabled else len(self._session_sig[1])}@"
             f"{self.tool_model + '(client)' if self.delegation_mode == 'client' else self.delegation_model} in {time.monotonic() - t0:.2f}s")
@@ -259,6 +272,8 @@ class S2SProvider(S2SProviderBase):
                 await self.ws.close()
         if self.gate is not None:
             self.stats["gate"] = dict(self.gate.stats, lag_ms=round(self.gate.lag * 1000))
+        if self.speech_gate is not None:
+            self.stats["speech_gate"] = self.speech_gate.stats
         self.logger.bind(tag=TAG).info(f"Live 会话结束: {self.stats}")
 
     # ---------- 设备 → 模型 ----------
@@ -270,6 +285,10 @@ class S2SProvider(S2SProviderBase):
             pcm16k, _ = self.gate.process(pcm16k, time.monotonic(), self.speaker.speaking)
         if not self.forward_before_listen and not getattr(self.conn, "client_is_listening", False):
             return
+        if self.speech_gate is not None:
+            pcm16k = self.speech_gate.process(pcm16k, time.monotonic())
+            if not pcm16k:
+                return   # 前瞻队列还没填满
         await self._send({"type": "session.input_audio.append", "audio": base64.b64encode(pcm16k).decode()})
         self.stats["up_frames"] += 1
 
@@ -277,6 +296,7 @@ class S2SProvider(S2SProviderBase):
         # Live 没有"按文字起一轮回复"的入口：唤醒词那句只用来播缓存的唤醒应答，其余文字忽略
         text = (text or "").strip()
         if text == WAKE_TRIGGER:
+            self.t_wake_trigger = time.monotonic()
             await self._play_greeting()
         elif text:
             self.logger.bind(tag=TAG).info("Live 暂不支持文字输入，已忽略")
@@ -304,6 +324,17 @@ class S2SProvider(S2SProviderBase):
         _GREETING_CACHE[key] = pcm
         return pcm
 
+    def _user_spoke_since_wake(self) -> bool:
+        """唤醒后用户是不是接着在说话。只认人声，不看电平：11-03 v9 复测时唤醒后上行一阵 13780 的响声（不是人在说话）
+        让"我在"被跳过，用户以为没唤醒。人声门判出人声，或者模型已经转写出了话，才算。"""
+        t0 = self.t_wake_trigger
+        if t0 is None:
+            return False
+        sg = self.speech_gate
+        if sg is not None and sg.t_last_speech is not None and sg.t_last_speech >= t0:
+            return True
+        return self.t_last_input_text is not None and self.t_last_input_text >= t0
+
     async def _play_greeting(self) -> None:
         if not self.wake_greeting_text or self.in_seg or self.speaker.speaking:
             return
@@ -314,7 +345,7 @@ class S2SProvider(S2SProviderBase):
         if not pcm or self.in_seg or self.speaker.speaking:
             return
         await asyncio.sleep(0.3)   # 给攒下的音频一点时间补送进来（drain_early_audio 在下一个音频包时执行）
-        if self.trace.loud or time.time() - self.trace.t_last < 0.5:
+        if self._user_spoke_since_wake():
             self.logger.bind(tag=TAG).info("Live 唤醒应答跳过：用户唤醒后接着在说")
             return
         await self.speaker.begin()
