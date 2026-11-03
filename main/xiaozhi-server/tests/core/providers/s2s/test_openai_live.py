@@ -319,3 +319,64 @@ def test_greeting_skipped_when_user_keeps_talking():
             assert ("tts", "start") not in conn.websocket.states()
             await p.close()
     asyncio.run(go())
+
+
+def _run_client(scenario, **over):
+    async def go():
+        lv = FakeLive()
+        async with serve(lv.handler, "127.0.0.1", 0) as srv:
+            url = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}/v1/live/sessions"
+            conn = FakeConn(asyncio.get_running_loop())
+            p = S2SProvider({"api_key": "k", "url": url, "echo_gate": False, "idle_close_s": 0, "wake_greeting_text": "",
+                             "delegation_mode": "client", **over}, conn)
+            conn.s2s = p
+            await p.open()
+            await scenario(lv, conn, p)
+            await p.close()
+    asyncio.run(go())
+
+
+def test_client_mode_session_start_declares_client_delegation():
+    async def sc(lv, conn, p):
+        d = lv.received[0]["session"]["delegation"]
+        assert d == {"type": "client", "acknowledgement_delay_ms": 800}
+    _run_client(sc)
+
+
+def test_client_delegation_short_tool_result_goes_straight_to_live():
+    async def sc(lv, conn, p):
+        calls = []
+
+        async def fake(items, tools):
+            calls.append([dict(i) for i in items])
+            assert [t["name"] for t in tools] == ["hass_state"]
+            return {"output": [{"type": "function_call", "call_id": "c1", "name": "hass_state", "arguments": "{\"entity_id\": \"light.x\"}"}]}
+        p._responses_call = fake
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "把客厅灯打开"})
+        await _real_sleep(0.05)
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d1", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        m = [m for m in lv.received if m["type"] == "session.commentary.append"][0]
+        assert m["delegation_id"] == "d1" and m["content"] == "客厅灯已打开"
+        assert len(calls) == 1 and "把客厅灯打开" in calls[0][0]["content"]
+        assert conn.func_handler.calls[0]["name"] == "hass_state"
+    _run_client(sc)
+
+
+def test_client_delegation_long_tool_result_gets_summarised():
+    async def sc(lv, conn, p):
+        n = {"i": 0}
+
+        async def fake(items, tools):
+            n["i"] += 1
+            if n["i"] == 1:
+                return {"output": [{"type": "function_call", "call_id": "c1", "name": "hass_state", "arguments": "{}"}]}
+            assert items[-1]["type"] == "function_call_output" and items[-2]["type"] == "function_call"
+            return {"output": [{"type": "message", "content": [{"type": "output_text", "text": "客厅灯开着。"}]}]}
+        p._responses_call = fake
+        p.direct_max_chars = 3            # 让"客厅灯已打开"算长结果，走第二轮
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d2", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        m = [m for m in lv.received if m["type"] == "session.commentary.append"][0]
+        assert m["content"] == "客厅灯开着。" and n["i"] == 2
+    _run_client(sc)
