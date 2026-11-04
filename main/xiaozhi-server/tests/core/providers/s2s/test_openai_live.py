@@ -1141,19 +1141,226 @@ def test_ha_names_wait_for_tool_handler_init():
 
 
 def test_area_only_call_hitting_several_devices_asks_unless_user_said_all():
-    """没填 name、会一次控制甲地的风扇和窗帘两台：用户没说"都"就不执行、回问；说了"都"照常执行。"""
+    """没填 name、会一次控制甲地的两台窗帘：用户没说"都"就不执行、回问；说了"都"照常执行。"""
     off = "intent__HassTurnOff"
 
+    def curtains_only(p):
+        p._ha_entries = [e for e in p._ha_entries if e["domain"] != "fan"]
+        p._ha_entries.append(dict(p._ha_entries[0], names=["甲地1号卧室纱帘", "卧室纱帘"]))
+
     async def sc(lv, conn, p):
+        curtains_only(p)
         content = await _delegate(lv, p, "把甲地的关了", {"name": off, "arguments": "{\"area\": \"甲地楼下1号\"}"}, "a1")
         assert "没有执行" in content and "2 台" in content
         assert [c["name"] for c in conn.func_handler.calls] == ["homeassistant__GetLiveContext"]
     _ha_client(sc)
 
     async def sc2(lv, conn, p):
+        curtains_only(p)
         await _delegate(lv, p, "把甲地的都关了", {"name": off, "arguments": "{\"area\": \"甲地楼下1号\"}"}, "a2")
         assert conn.func_handler.calls[-1]["name"] == off
     _ha_client(sc2)
+
+
+def _ha_ran(conn) -> list[dict]:
+    return [json.loads(c["arguments"]) for c in conn.func_handler.calls if c["name"] in ("intent__HassTurnOff", "intent__HassTurnOn")]
+
+
+async def _kind_round(lv, p, said: str, args: dict, did: str) -> str:
+    """转写先落进 history 再委托，交回后 Live 问的那句也记进 history（线上常见的顺序）。"""
+    p.history.append(("user", said))
+    content = await _delegate(lv, p, None, {"name": "intent__HassTurnOff", "arguments": json.dumps(args, ensure_ascii=False)}, did)
+    p.history.append(("assistant", "你要控制哪一类？"))
+    return content
+
+
+AREA_ONLY = {"area": "甲地楼下1号"}
+
+
+def test_area_only_call_across_kinds_asks_which_kind_even_when_user_said_all():
+    """用户说了"都"，小模型只填了区域：HA 会动那一处的风扇和窗帘。不执行，说清有哪几类、问要哪一类。"""
+    async def sc(lv, conn, p):
+        content = await _kind_round(lv, p, "把甲地的都关了", AREA_ONLY, "k1")
+        assert "没有执行" in content and "风扇或净化器 1 个" in content and "窗帘 1 个" in content and "哪一类" in content
+        assert _ha_ran(conn) == []
+    _ha_client(sc)
+
+
+def test_answer_with_a_kind_runs_and_is_not_asked_which_one():
+    """答了"窗帘"，小模型填上类别：只动窗帘，这句虽然没有"都"，也不能再问是哪一台（上一句说过了）。"""
+    args = {"area": "戊地楼下1号", "domain": ["cover"]}
+
+    async def sc(lv, conn, p):
+        assert "哪一类" in await _kind_round(lv, p, "把戊地的都关了", {"area": "戊地楼下1号"}, "c1")
+        assert "没有执行" not in await _kind_round(lv, p, "窗帘", args, "c2")
+        assert _ha_ran(conn) == [args]
+    _name_client(sc)
+
+
+def test_answer_with_a_kind_and_one_named_device_runs_then_rivals_are_checked_again():
+    """答了"窗帘"，小模型先填了一幅的名字：这一批还在问过的范围里，不再问"哪一台"（后面几轮它会接着补）。
+    只管回答的这一次，再下一句说不清是哪一幅照样问。"""
+    args = {"name": "戊地1号卧室布帘"}
+
+    async def sc(lv, conn, p):
+        assert "哪一类" in await _kind_round(lv, p, "把戊地的都关了", {"area": "戊地楼下1号"}, "c5")
+        assert "没有执行" not in await _kind_round(lv, p, "窗帘", args, "c6")
+        assert _ha_ran(conn) == [args]
+        assert "4 台" in await _kind_round(lv, p, "把戊地的窗帘关上", args, "c7")
+        assert _ha_ran(conn) == [args]
+    _name_client(sc)
+
+
+async def _answer_with_a_light(lv, p, conn, said: str, did: str) -> list[str]:
+    """问过"哪一类"之后用户答 said，小模型填了一盏灯，拿到结果后说一句话。返回这次执行的灯。"""
+    before = len(conn.func_handler.calls)
+
+    async def fake(items, tools):
+        if any(i.get("type") == "function_call_output" for i in items):
+            return {"output": [{"type": "message", "content": [{"type": "output_text", "text": "好了。"}]}]}
+        return {"output": [_light_call("light.a1")]}
+    p._responses_call = fake
+    p.history.append(("user", said))
+    await lv.emit({"type": "session.delegation.created", "delegation": {"id": did, "target": "client"}})
+    await wait_until(lambda: [m for m in lv.received if m["type"] == "session.commentary.append" and m["delegation_id"] == did],
+                     what="commentary")
+    return [json.loads(c["arguments"])["entity_id"] for c in conn.func_handler.calls[before:] if c["name"] == "hass_set_state"]
+
+
+def test_answer_lights_fans_out_to_every_light_at_that_place():
+    """答了"灯"，小模型只填一盏：上一句说过"都"，按设备列表控制那一处的每一盏，只管回答的这一次。"""
+    async def sc(lv, conn, p):
+        conn.prompt = _LIGHTS_PROMPT
+        assert "哪一类" in await _kind_round(lv, p, "把甲地的都关了", AREA_ONLY, "f1")
+        assert await _answer_with_a_light(lv, p, conn, "灯", "f2") == ["light.a1", "light.a2", "light.a3"]
+        p.history.append(("assistant", "好了。"))
+        assert await _answer_with_a_light(lv, p, conn, "灯", "f3") == ["light.a1"]
+    _ha_client(sc)
+
+
+def test_answer_naming_a_light_or_giving_up_does_not_fan_out():
+    """答了具体的灯只控制那一盏；"算了"之后小模型万一还填了一盏，也不会变成那一处的每一盏。"""
+    async def sc(lv, conn, p):
+        conn.prompt = _LIGHTS_PROMPT
+        assert "哪一类" in await _kind_round(lv, p, "把甲地的都关了", AREA_ONLY, "f4")
+        assert await _answer_with_a_light(lv, p, conn, "书房灯", "f5") == ["light.a1"]
+        p.history.append(("assistant", "好了。"))
+        assert "哪一类" in await _kind_round(lv, p, "把甲地的都关了", AREA_ONLY, "f6")
+        assert await _answer_with_a_light(lv, p, conn, "算了", "f7") == ["light.a1"]
+    _ha_client(sc)
+
+
+def test_area_ambiguity_still_asks_without_a_kind_question_before_it():
+    """同样的调用，上一轮没问过类别、这句也没说"都"：照旧问是哪一台。"""
+    async def sc(lv, conn, p):
+        content = await _kind_round(lv, p, "把戊地的窗帘关了", {"area": "戊地楼下1号", "domain": ["cover"]}, "c3")
+        assert "没有执行" in content and "4 台" in content and _ha_ran(conn) == []
+        # 只命中档位、目标湿度（HA 动不了）也一样照旧问，不能因为"能开关的一个都没有"就跳过
+        place = ["庚地"]
+        p._ha_entries = p._ha_entries + [{"names": [n], "domain": d, "areas": place, "device_class": None}
+                                         for n, d in (("庚地档位", "select"), ("庚地目标湿度", "number"))]
+        content = await _kind_round(lv, p, "把庚地的关了", {"area": "庚地"}, "c4")
+        assert "没有执行" in content and "2 台" in content and _ha_ran(conn) == []
+    _name_client(sc)
+
+
+def test_answer_all_runs_area_only_call_once():
+    """问过之后答"都关"，还是那一批设备才算真要全部；放行一次就用掉了，接着再说"都关"又要问。"""
+    async def sc(lv, conn, p):
+        assert "哪一类" in await _kind_round(lv, p, "把甲地的都关了", AREA_ONLY, "e1")
+        assert "没有执行" not in await _kind_round(lv, p, "都关", AREA_ONLY, "e2")
+        assert _ha_ran(conn) == [AREA_ONLY]
+        assert "哪一类" in await _kind_round(lv, p, "都关", AREA_ONLY, "e3")
+        assert _ha_ran(conn) == [AREA_ONLY]
+    _ha_client(sc)
+
+
+def test_answer_with_a_kind_but_area_only_call_asks_again():
+    """答了"窗帘"，小模型还是只填区域：不能执行，也不能改口问"哪一台"，接着问哪一类。"""
+    async def sc(lv, conn, p):
+        assert "哪一类" in await _kind_round(lv, p, "把甲地的都关了", AREA_ONLY, "g1")
+        assert "哪一类" in await _kind_round(lv, p, "窗帘", AREA_ONLY, "g2")
+        assert "哪一类" in await _kind_round(lv, p, "窗帘都关了", AREA_ONLY, "g3")      # 带"都"也是点了类别，不是全部
+        assert _ha_ran(conn) == []
+    _ha_client(sc)
+
+
+def test_all_words_for_another_place_after_a_kind_question_asks_about_that_place():
+    """问的是甲地，用户接着说"乙地的都关了"：不是答上一个问题，乙地也要问。"""
+    async def sc(lv, conn, p):
+        assert "哪一类" in await _kind_round(lv, p, "把甲地的都关了", AREA_ONLY, "h1")
+        content = await _kind_round(lv, p, "乙地的都关了", {"area": "乙地"}, "h2")
+        assert "乙地所有能开关的设备" in content and _ha_ran(conn) == []
+    _ha_client(sc)
+
+
+def test_place_guard_still_blocks_other_area_right_after_a_kind_question():
+    """回问之后用户换了个地方，小模型抄了甲地设备不带地名的别名：上一句的地点不能把它放过去。"""
+    async def sc(lv, conn, p):
+        assert "哪一类" in await _kind_round(lv, p, "把甲地的都关了", AREA_ONLY, "p3")
+        content = await _kind_round(lv, p, "把乙地的除醛净化器关了", {"name": "除醛净化器"}, "p4")
+        assert "不是同一个地方" in content and _ha_ran(conn) == []
+    _ha_client(sc)
+
+
+def test_kinds_or_names_filled_and_other_intents_are_not_asked_which_kind():
+    """填了类别、名字，或者 HA 那边不会跨类的意图（SetPosition），都照常执行。"""
+    calls = [("intent__HassTurnOff", {"area": "甲地楼下1号", "domain": ["cover"]}),
+             ("intent__HassTurnOn", {"area": "甲地楼下1号", "device_class": ["curtain"]}),
+             ("intent__HassTurnOff", {"name": "甲地客厅纱帘"}),
+             ("intent__HassSetPosition", {"area": "甲地楼下1号", "position": 0})]
+
+    async def sc(lv, conn, p):
+        for i, (name, args) in enumerate(calls):
+            said = "把甲地的窗帘都" + ("关上" if name != "intent__HassTurnOn" else "打开")
+            content = await _delegate(lv, p, said, {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}, f"m{i}")
+            assert "没有执行" not in content
+            ran = conn.func_handler.calls[-1]
+            assert ran["name"] == name and json.loads(ran["arguments"]) == args
+    _ha_client(sc)
+
+
+def test_area_only_call_after_tidy_dropped_a_bad_domain_is_asked():
+    """domain 填了 HA 没有、也不是 device_class 的词：整理时丢掉后就只剩区域，一样要问。"""
+    async def sc(lv, conn, p):
+        content = await _kind_round(lv, p, "把甲地的都关了", {"area": "甲地楼下1号", "domain": ["东西"]}, "t1")
+        assert "哪一类" in content and _ha_ran(conn) == []
+    _ha_client(sc)
+
+
+async def _many_area_calls(lv, p, said: str, areas: tuple, did: str) -> None:
+    """小模型一轮出好几个只填区域的调用，拿到结果后说一句话。"""
+    calls = [{"type": "function_call", "call_id": f"{did}{i}", "name": "intent__HassTurnOff",
+              "arguments": json.dumps({"area": a}, ensure_ascii=False)} for i, a in enumerate(areas)]
+
+    async def fake(items, tools):
+        if any(i.get("type") == "function_call_output" for i in items):
+            return {"output": [{"type": "message", "content": [{"type": "output_text", "text": "要关哪一类？"}]}]}
+        return {"output": calls}
+    p._responses_call = fake
+    p.history.append(("user", said))
+    await lv.emit({"type": "session.delegation.created", "delegation": {"id": did, "target": "client"}})
+    await wait_until(lambda: [m for m in lv.received if m["type"] == "session.commentary.append" and m["delegation_id"] == did],
+                     what="commentary")
+    p.history.append(("assistant", "要关哪一类？"))
+
+
+def test_two_area_only_calls_in_one_delegation_are_both_asked_and_both_answered():
+    """小模型一轮填了甲地、乙地两个只填区域的调用：都不执行；用户答"都关"后两处都算答过了。"""
+    async def sc(lv, conn, p):
+        await _many_area_calls(lv, p, "把甲地和乙地的都关了", ("甲地楼下1号", "乙地"), "b1")
+        assert _ha_ran(conn) == []
+        await _many_area_calls(lv, p, "都关", ("甲地楼下1号", "乙地"), "b2")
+        assert [a["area"] for a in _ha_ran(conn)] == ["甲地楼下1号", "乙地"]
+    _ha_client(sc)
+
+
+def test_same_area_only_call_twice_in_one_delegation_is_not_counted_as_answered():
+    """一轮出两个一样的：同一次委托里刚问的不算问过，用户这句带"都"也不能把第二个放过去。"""
+    async def sc(lv, conn, p):
+        await _many_area_calls(lv, p, "把甲地的都关了", ("甲地楼下1号", "甲地楼下1号"), "b3")
+        assert _ha_ran(conn) == []
+    _ha_client(sc)
 
 
 def _name_client(scenario):

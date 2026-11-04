@@ -11,6 +11,7 @@ HA 的意图工具（MCP 里叫"平台__Hass意图"，如 intent__HassTurnOn、f
 用户最后一句话提到的区域和这次调用会命中的设备不在一处，就不执行。再加一道区域歧义检查：没填 name、会一次控制多台，
 用户又没说"都 / 全部"，也不执行、回问是哪一台（设备名没识别出来时小模型会退成只填区域）。设备歧义检查管另一半：
 填了 name，但用户的话分不开这台和同类的另一台（"把甲地的窗帘关上"，小模型替用户挑了卧室那幅），同样不执行、回问。
+用户说了"都"时区域歧义放行，但开关意图只填区域会动那一处所有类别的设备，所以类别歧义检查再问一次要哪一类。
 
 名字、区域都来自 HA，这里不写任何地名。只读：只调 GetLiveContext。
 """
@@ -242,6 +243,51 @@ def area_ambiguity(utterance: str, tool_name: str, args: dict, entries: list[dic
     if len(hits) <= 1:
         return None
     return ask_which(hits, f"{a['area']}" if isinstance(a.get("area"), str) else "家里")
+
+
+# HassTurnOn / HassTurnOff 不限 domain：对区域里每个实体都动手（灯、风扇开关，窗帘开合，门锁上锁 / 开锁），没有开关服务的单台失败、不影响别的
+# （HA 的 OnOffIntentHandler）。HassSetPosition / HassStopMoving 碰到窗帘、阀门以外的实体整个调用就失败了，不会多控，不归这里管
+_ON_OFF_INTENTS = {"HassTurnOn", "HassTurnOff"}
+_NO_ON_OFF = _NOT_ACTIONABLE | {"select", "number", "text", "date", "time", "datetime", "event", "update", "weather",
+                                "image", "device_tracker", "person"}
+_KIND_NAMES = {"light": "灯", "fan": "风扇或净化器", "cover": "窗帘", "switch": "开关", "humidifier": "加湿器", "climate": "空调",
+               "media_player": "音箱或电视", "vacuum": "扫地机", "lock": "门锁", "valve": "阀门"}
+
+
+def would_switch(tool_name: str, args: dict, entries: Iterable[dict]) -> list[dict]:
+    """这次调用会命中的实体里，HA 真会动手的那些（传感器之类去掉）。"""
+    return [e for e in matched(tool_name, args, entries) if e["domain"] not in _NO_ON_OFF]
+
+
+def mixed_kinds(tool_name: str, args: dict, entries: list[dict]) -> list[dict]:
+    """开关意图没填 domain、device_class，又没有 name 把范围收窄：HA 会动那一处所有能开关的设备。不止一类时返回这些设备，否则返回 []。
+    "把甲地的净化器都关了"小模型偶尔只填 area（"都"让 area_ambiguity 放行），净化器以外的灯、窗帘也一起动，结果里还只说净化器关了。"""
+    a = {k: v for k, v in (args or {}).items() if v is not None and not (isinstance(v, str) and not v.strip())}
+    if tool_name.rpartition("__")[2] not in _ON_OFF_INTENTS or a.get("domain") or a.get("device_class"):
+        return []
+    hits = would_switch(tool_name, a, entries)
+    return hits if len({e["domain"] for e in hits}) > 1 else []
+
+
+def ask_kind(hits: list[dict], args: dict) -> str:
+    """交给 Live 的说明：没有执行，问用户要控制哪一类。写清这次调用会动到什么，用户已经说了"灯"时 Live 也能接得上。"""
+    area = (args or {}).get("area")
+    counts: dict[str, int] = {}
+    for e in hits:
+        counts[e["domain"]] = counts.get(e["domain"], 0) + 1
+    kinds = "、".join(f"{_KIND_NAMES.get(d, d)} {n} 个" for d, n in counts.items())
+    return (f"没有执行：这样会动到{area if isinstance(area, str) else '家里'}所有能开关的设备（{kinds}）。"
+            "问用户要控制哪一类，还是全部。")
+
+
+# 用户答"哪一类"时点了类别的词："窗帘都关了"不是全部
+_KIND_WORDS = re.compile(r"灯|帘|风扇|净化|开关|加湿|空调|音箱|电视|扫地|门锁|阀门")
+
+
+def said_all_kinds(utterance: str) -> bool:
+    """用户最后这句话有没有说全部（回问"哪一类"之后答"都关"）。"""
+    last = (utterance or "").rsplit("\n", 1)[-1]
+    return says_all(last) and not _KIND_WORDS.search(last)
 
 
 def _name_parts(e: dict) -> set[str]:
