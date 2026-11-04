@@ -134,6 +134,7 @@ class S2SProvider(S2SProviderBase):
         self.ha_names_wait_s = float(c.get("ha_names_wait_s", 15))   # 等工具处理器初始化完（HA MCP 连上）的上限
         self._ha_entries: list[dict] = []
         self._guard_mark = 0          # 上次委托结束时 history 的长度：地点守卫只看这之后用户说的话
+        self._ha_asked: set[str] = set()   # 上一次委托回问时列的设备
         self.history: list[tuple[str, str]] = []
         self._session_sig = None
         self._calls: dict[str, asyncio.Task] = {}   # call_id → 执行中的工具
@@ -713,9 +714,11 @@ class S2SProvider(S2SProviderBase):
         calls = [o for o in (resp.get("output") or []) if o.get("type") == "function_call"]
         return calls or None
 
-    def _check_ha_call(self, call: dict, intents: dict, utterance: str) -> str | None:
+    def _check_ha_call(self, call: dict, intents: dict, utterance: str, recent: str | None = None,
+                       asked: set[str] | frozenset[str] = frozenset()) -> str | None:
         """HA 意图调用执行前：domain 误填成 device_class 的挪过去（改写 call 里的参数，后面记进对话的也是改后的）；
-        用户说的地点和会命中的设备不在一处时返回交给 Live 的说明、不执行。"""
+        用户说的地点和会命中的设备不在一处、或者没说清是哪一台时，返回交给 Live 的说明、不执行。
+        utterance 是上次委托之后用户说的话，recent 是小模型手边的那几句（默认同 utterance），asked 是上一次委托回问时列的设备。"""
         name = call.get("name") or ""
         try:
             args = json.loads(call.get("arguments") or "{}")
@@ -736,6 +739,20 @@ class S2SProvider(S2SProviderBase):
         blocked = ha_names.area_ambiguity(utterance, name, tidy, self._ha_entries)
         if blocked:
             self.logger.bind(tag=TAG).info(f"Live 区域歧义拦下 {name}：{blocked}")
+            return blocked
+        # 填了 name，但用户的话分不开这台和同类的另一台：先问。只放行一种情况：还是上一次问的那一批设备，用户最后这句话里也没有
+        # 这些设备的词（"第一个""靠窗那幅"，名单里没有，靠小模型手边的对话上下文，再问就没完了）。答了半截（"客厅的"）时这一批
+        # 会变小，接着问剩下的；带着设备的词却还是分不开（小模型选错了，或者上次问完没答、这次又说了一遍），也要问
+        group = ha_names.name_rivals(utterance, utterance if recent is None else recent, name, tidy,
+                                     self._ha_entries, self.ha_names_domains)
+        if not group:
+            return None
+        names = {e["names"][0] for e in group}
+        if names == asked and not ha_names.says_device_word(utterance.rsplit("\n", 1)[-1], group):
+            return None
+        self._ha_asked = names
+        blocked = ha_names.ask_which(group)
+        self.logger.bind(tag=TAG).info(f"Live 设备歧义拦下 {name} {call.get('arguments')}：{blocked}")
         return blocked
 
     async def _client_delegation(self, did: str) -> None:
@@ -750,6 +767,9 @@ class S2SProvider(S2SProviderBase):
         # （Live 先开口说一句时会把转写刷进 history）。更早的不看，否则上一轮提到的地方会误拦这一轮；
         # 多看到的地点只会让守卫放行，一句都看不到（转写还没到）就不拦
         said = [t for r, t in self.history[self._guard_mark:] if r == "user"] + ([pending] if pending else [])
+        # 设备歧义看小模型手边的这几句：刚问过"甲地客厅的纱帘开着吗"，接着说"把它关了"不用再问；回问之后用户答半截也接得上
+        recent = "\n".join(t for r, t in turns if r == "user")
+        asked, self._ha_asked = self._ha_asked, set()
         intents = ha_names.device_intents(tools) if self.ha_names and self._ha_entries else {}
         answer, used, raw = "", [], []
         try:
@@ -769,7 +789,8 @@ class S2SProvider(S2SProviderBase):
                 outputs = []
                 for call in calls:
                     used.append(call.get("name"))
-                    blocked = self._check_ha_call(call, intents, "\n".join(said)) if call.get("name") in intents else None
+                    blocked = (self._check_ha_call(call, intents, "\n".join(said), recent, asked)
+                               if call.get("name") in intents else None)
                     result = blocked or await self.tools.run(call.get("name") or "", call.get("arguments") or "{}")
                     outputs.append(result)
                     items.append({"type": "function_call", "call_id": call.get("call_id"), "name": call.get("name"),

@@ -1043,8 +1043,10 @@ async def _delegate(lv, p, said: str | None, call: dict, did: str) -> str:
         await lv.emit({"type": "session.input_transcript.delta", "delta": said})
         await _real_sleep(0.05)
     await lv.emit({"type": "session.delegation.created", "delegation": {"id": did, "target": "client"}})
-    await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
-    return [m for m in lv.received if m["type"] == "session.commentary.append"][0]["content"]
+    def mine():
+        return [m for m in lv.received if m["type"] == "session.commentary.append" and m["delegation_id"] == did]
+    await wait_until(lambda: mine(), what="commentary")
+    return mine()[0]["content"]
 
 
 def test_ha_names_go_into_dispatch_instructions_and_are_cached():
@@ -1152,6 +1154,126 @@ def test_area_only_call_hitting_several_devices_asks_unless_user_said_all():
         await _delegate(lv, p, "把甲地的都关了", {"name": off, "arguments": "{\"area\": \"甲地楼下1号\"}"}, "a2")
         assert conn.func_handler.calls[-1]["name"] == off
     _ha_client(sc2)
+
+
+def _name_client(scenario):
+    """设备歧义用的名单（四幅窗帘等，见 test_ha_names._name_entries）。"""
+    from tests.core.providers.s2s.test_ha_names import _name_entries
+
+    async def sc(lv, conn, p):
+        p._ha_entries = _name_entries()
+        await scenario(lv, conn, p)
+    _ha_client(sc)
+
+
+async def _ask_round(lv, p, said: str, name: str, did: str) -> str:
+    """用户说完、Live 先开口（转写已落进 history）再委托；交回后 Live 接着说的话也记进 history，和真实对话的顺序一样。"""
+    p.history.append(("user", said))
+    content = await _delegate(lv, p, None, {"name": "intent__HassTurnOff", "arguments": json.dumps({"name": name}, ensure_ascii=False)}, did)
+    p.history.append(("assistant", "你要控制哪一台？"))
+    return content
+
+
+def _ran(conn) -> list[str]:
+    return [json.loads(c["arguments"])["name"] for c in conn.func_handler.calls if c["name"] == "intent__HassTurnOff"]
+
+
+def test_named_call_asks_until_user_tells_the_device_apart():
+    """小模型替用户挑了一幅：不执行、回问。用户答了半截（"客厅的"），只问剩下分不开的；再答"布帘"才执行。"""
+    async def sc(lv, conn, p):
+        content = await _ask_round(lv, p, "把戊地的窗帘关上", "戊地1号卧室布帘", "n1")
+        assert "没有执行" in content and "4 台" in content and _ran(conn) == []
+        content = await _ask_round(lv, p, "客厅的", "戊地1号客厅布帘", "n2")
+        assert "没有执行" in content and "2 台" in content and "戊地1号客厅纱帘" in content and "卧室" not in content
+        assert _ran(conn) == []
+        await _ask_round(lv, p, "布帘", "戊地1号客厅布帘", "n3")
+        assert _ran(conn) == ["戊地1号客厅布帘"]
+    _name_client(sc)
+
+
+def test_answer_with_words_not_in_names_is_not_asked_twice_and_ask_does_not_carry_over():
+    """用户答的词名单里没有（"第一个"）：还是那一批设备，不再问，照小模型选的执行。放行一次就用掉了，接着再来一句说不清的照样要问。"""
+    async def sc(lv, conn, p):
+        assert "没有执行" in await _ask_round(lv, p, "把戊地的窗帘关上", "戊地1号卧室布帘", "o1")
+        await _ask_round(lv, p, "第一个", "戊地1号卧室布帘", "o2")
+        assert _ran(conn) == ["戊地1号卧室布帘"]
+        assert "没有执行" in await _ask_round(lv, p, "再来一个", "戊地1号客厅纱帘", "o3")
+        assert _ran(conn) == ["戊地1号卧室布帘"]
+    _name_client(sc)
+
+
+def test_answer_with_device_words_is_still_judged_by_those_words():
+    """用户答了"客厅的"，小模型却选了卧室那幅：还是那一批设备，但这句话里有设备的词，不能放行。"""
+    async def sc(lv, conn, p):
+        assert "4 台" in await _ask_round(lv, p, "把戊地的窗帘关上", "戊地1号卧室布帘", "w1")
+        assert "4 台" in await _ask_round(lv, p, "客厅的", "戊地1号卧室布帘", "w2")
+        assert _ran(conn) == []
+    _name_client(sc)
+
+
+def test_repeating_the_request_after_an_unanswered_ask_asks_again():
+    """回问之后用户没答（没有委托，上次问的设备还记着），过一会儿又说了一遍：照样问，不能当成答过了。"""
+    async def sc(lv, conn, p):
+        assert "4 台" in await _ask_round(lv, p, "把戊地的窗帘关上", "戊地1号卧室布帘", "r1")
+        assert "4 台" in await _ask_round(lv, p, "把戊地的窗帘关上", "戊地1号卧室布帘", "r2")
+        assert _ran(conn) == []
+    _name_client(sc)
+
+
+def test_answer_without_device_words_reads_only_the_last_sentence():
+    """委托结束后转写才落进 history 时，下一次委托看得到上一句（带"窗帘"）：判设备词只看最后这句，"第一个"照样放行。"""
+    off = "intent__HassTurnOff"
+
+    async def sc(lv, conn, p):
+        call = {"name": off, "arguments": json.dumps({"name": "戊地1号卧室布帘"}, ensure_ascii=False)}
+        assert "4 台" in await _delegate(lv, p, "把戊地的窗帘关上", call, "l1")
+        await p._flush_input_text()
+        await _delegate(lv, p, "第一个", call, "l2")
+        assert _ran(conn) == ["戊地1号卧室布帘"]
+    _name_client(sc)
+
+
+def test_place_guard_still_blocks_other_area_right_after_an_ask():
+    """回问之后用户换了个地方：设备歧义看得到上一句，地点守卫不看，否则上一句的地点会把跨房子的误控放过去。"""
+    async def sc(lv, conn, p):
+        assert "4 台" in await _ask_round(lv, p, "把戊地的窗帘关上", "戊地1号卧室布帘", "p1")
+        content = await _ask_round(lv, p, "把己地的大净化器关了", "大净化器", "p2")
+        assert "不是同一个地方" in content and "己地老家" in content and _ran(conn) == []
+    _name_client(sc)
+
+
+def test_two_named_calls_in_one_delegation_are_both_asked():
+    """小模型一轮填了两幅：同一次委托里不能因为第一个刚问过，就把第二个放过去。"""
+    off = "intent__HassTurnOff"
+
+    async def sc(lv, conn, p):
+        calls = [{"type": "function_call", "call_id": f"c{i}", "name": off, "arguments": json.dumps({"name": n}, ensure_ascii=False)}
+                 for i, n in enumerate(("戊地1号卧室布帘", "戊地1号客厅布帘"))]
+        rounds = [{"output": calls}, {"output": [{"type": "message", "content": [{"type": "output_text", "text": "要关哪一幅？"}]}]}]
+
+        async def fake(items, tools):
+            return rounds.pop(0)
+        p._responses_call = fake
+        p.history.append(("user", "把戊地的窗帘关上"))
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "t1", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        assert _ran(conn) == []
+    _name_client(sc)
+
+
+def test_pronoun_after_naming_the_device_is_not_asked_and_in_list_tools_are_untouched():
+    """前一句说过是哪一台（查状态也算），接着说"把它关了"不用问。hass_set_state 不过这些检查。"""
+    async def sc(lv, conn, p):
+        p.history += [("user", "戊地客厅的纱帘开着吗"), ("assistant", "开着呢。")]
+        p._guard_mark = len(p.history)
+        await _delegate(lv, p, "把它关了", {"name": "intent__HassTurnOff", "arguments": "{\"name\": \"戊地1号客厅纱帘\"}"}, "q1")
+        assert _ran(conn) == ["戊地1号客厅纱帘"]
+    _name_client(sc)
+
+    async def sc2(lv, conn, p):
+        await _delegate(lv, p, "把灯关了", {"name": "hass_set_state", "arguments": "{\"entity_id\": \"light.x\"}"}, "q2")
+        assert conn.func_handler.calls[-1]["name"] == "hass_set_state"
+    _name_client(sc2)
 
 
 def test_close_writes_status_ledger_without_device_identity(tmp_path):
