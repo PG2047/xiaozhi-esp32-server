@@ -1535,6 +1535,6 @@ def test_no_named_fan_out_when_the_filled_light_is_not_named():
 
 def test_no_named_fan_out_for_queries():
     """查状态的工具不展开：这里只管控制。"""
-    rec = _after_first_call("书房灯和客厅大灯开着吗", [], first={"type": "function_call", "call_id": "c0", "name": "hass_get_state",
-                                                       "arguments": json.dumps({"entity_id": "light.a1"})}, tool="hass_get_state")
+    rec = _after_first_call("书房灯和客厅大灯的亮度是多少", [], first={"type": "function_call", "call_id": "c0", "name": "hass_get_state",
+                                                            "arguments": json.dumps({"entity_id": "light.a1"})}, tool="hass_get_state")
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"] and rec["auto"] == []

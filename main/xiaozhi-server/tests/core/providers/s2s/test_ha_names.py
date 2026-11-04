@@ -289,7 +289,8 @@ def _named(said: str, entity_id: str = "light.a1", es: list | None = None, promp
 def test_named_devices_lists_the_devices_said_in_full():
     for said in ("把书房灯和客厅大灯关了", "把书房灯和客厅大灯一起关了", "把书房灯和客厅大灯都关了", "书房灯、客厅大灯关一下",
                  "关掉书房灯跟客厅大灯", "帮我打开书房灯还有客厅大灯", "把书房的灯和客厅的大灯关了吧", "把书房灯，客厅大灯，关了",
-                 "把书房灯跟那个客厅大灯关了", "能不能把书房灯和客厅大灯关了", "把书房灯和客厅大灯关了好不好"):
+                 "把书房灯跟那个客厅大灯关了", "能不能把书房灯和客厅大灯关了", "把书房灯和客厅大灯关了好不好",
+                 "可以把书房灯和客厅大灯关了吗", "能把书房灯和客厅大灯关了吗", "帮我把书房灯和客厅大灯关了好吗"):
         assert _named(said) == ["light.a1", "light.a2"], said
     assert _named("把客厅大灯和书房灯关了") == ["light.a2", "light.a1"]                       # 按说的先后
     assert _named("把书房灯、客厅大灯和卧室灯打开") == ["light.a1", "light.a2", "light.b1"]   # 三台，没说地点时不限一处
@@ -318,11 +319,12 @@ def test_named_devices_gives_up_on_different_actions():
         assert _named(said) == [], said
 
 
-def test_named_devices_gives_up_on_except_or_negative_words():
+def test_named_devices_gives_up_on_except_negative_or_question_words():
     for said in ("除了书房灯，把客厅大灯和卧室灯关了", "把书房灯和客厅大灯关了，卧室灯不用关", "不要关书房灯，把客厅大灯关了",
                  "书房灯不关，客厅大灯关了", "别关书房灯，客厅大灯关了", "留着书房灯，关客厅大灯",
                  # 动作只有一种，靠这些词才分得出来
-                 "别把书房灯和客厅大灯关了", "不要把书房灯和客厅大灯关了", "书房灯和客厅大灯不用关了", "把书房灯和客厅大灯留着"):
+                 "别把书房灯和客厅大灯关了", "不要把书房灯和客厅大灯关了", "书房灯和客厅大灯不用关了", "把书房灯和客厅大灯留着",
+                 "书房灯和客厅大灯都关了吗", "书房灯和客厅大灯关了吗"):
         assert _named(said) == [], said
 
 
