@@ -24,6 +24,7 @@ import base64
 import contextlib
 import json
 import os
+import re
 import time
 
 from websockets.asyncio.client import connect
@@ -49,6 +50,7 @@ _HA_CACHE: dict = {"t": 0.0, "entries": []}  # GetLiveContext 解析出的设备
 # 喊停那句里不算"别的话"的词：口头的"一下 / 一点 / 下来"、称呼、客气话和语气词（见 _has_more），长的在前
 _STOP_FILLERS = ("好不好", "可以吗", "一下", "一点", "下来", "好吗", "行吗", "好的", "谢谢", "那个", "先", "你", "我", "好",
                  "吧", "啊", "呀", "呢", "嗯", "哦", "噢", "喔", "唉", "诶", "欸", "哎", "嘛", "啦", "了", "吗")
+_SENTENCE_END = re.compile(r"[。！？!?….]+")   # 判断告别时切出回复的最后一句
 
 
 def _trim_silence(pcm: bytes, rate: int, rms: int = 200, pad_ms: int = 40) -> bytes:
@@ -135,8 +137,10 @@ class S2SProvider(S2SProviderBase):
         self.ha_names_wait_s = float(c.get("ha_names_wait_s", 15))   # 等工具处理器初始化完（HA MCP 连上）的上限
         self._ha_entries: list[dict] = []
         self._guard_mark = 0          # 上次委托结束时 history 的长度：地点守卫只看这之后用户说的话
+        self._ha_kinds_asked: set[str] = set()   # 这次委托问"要控制哪一类"时，那一处能开关的设备
+        self._ha_kinds_prev: set[str] = set()    # 上一次委托问的那一批（判断用户这句是不是在答）
         self._ha_asked: set[str] = set()   # 上一次委托回问时列的设备
-        self._all_asked = False            # 上一次委托问过"全部"是哪一处（见 _fan_out_all）
+        self._all_asked = False            # 上一次委托问过"全部"是哪一处、哪一类（见 _fan_out_all）
         self._named_asked = ""             # 上一次委托问过是哪一处的那句话（见 _fan_out_named）
         self.history: list[tuple[str, str]] = []
         self._session_sig = None
@@ -722,7 +726,7 @@ class S2SProvider(S2SProviderBase):
     def _check_ha_call(self, call: dict, intents: dict, utterance: str, recent: str | None = None,
                        asked: set[str] | frozenset[str] = frozenset()) -> str | None:
         """HA 意图调用执行前：domain 误填成 device_class 的挪过去（改写 call 里的参数，后面记进对话的也是改后的）；
-        用户说的地点和会命中的设备不在一处、或者没说清是哪一台时，返回交给 Live 的说明、不执行。
+        用户说的地点和会命中的设备不在一处、或者没说清是哪一台 / 哪一类时，返回交给 Live 的说明、不执行。
         utterance 是上次委托之后用户说的话，recent 是小模型手边的那几句（默认同 utterance），asked 是上一次委托回问时列的设备。"""
         name = call.get("name") or ""
         try:
@@ -740,11 +744,25 @@ class S2SProvider(S2SProviderBase):
         if blocked:
             self.logger.bind(tag=TAG).info(f"Live 地点守卫拦下 {name}：{blocked}")
             return blocked
+        # 上一次问了"哪一类"，这次的调用还落在那一批里：这句在答那个问题（"窗帘"），上一句说过"都"，下面两道"哪一台"都不问
+        switched = {e["names"][0] for e in ha_names.would_switch(name, tidy, self._ha_entries)}
+        answering = bool(self._ha_kinds_prev) and switched <= self._ha_kinds_prev
         # 没填 name、会一次控制多台、用户又没说"都 / 全部"：先问是哪一台（设备名没识别出来时小模型会退成只填区域）
-        blocked = ha_names.area_ambiguity(utterance, name, tidy, self._ha_entries)
+        blocked = None if answering else ha_names.area_ambiguity(utterance, name, tidy, self._ha_entries)
         if blocked:
             self.logger.bind(tag=TAG).info(f"Live 区域歧义拦下 {name}：{blocked}")
             return blocked
+        # 用户说了"都"，小模型却只填了区域、没填类别：那一处能开关的全算（"把甲地的灯都关了"会连窗帘一起动）。先问要控制哪一类。
+        # 问过了，这句又说了全部（"都关"），才算真要全部；答了"灯"小模型还是只填区域，接着问
+        mixed = ha_names.mixed_kinds(name, tidy, self._ha_entries)
+        if mixed and not (answering and ha_names.said_all_kinds(utterance)):
+            self._ha_kinds_asked |= switched
+            self._all_asked = True          # 答"灯"时小模型多半只填一盏，上一句说过"都"，按展开控制那一处的每一盏
+            blocked = ha_names.ask_kind(mixed, tidy)
+            self.logger.bind(tag=TAG).info(f"Live 类别歧义拦下 {name} {call.get('arguments')}：{blocked}")
+            return blocked
+        if answering:
+            return None
         # 填了 name，但用户的话分不开这台和同类的另一台：先问。只放行一种情况：还是上一次问的那一批设备，用户最后这句话里也没有
         # 这些设备的词（"第一个""靠窗那幅"，名单里没有，靠小模型手边的对话上下文，再问就没完了）。答了半截（"客厅的"）时这一批
         # 会变小，接着问剩下的；带着设备的词却还是分不开（小模型选错了，或者上次问完没答、这次又说了一遍），也要问
@@ -849,6 +867,7 @@ class S2SProvider(S2SProviderBase):
         said = [t for r, t in self.history[self._guard_mark:] if r == "user"] + ([pending] if pending else [])
         # 设备歧义看小模型手边的这几句：刚问过"甲地客厅的纱帘开着吗"，接着说"把它关了"不用再问；回问之后用户答半截也接得上
         recent = "\n".join(t for r, t in turns if r == "user")
+        self._ha_kinds_prev, self._ha_kinds_asked = self._ha_kinds_asked, set()
         asked, self._ha_asked = self._ha_asked, set()
         asked_all, self._all_asked = self._all_asked, False
         asked_named, self._named_asked = self._named_asked, ""
@@ -1005,8 +1024,14 @@ class S2SProvider(S2SProviderBase):
         if not self.close_on_goodbye or not assistant_txt:
             return False
         said = (self.last_user_text + "".join(self.in_text))
-        return (any(w in said for w in self.goodbye_words) and len(assistant_txt) <= 16
-                and any(w in assistant_txt for w in self.goodbye_words))
+        if not any(w in said for w in self.goodbye_words):
+            return False
+        # 11-04 真机：用户在模型念长回复时说拜拜，模型的告别会和长回复并成一段（"…还要查别的吗?拜拜!"）。
+        # 整段超过 16 字就只看最后一句，否则要等空闲关闭，这期间喊唤醒词会被当成普通的话
+        farewell = assistant_txt
+        if len(farewell) > 16:
+            farewell = ([s for s in _SENTENCE_END.split(farewell) if s.strip()] or [""])[-1]
+        return len(farewell) <= 16 and any(w in farewell for w in self.goodbye_words)
 
     async def _flush_input_text(self) -> None:
         txt = "".join(self.in_text).strip()
