@@ -209,7 +209,7 @@ def test_name_rivals_lists_devices_the_user_words_do_not_tell_apart():
 
 
 def test_says_all():
-    for said in ("都关了吧", "把甲地的灯全部打开", "所有的灯", "灯全关了", "全打开", "一起关了", "统统关掉", "灯全灭了"):
+    for said in ("都关了吧", "把甲地的灯全部打开", "所有的灯", "灯全关了", "全打开", "一起关了", "统统关掉", "灯全灭了", "全屋的灯"):
         assert H.says_all(said), said
     # "全"后面不是动作的不算："除甲醛"曾被转写成"出价全"
     for said in ("把灯关了", "出价全净化器关了", "", None):
@@ -221,8 +221,10 @@ _LIGHTS = ("下面是我家智能设备列表（位置，设备名，entity_id�
            "老家卧室,卧室灯,light.b1\n丙地,吊灯,light.c1\n")
 
 
-def _at_place(said: str, recent: str | None = None, entity_id: str = "light.a1", es: list | None = None) -> list[str]:
-    return H.all_at_place(_LIGHTS, said, said if recent is None else recent, entity_id, entries() if es is None else es)
+def _at_place(said: str, recent: str | None = None, entity_id: str = "light.a1", es: list | None = None, asked: bool = False) -> list[str]:
+    targets, question = H.all_at_place(_LIGHTS, said, said if recent is None else recent, entity_id, entries() if es is None else es, asked)
+    assert question is None
+    return targets
 
 
 def test_all_at_place_lists_same_kind_devices_in_the_named_place():
@@ -242,15 +244,37 @@ def test_all_at_place_takes_the_latest_sentence_with_a_place():
 
 
 def test_all_at_place_gives_up_when_unsure():
-    assert _at_place("把灯全关了") == []                                # 没有地点
     assert _at_place("都这么晚了，把甲地的书房灯关了") == []             # 点了具体设备
     assert _at_place("把甲地的灯都打开，除了台灯") == []
     # 排除的词：地点可能正是要排除的
-    for said in ("除了甲地，灯都关了", "把老家的灯都关了，甲地的不用", "甲地的灯留一盏，都关了", "别把甲地的灯都关了", "不要把甲地的灯都关了"):
+    for said in ("除了甲地，灯都关了", "把老家的灯都关了，甲地的不用", "甲地的灯留一盏，都关了", "别把甲地的灯都关了", "不要把甲地的灯都关了",
+                 "甲地的灯都不关了", "甲地的灯都算了"):
         assert _at_place(said) == [], said
     # 取不到名单（认不出地点）、设备列表为空，都不展开；表头那行不算设备
     assert _at_place("把甲地的灯全关了", es=[]) == []
-    assert H.all_at_place("你是小智", "把甲地的灯全关了", "把甲地的灯全关了", "light.a1", entries()) == []
+    assert H.all_at_place("你是小智", "把甲地的灯全关了", "把甲地的灯全关了", "light.a1", entries()) == ([], None)
+
+
+def test_all_at_place_asks_where_without_a_place():
+    targets, question = H.all_at_place(_LIGHTS, "把灯全关了", "把灯全关了", "light.a1", entries())
+    assert targets == [] and question.startswith("没有执行") and "甲地楼下1号、乙地老家" in question and "一共 4 台" in question
+    # 这类设备只在一处：不用问；名单没取到（认不出哪一处）：不问也不展开
+    assert _at_place("把喇叭都关了", entity_id="media_player.a3") == ["media_player.a3"]
+    assert _at_place("把灯全关了", es=[]) == []
+
+
+def test_all_at_place_after_asking_where():
+    def answer(said):
+        return _at_place(said, f"把灯全关了\n{said}", asked=True)
+    assert answer("甲地的") == ["light.a1", "light.a2"]
+    assert answer("甲地和老家") == ["light.a1", "light.a2", "light.b1"]
+    assert answer("都关了吧") == ["light.a1", "light.a2", "light.b1", "light.c1"]    # 全部：位置对不上区域的也算
+    for said in ("书房灯", "不用了", "都不是", "都不关"):
+        assert answer(said) == [], said
+    # 没答上来、还没听到这一句：再问一遍
+    for said, recent in (("嗯", "把灯全关了\n嗯"), ("第一个", "把灯全关了\n第一个"), ("", "把灯全关了")):
+        targets, question = H.all_at_place(_LIGHTS, said, recent, "light.a1", entries(), True)
+        assert targets == [] and question.startswith("没有执行"), said
 
 
 def test_name_rivals_lets_through_clear_words_all_words_and_other_calls():

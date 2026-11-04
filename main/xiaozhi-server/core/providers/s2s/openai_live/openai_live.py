@@ -135,6 +135,7 @@ class S2SProvider(S2SProviderBase):
         self._ha_entries: list[dict] = []
         self._guard_mark = 0          # 上次委托结束时 history 的长度：地点守卫只看这之后用户说的话
         self._ha_asked: set[str] = set()   # 上一次委托回问时列的设备
+        self._all_asked = False            # 上一次委托问过"全部"是哪一处（见 _fan_out_all）
         self.history: list[tuple[str, str]] = []
         self._session_sig = None
         self._calls: dict[str, asyncio.Task] = {}   # call_id → 执行中的工具
@@ -755,24 +756,30 @@ class S2SProvider(S2SProviderBase):
         self.logger.bind(tag=TAG).info(f"Live 设备歧义拦下 {name} {call.get('arguments')}：{blocked}")
         return blocked
 
-    def _fan_out_all(self, calls: list, said: str, recent: str) -> list:
+    def _fan_out_all(self, calls: list, said: str, recent: str, asked: bool) -> tuple[list, str | None]:
         """"把甲地的灯全关了"：强制填参只出一个 hass_set_state，结果又只有几个字，不展开就只控制到第一盏。动作用小模型填的，
         换成那一处同类设备每台一个调用（设备照设备列表，见 ha_names.all_at_place），结果交给小模型总结。不让小模型自己补：
-        11-04 模拟里它有时漏灯还说都关了（位置写法不统一的那一处），给了提示就跨房子多控，给了名单又抄错 entity_id。"""
-        if len(calls) != 1 or calls[0].get("name") != "hass_set_state" or not ha_names.says_all(said):
-            return calls
+        11-04 模拟里它有时漏灯还说都关了（位置写法不统一的那一处），给了提示就跨房子多控，给了名单又抄错 entity_id。
+        没说地点（"把灯全关了"）时第二个返回值是交给 Live 的回问，这次委托的调用都不执行。said 是用户最后一句话，asked 是上一次委托问过。"""
+        if any(c.get("name") != "hass_set_state" for c in calls) or not (asked or ha_names.says_all(said)):
+            return calls, None
         try:
             args = json.loads(calls[0].get("arguments") or "{}")
         except ValueError:
-            return calls
+            return calls, None
         if not isinstance(args, dict):
-            return calls
-        targets = ha_names.all_at_place(self.conn.prompt, said, recent, str(args.get("entity_id") or ""), self._ha_entries)
-        if not targets:
-            return calls
+            return calls, None
+        targets, question = ha_names.all_at_place(self.conn.prompt, said, recent, str(args.get("entity_id") or ""),
+                                                  self._ha_entries, asked)
+        if question:
+            self._all_asked = True
+            self.logger.bind(tag=TAG).info(f"Live 全部回问 hass_set_state：{question}")
+            return calls, question
+        if not targets or len(calls) > 1:
+            return calls, None
         self.logger.bind(tag=TAG).info(f"Live 全部展开 hass_set_state：{len(targets)} 个设备")
         return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}",
-                     arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False)) for n, e in enumerate(targets)]
+                     arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False)) for n, e in enumerate(targets)], None
 
     async def _client_delegation(self, did: str) -> None:
         """Live 把一件事委托出来（没有请求正文）：用最近几句对话拼出请求，小模型选工具、ToolRunner 执行，结果交回 Live 转述。"""
@@ -789,8 +796,9 @@ class S2SProvider(S2SProviderBase):
         # 设备歧义看小模型手边的这几句：刚问过"甲地客厅的纱帘开着吗"，接着说"把它关了"不用再问；回问之后用户答半截也接得上
         recent = "\n".join(t for r, t in turns if r == "user")
         asked, self._ha_asked = self._ha_asked, set()
+        asked_all, self._all_asked = self._all_asked, False
         intents = ha_names.device_intents(tools) if self.ha_names and self._ha_entries else {}
-        answer, used, raw = "", [], []
+        answer, used, raw, ask = "", [], [], None
         try:
             first = await self._decide_first(ctx, items, tools) if self.tool_picker == "decisions" else None
             for i in range(max(1, self.tool_rounds)):
@@ -806,12 +814,13 @@ class S2SProvider(S2SProviderBase):
                     answer = text
                     break
                 if i == 0:
-                    calls = self._fan_out_all(calls, "\n".join(said), recent)
+                    # 只看最后一句：上一次委托时还没落进 history 的那句也会算进 said，它的"全关"不是这句的意思
+                    calls, ask = self._fan_out_all(calls, said[-1] if said else "", recent, asked_all)
                 outputs = []
                 for call in calls:
                     used.append(call.get("name"))
-                    blocked = (self._check_ha_call(call, intents, "\n".join(said), recent, asked)
-                               if call.get("name") in intents else None)
+                    blocked = ask or (self._check_ha_call(call, intents, "\n".join(said), recent, asked)
+                                      if call.get("name") in intents else None)
                     result = blocked or await self.tools.run(call.get("name") or "", call.get("arguments") or "{}")
                     outputs.append(result)
                     items.append({"type": "function_call", "call_id": call.get("call_id"), "name": call.get("name"),

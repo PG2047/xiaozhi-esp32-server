@@ -1309,9 +1309,9 @@ def _light_call(entity: str, call_id: str = "c0", state: str = "turn_off", name:
             "arguments": json.dumps({"state": {"type": state}, "entity_id": entity})}
 
 
-def _after_first_call(said: str, auto_rounds: list, first: dict | list | None = None, tool: str = "hass_set_state", history: list | None = None) -> dict:
-    """用户说 said，decisions 选 tool、强制填参填 first（默认只填甲地书房灯一个）；之后小模型每次自选按 auto_rounds 依次回（多要一次会报错）。
-    返回交回 Live 的话、依次执行的调用、小模型每次自选时看到的工具结果数。名单和设备列表用虚构的甲地、老家。"""
+def _after_first_call(said: str | list[str], auto_rounds: list, first: dict | list | None = None, tool: str = "hass_set_state", history: list | None = None) -> dict:
+    """用户说 said（列表是一句一次委托），decisions 选 tool、强制填参填 first（默认只填甲地书房灯一个）；之后小模型每次自选按 auto_rounds
+    依次回（多要一次会报错）。返回最后交回 Live 的话、依次执行的调用、小模型每次自选时看到的工具结果数。名单和设备列表用虚构的甲地、老家。"""
     from tests.core.providers.s2s.test_ha_names import entries
     rec = {"auto": []}
 
@@ -1334,11 +1334,15 @@ def _after_first_call(said: str, auto_rounds: list, first: dict | list | None = 
         conn.prompt = _LIGHTS_PROMPT
         p.history += history or []
         p._guard_mark = len(p.history)
-        await lv.emit({"type": "session.input_transcript.delta", "delta": said})
-        await _real_sleep(0.05)
-        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "l1", "target": "client"}})
-        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
-        rec["commentary"] = [m for m in lv.received if m["type"] == "session.commentary.append"][0]["content"]
+        for n, s in enumerate([said] if isinstance(said, str) else said):
+            await lv.emit({"type": "session.input_transcript.delta", "delta": s})
+            await _real_sleep(0.05)
+            await lv.emit({"type": "session.delegation.created", "delegation": {"id": f"l{n}", "target": "client"}})
+            await wait_until(lambda: any(m["type"] == "session.commentary.append" and m["delegation_id"] == f"l{n}" for m in lv.received),
+                             what="commentary")
+            await p._flush_input_text()                 # 交回之后 Live 才开口：这句落在委托标记之后，下一次委托的 said 里也有它
+            p.history.append(("assistant", "好的。"))
+        rec["commentary"] = [m for m in lv.received if m["type"] == "session.commentary.append"][-1]["content"]
         rec["calls"] = [json.loads(c["arguments"]) for c in conn.func_handler.calls]
     _run_client(sc, tool_picker="decisions")
     return rec
@@ -1379,12 +1383,67 @@ def test_fan_out_takes_the_place_from_earlier_sentences_when_this_one_has_none()
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3"]
 
 
-def test_no_fan_out_without_a_place_a_named_device_or_all_words():
-    """没说地点（不替用户关掉几处房子的灯）、点了具体设备（"都"不是全部的意思）、没说"都"：还是一个调用、直接交回，不多走一轮小模型。"""
-    for said in ("把灯全关了", "都这么晚了，把甲地的书房灯关了", "把甲地的灯关了", "把甲地的书房灯亮度调到百分之五十"):
+def test_no_fan_out_with_a_named_device_or_without_all_words():
+    """点了具体设备（"都"不是全部的意思）、没说"都"：还是一个调用、直接交回，不多走一轮小模型。"""
+    for said in ("都这么晚了，把甲地的书房灯关了", "把甲地的灯关了", "把甲地的书房灯亮度调到百分之五十"):
         rec = _after_first_call(said, [])
         assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"] and rec["auto"] == [], said
         assert rec["commentary"].startswith("已调用 hass_set_state") and rec["commentary"].endswith("结果：客厅灯已打开")
+
+
+def test_all_words_without_a_place_ask_where_and_run_nothing():
+    """"把灯全关了"：不替用户控制几处房子的灯，什么都不执行，回问交给 Live，不多走一轮小模型。"""
+    rec = _after_first_call("把灯全关了", [])
+    assert rec["calls"] == [] and rec["auto"] == []
+    assert "没有执行" in rec["commentary"] and "甲地楼下1号、乙地老家" in rec["commentary"] and "问用户要控制哪一处" in rec["commentary"]
+
+
+def test_several_calls_without_a_place_are_asked_too():
+    """置信度低、小模型自己一轮出了几盏：也不执行，它看到"没有执行"后说的话交给 Live。"""
+    two = [_light_call("light.a1", "c0"), _light_call("light.b1", "c1")]
+    rec = _after_first_call("把灯全关了", [_text_reply("要关哪里的灯？")], first=two)
+    assert rec["calls"] == [] and rec["auto"] == [2] and rec["commentary"] == "要关哪里的灯？"
+
+
+def test_answer_with_a_place_after_asking_controls_that_place():
+    rec = _after_first_call(["把灯全关了", "甲地的"], [_text_reply("甲地的灯都关了。")])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3"]
+    assert rec["commentary"] == "甲地的灯都关了。"
+
+
+def test_answer_all_after_asking_controls_everything():
+    rec = _after_first_call(["把灯全关了", "都关了吧"], [_text_reply("都关了。")])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3", "light.b1"]
+
+
+def test_named_device_after_asking_controls_only_that_one():
+    """答了具体设备：上一句的"全关"不算这一句的，照小模型填的执行一个。"""
+    rec = _after_first_call(["把灯全关了", "书房灯"], [])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"]
+    assert rec["commentary"].startswith("已调用 hass_set_state") and "没有执行" not in rec["commentary"]
+
+
+def test_vague_answer_after_asking_is_asked_again_and_runs_nothing():
+    """没答上来（"嗯"）：小模型一轮出好几个调用也不执行，再问一遍；接着答了地点还能接上。"""
+    two = [_light_call("light.a1", "c0"), _light_call("light.b1", "c1")]
+    rec = _after_first_call(["把灯全关了", "嗯"], [_text_reply("要关哪里的灯？"), _text_reply("是哪里的灯？")], first=two)
+    assert rec["calls"] == [] and rec["commentary"] == "是哪里的灯？"
+    rec = _after_first_call(["把灯全关了", "第一个"], [])
+    assert rec["calls"] == [] and "没有执行" in rec["commentary"]
+    rec = _after_first_call(["把灯全关了", "第一个", "甲地的"], [_text_reply("甲地的灯都关了。")])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3"]
+
+
+def test_asking_only_counts_for_the_next_delegation():
+    """问完隔了一次别的委托，再说地点就不算答这个问题了。"""
+    rec = _after_first_call(["把灯全关了", "书房灯", "甲地的"], [])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a1"]
+
+
+def test_all_words_of_the_previous_sentence_do_not_fan_out_this_one():
+    """上一句全关了甲地，这句没说"都"：只照小模型填的执行一个。"""
+    rec = _after_first_call(["把甲地的灯全关了", "把它打开"], [_text_reply("都关了。")])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3", "light.a1"]
 
 
 def test_fan_out_only_in_the_first_round():
