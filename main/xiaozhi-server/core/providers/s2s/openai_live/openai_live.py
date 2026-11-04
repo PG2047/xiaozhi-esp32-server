@@ -45,6 +45,8 @@ TTS_RATE = 24000        # /v1/audio/speech 的 pcm 是 24 kHz 16-bit 单声道
 CONTEXT_CHUNK_CHARS = 400   # session.thinking.append 每条 content 上限 500 token，中文按 400 字切
 _GREETING_CACHE: dict[tuple, bytes] = {}   # (voice, 文本, 设备采样率) → PCM，进程内共用：只有第一次唤醒要等 TTS
 _HA_CACHE: dict = {"t": 0.0, "entries": []}  # GetLiveContext 解析出的设备表，进程内各连接共用（见 _load_ha_names）；只按一个 HA 缓存
+# 调用没走完（轮数用完、中途出错）时交给 Live 的话的开头，后面跟每个调用的结果
+UNFINISHED = "工具调用到这里停了，不会接着做，可能还有没做的。下面是已经调用的，照实告诉用户做了哪些，不要说都做完了，也不要说还在继续：\n"
 # 喊停那句里不算"别的话"的词：口头的"一下 / 一点 / 下来"、称呼、客气话和语气词（见 _has_more），长的在前
 _STOP_FILLERS = ("好不好", "可以吗", "一下", "一点", "下来", "好吗", "行吗", "好的", "谢谢", "那个", "先", "你", "我", "好",
                  "吧", "啊", "呀", "呢", "嗯", "哦", "噢", "喔", "唉", "诶", "欸", "哎", "嘛", "啦", "了", "吗")
@@ -800,7 +802,7 @@ class S2SProvider(S2SProviderBase):
         asked, self._ha_asked = self._ha_asked, set()
         asked_all, self._all_asked = self._all_asked, False
         intents = ha_names.device_intents(tools) if self.ha_names and self._ha_entries else {}
-        answer, used, raw, ask = "", [], [], None
+        answer, used, raw, ask, ran = "", [], [], None, []
         # 只看最后一句：上一次委托时还没落进 history 的那句也会算进 said，它的"全关"不是这句的意思
         last = said[-1] if said else ""
         try:
@@ -819,7 +821,7 @@ class S2SProvider(S2SProviderBase):
                 text = "".join(c.get("text", "") for o in out if o.get("type") == "message"
                                for c in (o.get("content") or []) if c.get("type") == "output_text").strip()
                 if not calls:
-                    answer = text
+                    answer = text or "\n".join(ran)
                     break
                 if i == 0:
                     calls, ask = self._fan_out_all(calls, last, recent, asked_all)
@@ -830,23 +832,25 @@ class S2SProvider(S2SProviderBase):
                                       if call.get("name") in intents else None)
                     result = blocked or await self.tools.run(call.get("name") or "", call.get("arguments") or "{}")
                     outputs.append(result)
+                    ran.append(f"已调用 {call.get('name')}（参数 {call.get('arguments') or '{}'}），结果：{result[:self.direct_max_chars]}")
                     items.append({"type": "function_call", "call_id": call.get("call_id"), "name": call.get("name"),
                                   "arguments": call.get("arguments") or "{}"})
                     items.append({"type": "function_call_output", "call_id": call.get("call_id"), "output": result})
                 if len(calls) == 1 and len(outputs[0]) <= self.direct_max_chars:
                     # 短结果直接交给 Live 转述，省一轮小模型。带上调用了什么、参数是什么：
-                    # 设音量这类工具只回"成功"，光给结果 Live 只会说"好了"（11-03 R26），带上参数它会说"调到六十了"
-                    call = calls[0]
-                    answer = f"已调用 {call.get('name')}（参数 {call.get('arguments') or '{}'}），结果：{outputs[0]}"
+                    # 设音量这类工具只回"成功"，光给结果 Live 只会说"好了"（11-03 R26），带上参数它会说"调到六十了"。
+                    # 前几轮做过的也带上，不然 Live 只知道最后这一个
+                    answer = "\n".join(ran)
                     break
                 # 长结果交给小模型总结成一两句，总结常会删掉细节（农历插件自己写着"仅在要求查询宜忌时才返回宜忌"），
                 # 用户接着问宜忌时 Live 手边没有真数据，就凭记忆编（11-03 直连 API：10 次接话 2 次编）；原文另作背景交给 Live
                 raw += [o for o in outputs if len(o) > self.direct_max_chars]
             else:
-                answer = answer or "这个我暂时没查到。"
+                # 轮数用完：走到这里每一轮都有调用，不能说"没查到"（11-04 模拟：关了三幅窗帘说"这个我暂时没查到"）
+                answer = UNFINISHED + "\n".join(ran)
         except Exception as e:  # noqa: BLE001
             self.logger.bind(tag=TAG).warning(f"Live 工具调度失败 {type(e).__name__}: {e}")
-            answer = "这个我暂时查不到，稍后再试。"
+            answer = UNFINISHED + "\n".join(ran) if ran else "这个我暂时查不到，稍后再试。"
         # 背景用 session.thinking.append：只当上下文、不要求念出来；每条 content 上限 500 token，按 400 字切，总长有上限
         context = "\n".join(raw)[:self.context_max_chars]
         for i in range(0, len(context), CONTEXT_CHUNK_CHARS):

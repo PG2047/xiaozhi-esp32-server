@@ -14,7 +14,7 @@ from websockets.asyncio.server import serve
 from tests.core.providers.s2s.test_openai_realtime import (  # noqa: F401  复用夹具（也带上 _restore_sleep 与 Opus 跳过标记）
     FakeConn, _real_sleep, _restore_sleep, pytestmark, wait_until,
 )
-from core.providers.s2s.openai_live.openai_live import S2SProvider
+from core.providers.s2s.openai_live.openai_live import S2SProvider, UNFINISHED
 
 
 class FakeLive:
@@ -778,6 +778,74 @@ def test_client_delegation_long_tool_result_raw_text_goes_to_thinking_first():
         assert "".join(m["content"] for m in sent[:3]) == raw[:850]
         assert sent[3]["content"] == "今天是农历九月廿五。"
     _run_client(sc)
+
+
+def _rounds_client(rounds: list, checks, run=None, **over):
+    """小模型按 rounds 依次回（一项是 Exception 就抛），工具结果默认算长结果（不直接交回），交回 Live 的话交给 checks。"""
+    async def sc(lv, conn, p):
+        script = list(rounds)
+
+        async def fake(items, tools):
+            r = script.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return {"output": r}
+        p._responses_call = fake
+        p.direct_max_chars = 3 if run is None else p.direct_max_chars
+        if run:
+            p.tools.run = run
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "u1", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        checks([m for m in lv.received if m["type"] == "session.commentary.append"][0]["content"])
+    _run_client(sc, **over)
+
+
+def _tool_call(n: int, name: str = "intent__HassTurnOff") -> list:
+    return [{"type": "function_call", "call_id": f"c{n}", "name": name, "arguments": json.dumps({"name": f"窗帘{n}"}, ensure_ascii=False)}]
+
+
+def test_rounds_used_up_reports_what_ran_not_nothing_found():
+    """轮数用完：不说"没查到"，每个调用都交给 Live，并说明可能没做完。"""
+    def checks(content):
+        assert "没查到" not in content and content.startswith(UNFINISHED)
+        for n in (1, 2, 3):
+            assert f"窗帘{n}" in content and "结果：客厅灯" in content
+        assert "窗帘4" not in content
+    _rounds_client([_tool_call(1), _tool_call(2), _tool_call(3)], checks)
+
+
+def test_error_after_some_calls_reports_what_ran():
+    """执行过之后小模型那一轮出错：同样照实说；一个都没执行就还是原来那句。"""
+    def checks(content):
+        assert "查不到" not in content and content.startswith(UNFINISHED) and "窗帘1" in content
+    _rounds_client([_tool_call(1), RuntimeError("HTTP 500")], checks)
+
+    def nothing(content):
+        assert content == "这个我暂时查不到，稍后再试。"
+    _rounds_client([RuntimeError("HTTP 500")], nothing)
+
+
+def test_model_says_nothing_after_calls_reports_what_ran():
+    """执行过之后小模型回了空话：把调用交给 Live，不是一句"好的"；没执行过才说"好的"。"""
+    def checks(content):
+        assert content.startswith("已调用 intent__HassTurnOff") and "窗帘1" in content
+    _rounds_client([_tool_call(1), []], checks)
+
+    def nothing(content):
+        assert content == "好的。"
+    _rounds_client([[]], nothing)
+
+
+def test_direct_answer_includes_earlier_rounds():
+    """前面的长结果调用也带上，不然 Live 只知道最后这个短结果。第一轮的结果太长只留开头。"""
+    async def run(name, args):
+        return "长" * 300 if "窗帘1" in args else "短结果"
+
+    def checks(content):
+        lines = content.split("\n")
+        assert len(lines) == 2 and "窗帘1" in lines[0] and lines[1].endswith("结果：短结果") and "窗帘2" in lines[1]
+        assert lines[0].count("长") == 200
+    _rounds_client([_tool_call(1), _tool_call(2)], checks, run=run)
 
 
 def test_client_delegation_short_tool_result_sends_no_thinking():
