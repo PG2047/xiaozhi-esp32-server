@@ -165,6 +165,63 @@ def test_area_ambiguity_lets_through_all_words_single_device_and_named_calls():
     assert H.area_ambiguity("把乙地的风扇关了", off, {"area": "没有的区域"}, es) is None                   # HA 本来就找不到
 
 
+def test_mixed_kinds_only_for_on_off_calls_without_a_kind_or_name():
+    es = entries()
+    off, on = "intent__HassTurnOff", "intent__HassTurnOn"
+    # 甲地有风扇、窗帘和传感器（传感器不算），乙地有风扇和灯；area 填别名也一样
+    assert [e["domain"] for e in H.mixed_kinds(off, {"area": "甲地1号"}, es)] == ["fan", "cover"]
+    assert [e["names"][0] for e in H.mixed_kinds(on, {"area": "乙地老家"}, es)] == ["乙地风扇", "乙地台灯"]
+    # 没填 name 的几种写法：HA 看到的都是只有区域
+    for args in ({"area": "乙地", "name": "all"}, {"area": "乙地", "name": "  "}, {"area": "乙地", "domain": None},
+                 {"area": "乙地", "device_class": []}):
+        assert len(H.mixed_kinds(off, args, es)) == 2
+    # 填了类别或名字的不管：把甲地的窗帘都关上、把灯和风扇都关了（两类是用户说的）
+    for args in ({"area": "甲地1号", "domain": ["cover"]}, {"area": "甲地1号", "device_class": ["curtain"]},
+                 {"area": "乙地", "domain": ["light", "fan"]}, {"name": "乙地风扇"}, {"area": "乙地", "name": "乙地风扇"}):
+        assert H.mixed_kinds(off, args, es) == []
+    # 只有开关意图不限 domain：SetPosition / StopMoving 碰到窗帘以外的整个失败，灯和风扇的意图只找自己那一类
+    assert H.mixed_kinds("intent__HassSetPosition", {"area": "甲地1号", "position": 0}, es) == []
+    assert H.mixed_kinds("intent__HassStopMoving", {"area": "甲地1号"}, es) == []
+    assert H.mixed_kinds("light__HassLightSet", {"area": "乙地"}, es) == []
+    assert H.mixed_kinds("fan__HassFanSetSpeed", {"area": "乙地", "percentage": 50}, es) == []
+    assert H.mixed_kinds(off, {"area": "没有的区域"}, es) == []
+
+
+def test_mixed_kinds_ignores_entities_that_cannot_be_switched():
+    """一类能开关的设备 + 没有开关服务的（档位、目标湿度、传感器）：HA 只动得了那一类，不用问。"""
+    place = ["丙地"]
+    es = [{"names": [n], "domain": d, "areas": place, "device_class": None}
+          for n, d in (("丙地灯", "light"), ("丙地档位", "select"), ("丙地目标湿度", "number"), ("丙地温度", "sensor"))]
+    assert H.mixed_kinds("intent__HassTurnOff", {"area": "丙地"}, es) == []
+    assert [e["names"][0] for e in H.would_switch("intent__HassTurnOff", {"area": "丙地"}, es)] == ["丙地灯"]
+    es.append({"names": ["丙地自定义"], "domain": "input_boolean", "areas": place, "device_class": None})   # 不认识的 domain 算能开关
+    assert [e["domain"] for e in H.mixed_kinds("intent__HassTurnOff", {"area": "丙地"}, es)] == ["light", "input_boolean"]
+
+
+def test_mixed_kinds_trusts_a_filled_device_class_even_across_domains():
+    """device_class 跨了两类（窗帘 + 插座）也是填了类别的，照用户说的。"""
+    es = [{"names": ["丙地窗帘"], "domain": "cover", "areas": ["丙地"], "device_class": "curtain"},
+          {"names": ["丙地插座"], "domain": "switch", "areas": ["丙地"], "device_class": "outlet"}]
+    assert H.mixed_kinds("intent__HassTurnOff", {"area": "丙地", "device_class": ["curtain", "outlet"]}, es) == []
+    assert len(H.mixed_kinds("intent__HassTurnOff", {"area": "丙地"}, es)) == 2
+
+
+def test_ask_kind_counts_each_kind_and_is_short_enough_to_hand_back():
+    es = _name_entries()
+    hits = H.mixed_kinds("intent__HassTurnOff", {"area": "戊地1号"}, es)
+    text = H.ask_kind(hits, {"area": "戊地1号"})
+    assert text.startswith("没有执行") and "戊地1号所有能开关的设备（窗帘 4 个、风扇或净化器 2 个、灯 1 个）" in text
+    assert "问用户要控制哪一类" in text and "全部" in text and len(text) <= 200       # 超过 200 字就不直接交回 Live 了
+    assert "家里" in H.ask_kind(hits, {})
+    assert "input_boolean 1 个" in H.ask_kind(hits + [{"domain": "input_boolean"}], {})
+
+
+def test_said_all_kinds_reads_only_the_last_sentence_and_not_a_named_kind():
+    assert H.said_all_kinds("把甲地的都关了\n都关") and H.said_all_kinds("全部") and H.said_all_kinds("把甲地的都关了\n甲地的都关")
+    assert not H.said_all_kinds("把甲地的都关了\n嗯") and not H.said_all_kinds("把甲地的都关了\n灯") and not H.said_all_kinds("")
+    assert not H.said_all_kinds("窗帘都关了") and not H.said_all_kinds("所有的灯") and not H.said_all_kinds("净化器全关")
+
+
 def _name_entries():
     """戊地四幅窗帘（卧室 / 客厅 × 布帘 / 纱帘，布帘也叫遮光窗帘、纱帘也叫薄窗帘）、一台风扇、一台净化器、一盏灯；
     己地一台同款风扇、一盏灯。别名里有 HA 拼的"设备名  实体名"。"""
