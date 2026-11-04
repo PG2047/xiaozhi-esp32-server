@@ -211,10 +211,15 @@ def place_conflict(utterance: str, tool_name: str, args: dict, entries: list[dic
             "告诉用户那里没有这台设备，或者问清是哪一台。")
 
 
-# 用户明说要控制一类设备的词。"全"只认"全都 / 全部"和后面紧跟动作的（全关、全打开）：
+# 用户明说要控制一类设备的词。"全"只认"全都 / 全部 / 全屋"和后面紧跟动作的（全关、全打开）：
 # 11-03 外放验收里"除甲醛"被转写成"出价全"，光认"全"会把这种转写错的设备名当成"全部"
-_ALL_WORDS = re.compile(r"都|全部|所有|全都|一起|统统|全(?=[关开打拉调停合])")
+_ALL_WORDS = re.compile(r"都|全部|所有|全都|全屋|一起|统统|全(?=[关开打拉调停合灭熄])")
 _NOT_ACTIONABLE = {"sensor", "binary_sensor"}
+
+
+def says_all(text: str) -> bool:
+    """用户有没有明说要控制一类设备（都 / 全部 / 所有 / 全关……）。"""
+    return bool(_ALL_WORDS.search(text or ""))
 
 
 def ask_which(hits: list[dict], where: str = "") -> str:
@@ -231,7 +236,7 @@ def area_ambiguity(utterance: str, tool_name: str, args: dict, entries: list[dic
     a = {k: v for k, v in (args or {}).items() if v is not None and not (isinstance(v, str) and not v.strip())}
     if isinstance(a.get("name"), str) and norm(a["name"]) != "all":
         return None
-    if _ALL_WORDS.search(utterance or ""):
+    if says_all(utterance):
         return None
     hits = [e for e in matched(tool_name, a, entries) if e["domain"] not in _NOT_ACTIONABLE]
     if len(hits) <= 1:
@@ -265,7 +270,7 @@ def name_rivals(utterance: str, recent: str, tool_name: str, args: dict, entries
     a = {k: v for k, v in (args or {}).items() if v is not None and not (isinstance(v, str) and not v.strip())}
     if not isinstance(a.get("name"), str) or norm(a["name"]) == "all":
         return []
-    if not (utterance or "").strip() or _ALL_WORDS.search(utterance):
+    if not (utterance or "").strip() or says_all(utterance):
         return []
     hits = matched(tool_name, a, entries)
     if len(hits) != 1 or hits[0]["domain"] not in set(domains):
@@ -274,6 +279,42 @@ def name_rivals(utterance: str, recent: str, tool_name: str, args: dict, entries
     mine = _name_parts(e)
     group = [s for s in entries if s is e or (s["domain"] == e["domain"] and not any(x in text for x in mine - _name_parts(s)))]
     return group if len(group) > 1 else []
+
+
+_EXCEPT_WORDS = re.compile(r"除|别|不|留|算了|吗")
+
+
+def all_at_place(prompt: str, said: str, recent: str, entity_id: str, entries: list[dict],
+                 asked: bool = False) -> tuple[list[str], str | None]:
+    """"把甲地的灯全关了"要控制哪些设备，返回 (设备, 交给 Live 的回问)。设备是提示词的智能设备列表（每行"位置,设备名,entity_id"）里，
+    和 entity_id 同类、位置属于用户说的地点的全部设备；地点取手边的话（recent，一行一句）里最近一句提到地点的（"都关了吧"看前一句）。
+
+    这里定了就不再问小模型，所以拿不准都返回 ([], None)，照旧只控制小模型填的那一个：用户这句话（said）点了具体设备（"都这么晚了，
+    把书房灯关了"，"都"不是全部的意思）或者有排除、否定、提问的词（"除了甲地""乙地的不用""都不关""都关了吗"）。
+
+    哪句都没有地点（"把灯全关了"）、这类设备又不止在一处：不替用户把几处房子的都控制了，先回问。asked 表示上一次委托问过：这次答了地点
+    就控制那一处，答"都关"才控制全部，没答上来（"嗯""第一个"，或者转写还没到）再问一遍。11-04 模拟：问完用户只说"嗯"，小模型一轮就把
+    三处的 10 盏灯都调了，所以这里连小模型一轮出好几个调用的也拦。"""
+    rows = [p for p in ([x.strip() for x in line.split(",")] for line in (prompt or "").splitlines())
+            if len(p) == 3 and re.fullmatch(r"\w+\.\w+", p[2])]
+    if _EXCEPT_WORDS.search(said or "") or says_device_word(said, [{"names": [p[1]]} for p in rows]):
+        return [], None
+    same = [p for p in rows if p[2].split(".")[0] == entity_id.split(".")[0]]
+    tokens = area_tokens(entries)
+
+    def located(places: Iterable[str]) -> list[str]:
+        words = {w.replace(" ", "") for a in places for w in tokens[a]}
+        return [p[2] for p in same if any(w in norm(p[0]).replace(" ", "") for w in words)]
+
+    places = next(filter(None, (mentioned_areas(t, tokens) for t in reversed((recent or "").split("\n")))), set())
+    if places:
+        return located(places), None
+    where = [a for a in tokens if located([a])]
+    if len(where) <= 1:
+        return located(where), None
+    if asked and says_all(said):
+        return [p[2] for p in same], None
+    return [], f"没有执行：用户没说是哪一处，{'、'.join(where)}都有这类设备，一共 {len(same)} 台。问用户要控制哪一处，还是全部。"
 
 
 def tidy_args(tool: dict, args: dict, entries: list[dict]) -> dict:
