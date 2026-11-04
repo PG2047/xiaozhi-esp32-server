@@ -1152,3 +1152,16 @@ def test_area_only_call_hitting_several_devices_asks_unless_user_said_all():
         await _delegate(lv, p, "把甲地的都关了", {"name": off, "arguments": "{\"area\": \"甲地楼下1号\"}"}, "a2")
         assert conn.func_handler.calls[-1]["name"] == off
     _ha_client(sc2)
+
+
+def test_close_writes_status_ledger_without_device_identity(tmp_path):
+    async def sc(lv, conn, p):
+        conn.config = dict(getattr(conn, "config", None) or {}, log={"status_dir": str(tmp_path)})
+        conn.device_name = "书房"
+        conn.device_id = "aa:bb:cc:dd:ee:ff"
+        p.stats["segments"] = 2
+    run(sc)
+    row = json.loads((tmp_path / "sessions.jsonl").read_text(encoding="utf-8"))
+    assert row["device"] == "书房" and row["model"] == "gpt-live-1"
+    assert row["stats"]["segments"] == 2 and row["duration_s"] >= 0
+    assert "aa:bb:cc:dd:ee:ff" not in json.dumps(row)

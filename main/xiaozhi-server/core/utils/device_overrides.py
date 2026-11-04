@@ -72,6 +72,8 @@ def apply_device_overrides(conn) -> dict:
         info = load_device_overrides(path, getattr(conn, "device_id", None))
         if not info:
             return applied
+        # 状态页台账用名字指代设备，不写 MAC（core/utils/status_ledger.py）；和 gate 的 /status 同一个规则
+        conn.device_name = str(info.get("name") or f"未命名设备 {str(conn.device_id)[-2:]}")
         selected = config.setdefault("selected_module", {})
 
         brain = info.get("brain")
