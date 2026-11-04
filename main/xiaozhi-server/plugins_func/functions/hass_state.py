@@ -195,7 +195,8 @@ async def handle_hass_set_state(conn: "ConnectionHandler", entity_id, state):
         action = "turn_on"
         arg = "brightness_step_pct"
         value = -10
-    elif state["type"] == "brightness_value":
+    elif state["type"] in ("brightness_value", "brightness_set"):
+        # 小模型自选工具时偶尔照着 volume_set 的样子填成 brightness_set（11-04 模拟），不认的话灯不动，它还会说调不了亮度
         description = f"亮度已调整到{state['input']}"
         action = "turn_on"
         arg = "brightness_pct"

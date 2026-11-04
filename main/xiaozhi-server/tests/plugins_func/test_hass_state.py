@@ -62,3 +62,18 @@ def test_light_off_has_no_brightness_line(fake_http):
     text = _get_state(fake_http, {"brightness": None}, state="off")
     assert text == "设备状态:off "
     assert "亮度" not in _get_state(fake_http, {"friendly_name": "书房灯"})
+
+
+def test_brightness_set_is_taken_as_brightness_value(monkeypatch):
+    sent = []
+
+    class Client(FakeAsyncClient):
+        async def post(self, url, headers=None, json=None):
+            sent.append((url.rsplit("/services/", 1)[1], json))
+            return FakeResponse({})
+
+    monkeypatch.setattr(hass_module.httpx, "AsyncClient", Client)
+    for kind in ("brightness_value", "brightness_set"):
+        text = asyncio.run(hass_module.handle_hass_set_state(FakeConn(), "light.study_lamp", {"type": kind, "input": 50}))
+        assert text == "亮度已调整到50"
+    assert sent == [("light/turn_on", {"entity_id": "light.study_lamp", "brightness_pct": 50})] * 2
