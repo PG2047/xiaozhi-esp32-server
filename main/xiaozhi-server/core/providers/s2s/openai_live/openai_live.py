@@ -785,19 +785,23 @@ class S2SProvider(S2SProviderBase):
         return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}",
                      arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False)) for n, e in enumerate(targets)], None
 
-    def _fan_out_named(self, calls: list, said: str, asked: str = "") -> tuple[list, str | None]:
+    def _fan_out_named(self, calls: list, said: str, asked: str = "") -> tuple[list, str | None, list]:
         """"把书房灯和客厅大灯关了""把书房和客厅的灯关了""书房灯和客厅大灯开着吗"：和"全关"同一个根因，强制填参只出第一盏，结果又短，不展开就只到第一盏。
         动作用小模型填的，换成用户这句话（said）点到的那几台（见 ha_names.named_devices），每台一个调用，结果交给小模型总结。点名不到两台的照旧。
-        定不了是哪一处时第二个返回值是交给 Live 的回问，这次委托的调用都不执行；asked 是上一次委托问过的那句话。"""
+        定不了是哪一处时第二个返回值是交给 Live 的回问，这次委托的调用都不执行；asked 是上一次委托问过的那句话。
+
+        "把书房灯关了，再把客厅大灯打开"每台动作不同，不能套同一个动作：不换调用，第三个返回值是这几台，不直接交回，小模型看到第一个结果会接着做下一个，
+        只能动这几台（见 _off_named）。11-04 模拟 12 句 × 6 遍：这样 70/72；每台强制填一次 64/72（后一台常填成前一台的动作）；用 tool_choice required
+        让小模型一次出全 0/72（还是只出一个）。"""
         tool = calls[0].get("name") if calls else None
         if tool not in _HASS_LIST_TOOLS:
-            return calls, None
+            return calls, None, []
         try:
             args = json.loads(calls[0].get("arguments") or "{}")
         except ValueError:
-            return calls, None
+            return calls, None, []
         if not isinstance(args, dict):
-            return calls, None
+            return calls, None, []
         targets, question, differ = ha_names.named_devices(self.conn.prompt, said, str(args.get("entity_id") or ""), self._ha_entries,
                                                            tool == "hass_get_state", asked)
         if question:
@@ -805,12 +809,31 @@ class S2SProvider(S2SProviderBase):
             own = ha_names.named_devices(self.conn.prompt, said, None, self._ha_entries, tool == "hass_get_state")[1]
             self._named_asked = said if own else asked
             self.logger.bind(tag=TAG).info(f"Live 点名回问 {tool}：{question}")
-            return calls, question
-        if not targets or differ or len(calls) > 1:     # 每台动作不同不能套同一个动作
-            return calls, None
+            return calls, question, []
+        if not targets:
+            return calls, None, []
+        if differ or len(calls) > 1:
+            self.logger.bind(tag=TAG).info(f"Live 点名 {tool} 交给小模型接着做：{len(targets)} 个设备")
+            return calls, None, targets
         self.logger.bind(tag=TAG).info(f"Live 点名展开 {tool}：{len(targets)} 个设备")
         return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}",
-                     arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False)) for n, e in enumerate(targets)], None
+                     arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False)) for n, e in enumerate(targets)], None, []
+
+    def _named_list(self, only: list[str]) -> str:
+        """这几台设备的说明，给小模型看。"""
+        where = {p[2]: f"{p[0]}的{p[1]}" for p in ha_names._device_rows(self.conn.prompt)}
+        return "、".join(f"{where.get(e, e)}（entity_id {e}）" for e in only)
+
+    def _off_named(self, call: dict, only: list[str]) -> str | None:
+        """点名几台、动作不同时小模型接着做：只能动这句话点到的几台。填到别处（另一处房子同名房间的灯）不执行，告诉它是哪几台。"""
+        if not only or call.get("name") != "hass_set_state":
+            return None
+        try:
+            args = json.loads(call.get("arguments") or "{}")
+        except ValueError:
+            return None
+        entity = args.get("entity_id") if isinstance(args, dict) else None
+        return None if entity in only else f"没有执行：用户这句话点到的设备是{self._named_list(only)}，不是 {entity}。"
 
     async def _client_delegation(self, did: str) -> None:
         """Live 把一件事委托出来（没有请求正文）：用最近几句对话拼出请求，小模型选工具、ToolRunner 执行，结果交回 Live 转述。"""
@@ -830,7 +853,7 @@ class S2SProvider(S2SProviderBase):
         asked_all, self._all_asked = self._all_asked, False
         asked_named, self._named_asked = self._named_asked, ""
         intents = ha_names.device_intents(tools) if self.ha_names and self._ha_entries else {}
-        answer, used, raw, ask = "", [], [], None
+        answer, used, raw, ask, only = "", [], [], None, []
         # 只看最后一句：上一次委托时还没落进 history 的那句也会算进 said，它的"全关"不是这句的意思
         last = said[-1] if said else ""
         try:
@@ -839,9 +862,11 @@ class S2SProvider(S2SProviderBase):
             sure = ((asked_all or ha_names.says_all(last))
                     and bool(ha_names.all_at_place(self.conn.prompt, last, recent, "light.", self._ha_entries, asked_all)[0]))
             # 点名几台的句子同样不退回小模型自选；回问之后只答地名时可能是在答查询，动作这几条先不看
-            sure = sure or any(ha_names.named_devices(self.conn.prompt, last, None, self._ha_entries, bool(asked_named), asked_named)[:2])
+            named = ha_names.named_devices(self.conn.prompt, last, None, self._ha_entries, bool(asked_named), asked_named)
+            sure = sure or any(named[:2])
             first = await self._decide_first(ctx, items, tools, sure) if self.tool_picker == "decisions" else None
-            for i in range(max(1, self.tool_rounds)):
+            # 点名几台时多给几轮：动作不同时小模型一台一轮，轮数用完会说"没查到"，其实灯已经动了
+            for i in range(max(1, self.tool_rounds) + len(named[0])):
                 if i == 0 and first:
                     calls, out = first, []
                 else:
@@ -857,18 +882,22 @@ class S2SProvider(S2SProviderBase):
                     # 刚回问过"客厅和卧室的灯是哪一处"时答"都关"：说的是那几盏，不是所有的灯
                     calls, ask = (calls, None) if asked_named else self._fan_out_all(calls, last, recent, asked_all)
                     if not ask:
-                        calls, ask = self._fan_out_named(calls, last, asked_named)
+                        calls, ask, only = self._fan_out_named(calls, last, asked_named)
                 outputs = []
                 for call in calls:
                     used.append(call.get("name"))
-                    blocked = ask or (self._check_ha_call(call, intents, "\n".join(said), recent, asked)
-                                      if call.get("name") in intents else None)
+                    blocked = ask or self._off_named(call, only) or (self._check_ha_call(call, intents, "\n".join(said), recent, asked)
+                                                                      if call.get("name") in intents else None)
                     result = blocked or await self.tools.run(call.get("name") or "", call.get("arguments") or "{}")
                     outputs.append(result)
                     items.append({"type": "function_call", "call_id": call.get("call_id"), "name": call.get("name"),
                                   "arguments": call.get("arguments") or "{}"})
                     items.append({"type": "function_call_output", "call_id": call.get("call_id"), "output": result})
-                if len(calls) == 1 and len(outputs[0]) <= self.direct_max_chars:
+                if i == 0 and only:
+                    # "客厅灯"这样的说法小模型自己填可能填到另一处，告诉它定下来的是哪几台（11-04 模拟：不说时 4 次里 3 次填错、被拦下后就不做了）
+                    items.append({"role": "user", "content": f"（这句话点到的设备是{self._named_list(only)}。"
+                                                             "还没调用的，按用户对那一台说的动作各调用一次；调用过的不要重复，别的设备不要动。）"})
+                if len(calls) == 1 and len(outputs[0]) <= self.direct_max_chars and not only:
                     # 短结果直接交给 Live 转述，省一轮小模型。带上调用了什么、参数是什么：
                     # 设音量这类工具只回"成功"，光给结果 Live 只会说"好了"（11-03 R26），带上参数它会说"调到六十了"
                     call = calls[0]

@@ -1519,9 +1519,8 @@ def test_named_lights_as_the_answer_to_which_place():
 
 
 def test_no_named_fan_out_when_unsure():
-    """动作不同、提到设备但不是都要控制、有否定的词、单盏带"都"、只说一盏不完整的：还是小模型填的那一个、直接交回，不多走一轮。"""
-    for said in ("把书房灯关了，再把客厅大灯打开", "把书房灯调到三十，客厅大灯调到五十",
-                 "书房灯太亮了，把客厅大灯关了", "书房灯太亮了，打开客厅大灯", "书房灯不关，客厅大灯关了", "都这么晚了，把书房灯关了", "把客厅灯关了"):
+    """提到设备但不是都要控制、有否定的词、单盏带"都"、只说一盏不完整的：还是小模型填的那一个、直接交回，不多走一轮。"""
+    for said in ("书房灯太亮了，把客厅大灯关了", "书房灯太亮了，打开客厅大灯", "书房灯不关，客厅大灯关了", "都这么晚了，把书房灯关了", "把客厅灯关了"):
         rec = _after_first_call(said, [])
         assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"] and rec["auto"] == [], said
         assert rec["commentary"].startswith("已调用 hass_set_state"), said
@@ -1634,3 +1633,77 @@ def test_single_query_still_goes_straight_to_live():
     rec = _after_first_call("书房灯开着吗", [], first=_get_call(), tool="hass_get_state")
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"] and rec["auto"] == []
     assert rec["commentary"].startswith("已调用 hass_get_state")
+
+
+def test_different_actions_let_the_small_model_go_on():
+    """"把书房灯关了，再把客厅大灯打开"：第一个结果不直接交回，小模型接着做下一个，最后总结；不套同一个动作。"""
+    rec = _after_first_call("把书房灯关了，再把客厅大灯打开", [[_light_call("light.a2", "c1", "turn_on")], _text_reply("书房灯关了，客厅大灯开了。")])
+    assert [(c["entity_id"], c["state"]["type"]) for c in rec["calls"]] == [("light.a1", "turn_off"), ("light.a2", "turn_on")]
+    assert rec["auto"] == [1, 2] and rec["commentary"] == "书房灯关了，客厅大灯开了。"
+
+
+def test_different_actions_tell_the_small_model_which_lights_were_settled():
+    """"客厅灯"定到了甲地：接着做之前告诉小模型是哪几台；只在这条路径说。"""
+    seen = []
+    from tests.core.providers.s2s.test_ha_names import entries
+
+    async def sc(lv, conn, p):
+        rounds = [[_light_call("light.a2", "c1", "turn_on")], _text_reply("好了。")]
+
+        async def fake_dec(ctx, tools):
+            return "hass_set_state", 0.95
+
+        async def fake_resp(items, tools, force=None):
+            if force:
+                return {"output": [_light_call("light.a1")]}
+            seen.append([it.get("content") for it in items if it.get("role") == "user"])
+            return {"output": rounds.pop(0)}
+        p._decisions_call = fake_dec
+        p._responses_call = fake_resp
+        p._tool_list = lambda: [{"type": "function", "name": "hass_set_state", "description": "设置设备状态",
+                                 "parameters": {"type": "object", "properties": {"entity_id": {"type": "string"}, "state": {"type": "object"}}}}]
+        p._ha_entries = entries()
+        conn.prompt = _HOUSES_PROMPT
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "把书房灯关了，再把客厅灯打开"})
+        await _real_sleep(0.05)
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "l0", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+    _run_client(sc, tool_picker="decisions")
+    assert "甲地客厅的客厅大灯（entity_id light.a2）" in seen[0][-1] and "甲地书房的书房灯（entity_id light.a1）" in seen[0][-1]
+    assert sum("这句话点到的设备是" in x for x in seen[1]) == 1           # 只说一次
+
+
+def test_different_actions_have_enough_rounds():
+    """三盏一盏一轮、再加总结：默认的轮数不够，不能灯动了还说"没查到"。"""
+    rec = _after_first_call("打开书房灯和客厅大灯，关掉卧室灯", [[_light_call("light.a2", "c1", "turn_on")], [_light_call("light.b1", "c2", "turn_off")],
+                                                  _text_reply("都好了。")], first=_light_call("light.a1", state="turn_on"))
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.b1"] and rec["commentary"] == "都好了。"
+
+
+def test_named_lights_when_the_model_already_gave_several_calls():
+    """小模型自己一轮出了几盏（点名的句子，动作相同）：照它填的执行，不是这句话点到的不执行。"""
+    two = [_light_call("light.a1", "c0"), _light_call("light.b1", "c1")]
+    rec = _after_first_call("把书房灯和客厅大灯关了", [[_light_call("light.a2", "c2")], _text_reply("都关了。")], first=two)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2"] and rec["auto"] == [2, 3]
+
+
+def test_different_actions_touch_only_the_named_lights():
+    """小模型接着做时填到别处的灯：不执行，告诉它是哪几台，它改过来再执行。第一盏填到别处也一样。"""
+    rec = _after_first_call("把书房灯关了，再把客厅灯打开", [[_light_call("light.b2", "c1", "turn_on")], [_light_call("light.a2", "c2", "turn_on")], _text_reply("好了。")],
+                            prompt=_HOUSES_PROMPT)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2"] and rec["auto"] == [1, 2, 3]
+    rec = _after_first_call("把客厅灯打开，再把书房灯关了", [[_light_call("light.a2", "c1", "turn_on"), _light_call("light.a1", "c2")], _text_reply("好了。")],
+                            first=_light_call("light.b2", state="turn_on"), prompt=_HOUSES_PROMPT)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a2", "light.a1"]
+    # 只读的查询不拦
+    rec = _after_first_call("把书房灯关了，再把客厅灯打开", [[_get_call("light.b2", "c1")], [_light_call("light.a2", "c2", "turn_on")], _text_reply("好了。")],
+                            prompt=_HOUSES_PROMPT)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.b2", "light.a2"]
+
+
+def test_different_actions_without_a_place_ask_and_the_answer_goes_on():
+    said = "把客厅灯关了，再把卧室灯打开"
+    rec = _after_first_call(said, [], prompt=_HOUSES_PROMPT)
+    assert rec["calls"] == [] and "没有执行" in rec["commentary"]
+    rec = _after_first_call([said, "老家"], [[_light_call("light.b1", "c1", "turn_on")], _text_reply("好了。")], first=_light_call("light.b2"), prompt=_HOUSES_PROMPT)
+    assert [(c["entity_id"], c["state"]["type"]) for c in rec["calls"]] == [("light.b2", "turn_off"), ("light.b1", "turn_on")]
