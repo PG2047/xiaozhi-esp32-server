@@ -6,7 +6,7 @@ import stat
 
 from loguru import logger
 
-from core.utils.status_ledger import USER_TEXT_PREFIXES, add_error_sink, append_session, scrub_message
+from core.utils.status_ledger import USER_TEXT_PREFIXES, add_error_sink, append_session, is_server_process, scrub_message
 
 MAC = "aa:bb:cc:dd:ee:ff"
 UUID = "11111111-2222-4333-8444-555555555555"
@@ -73,3 +73,10 @@ def test_error_sink_writes_scrubbed_warnings_only(tmp_path):
     assert "用户说" not in raw and MAC not in raw and "日程" not in raw and "堆栈" not in raw
     assert json.loads((tmp_path / "server.json").read_text())["started_at"] > 0
     assert stat.S_IMODE((tmp_path / "errors.jsonl").stat().st_mode) & 0o044 == 0o044  # 非 root 的状态页进程要读得到
+
+
+def test_only_the_server_process_counts(monkeypatch):
+    for argv0, expected in (("app.py", True), ("/opt/xiaozhi-esp32-server/app.py", True), ("-", False), ("-c", False),
+                            ("probe.py", False), ("", False)):
+        monkeypatch.setattr("sys.argv", [argv0])
+        assert is_server_process() is expected
