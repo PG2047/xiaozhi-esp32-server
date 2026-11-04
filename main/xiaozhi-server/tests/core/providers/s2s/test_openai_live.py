@@ -1298,3 +1298,108 @@ def test_probe_process_does_not_write_status_ledger(tmp_path, monkeypatch):
         conn.config = dict(getattr(conn, "config", None) or {}, log={"status_dir": str(tmp_path)})
     run(sc)
     assert not (tmp_path / "sessions.jsonl").exists()
+
+
+_LIGHTS_PROMPT = ("你是小智\n下面是我家智能设备列表（位置，设备名，entity_id），可以通过homeassistant控制\n"
+                  "甲地书房,书房灯,light.a1\n甲地客厅,客厅大灯,light.a2\n甲地1号,小台灯,light.a3\n老家卧室,卧室灯,light.b1\n")
+
+
+def _light_call(entity: str, call_id: str = "c0", state: str = "turn_off", name: str = "hass_set_state") -> dict:
+    return {"type": "function_call", "call_id": call_id, "name": name,
+            "arguments": json.dumps({"state": {"type": state}, "entity_id": entity})}
+
+
+def _after_first_call(said: str, auto_rounds: list, first: dict | list | None = None, tool: str = "hass_set_state", history: list | None = None) -> dict:
+    """用户说 said，decisions 选 tool、强制填参填 first（默认只填甲地书房灯一个）；之后小模型每次自选按 auto_rounds 依次回（多要一次会报错）。
+    返回交回 Live 的话、依次执行的调用、小模型每次自选时看到的工具结果数。名单和设备列表用虚构的甲地、老家。"""
+    from tests.core.providers.s2s.test_ha_names import entries
+    rec = {"auto": []}
+
+    async def sc(lv, conn, p):
+        rounds = list(auto_rounds)
+
+        async def fake_dec(ctx, tools):
+            return tool, 0.95
+
+        async def fake_resp(items, tools, force=None):
+            if force:
+                return {"output": first if isinstance(first, list) else [first or _light_call("light.a1")]}
+            rec["auto"].append(sum(1 for it in items if it.get("type") == "function_call_output"))
+            return {"output": rounds.pop(0)}
+        p._decisions_call = fake_dec
+        p._responses_call = fake_resp
+        p._tool_list = lambda: [{"type": "function", "name": tool, "description": "设置设备状态",
+                                 "parameters": {"type": "object", "properties": {"entity_id": {"type": "string"}, "state": {"type": "object"}}}}]
+        p._ha_entries = entries()
+        conn.prompt = _LIGHTS_PROMPT
+        p.history += history or []
+        p._guard_mark = len(p.history)
+        await lv.emit({"type": "session.input_transcript.delta", "delta": said})
+        await _real_sleep(0.05)
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "l1", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        rec["commentary"] = [m for m in lv.received if m["type"] == "session.commentary.append"][0]["content"]
+        rec["calls"] = [json.loads(c["arguments"]) for c in conn.func_handler.calls]
+    _run_client(sc, tool_picker="decisions")
+    return rec
+
+
+def _text_reply(text: str) -> list:
+    return [{"type": "message", "content": [{"type": "output_text", "text": text}]}]
+
+
+def test_all_words_with_a_place_fan_out_to_every_light_there():
+    """"把甲地的灯全关了"：强制填参只出第一盏，服务端按设备列表换成甲地的每一盏，动作照小模型填的，结果都给小模型总结。"""
+    for said in ("把甲地的灯全关了", "把甲地的灯都关了", "把甲地所有的灯关了", "把甲地的灯全部关掉"):
+        rec = _after_first_call(said, [_text_reply("甲地的灯都关了。")])
+        assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3"], said
+        assert {c["state"]["type"] for c in rec["calls"]} == {"turn_off"}
+        assert rec["auto"] == [3] and rec["commentary"] == "甲地的灯都关了。"
+
+
+def test_fan_out_keeps_the_filled_action_and_replaces_a_wrong_first_light():
+    """动作（调亮度）跟小模型填的走；小模型第一盏填到别处或者抄错 entity_id，也不执行它，只控制用户说的那一处。"""
+    first = {"type": "function_call", "call_id": "c0", "name": "hass_set_state",
+             "arguments": json.dumps({"state": {"type": "brightness_value", "input": 30}, "entity_id": "light.b1"})}
+    rec = _after_first_call("把甲地的灯都调到百分之三十", [_text_reply("调好了。")], first=first)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3"]
+    assert all(c["state"] == {"type": "brightness_value", "input": 30} for c in rec["calls"])
+
+
+def test_fan_out_with_one_light_there_goes_straight_to_live():
+    """那一处只有一盏：展开后还是一个调用，照旧直接交回。"""
+    rec = _after_first_call("把老家的灯都关了", [], first=_light_call("light.b1"))
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.b1"] and rec["auto"] == []
+    assert rec["commentary"].startswith("已调用 hass_set_state")
+
+
+def test_fan_out_takes_the_place_from_earlier_sentences_when_this_one_has_none():
+    rec = _after_first_call("都关了吧", [_text_reply("都关了。")],
+                            history=[("user", "甲地有哪些灯"), ("assistant", "书房灯、客厅大灯和小台灯。")])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3"]
+
+
+def test_no_fan_out_without_a_place_a_named_device_or_all_words():
+    """没说地点（不替用户关掉几处房子的灯）、点了具体设备（"都"不是全部的意思）、没说"都"：还是一个调用、直接交回，不多走一轮小模型。"""
+    for said in ("把灯全关了", "都这么晚了，把甲地的书房灯关了", "把甲地的灯关了", "把甲地的书房灯亮度调到百分之五十"):
+        rec = _after_first_call(said, [])
+        assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"] and rec["auto"] == [], said
+        assert rec["commentary"].startswith("已调用 hass_set_state") and rec["commentary"].endswith("结果：客厅灯已打开")
+
+
+def test_fan_out_only_in_the_first_round():
+    """总结那一轮小模型又调了一次：照它填的执行，不再展开一遍。"""
+    rec = _after_first_call("把甲地的灯都关了", [[_light_call("light.a2", "c9")]])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3", "light.a2"] and rec["auto"] == [3]
+
+
+def test_no_fan_out_when_the_model_already_gave_several_calls():
+    """小模型一轮出了几个调用：是它自己挑的，照它填的执行。"""
+    rec = _after_first_call("把甲地的灯都关了", [_text_reply("关了。")], first=[_light_call("light.a1", "c0"), _light_call("light.a2", "c1")])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2"] and rec["auto"] == [2]
+
+
+def test_no_fan_out_for_other_tools():
+    """别的工具（同样是短结果）照旧：说了"都"也是一个调用、直接交回。"""
+    rec = _after_first_call("甲地都几点了", [], first=_light_call("light.a1", name="llm__GetDateTime"), tool="llm__GetDateTime")
+    assert len(rec["calls"]) == 1 and rec["auto"] == [] and rec["commentary"].startswith("已调用 llm__GetDateTime")

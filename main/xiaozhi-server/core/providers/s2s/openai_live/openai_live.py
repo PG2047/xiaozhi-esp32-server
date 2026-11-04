@@ -755,6 +755,25 @@ class S2SProvider(S2SProviderBase):
         self.logger.bind(tag=TAG).info(f"Live 设备歧义拦下 {name} {call.get('arguments')}：{blocked}")
         return blocked
 
+    def _fan_out_all(self, calls: list, said: str, recent: str) -> list:
+        """"把甲地的灯全关了"：强制填参只出一个 hass_set_state，结果又只有几个字，不展开就只控制到第一盏。动作用小模型填的，
+        换成那一处同类设备每台一个调用（设备照设备列表，见 ha_names.all_at_place），结果交给小模型总结。不让小模型自己补：
+        11-04 模拟里它有时漏灯还说都关了（位置写法不统一的那一处），给了提示就跨房子多控，给了名单又抄错 entity_id。"""
+        if len(calls) != 1 or calls[0].get("name") != "hass_set_state" or not ha_names.says_all(said):
+            return calls
+        try:
+            args = json.loads(calls[0].get("arguments") or "{}")
+        except ValueError:
+            return calls
+        if not isinstance(args, dict):
+            return calls
+        targets = ha_names.all_at_place(self.conn.prompt, said, recent, str(args.get("entity_id") or ""), self._ha_entries)
+        if not targets:
+            return calls
+        self.logger.bind(tag=TAG).info(f"Live 全部展开 hass_set_state：{len(targets)} 个设备")
+        return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}",
+                     arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False)) for n, e in enumerate(targets)]
+
     async def _client_delegation(self, did: str) -> None:
         """Live 把一件事委托出来（没有请求正文）：用最近几句对话拼出请求，小模型选工具、ToolRunner 执行，结果交回 Live 转述。"""
         t0 = time.time()
@@ -786,6 +805,8 @@ class S2SProvider(S2SProviderBase):
                 if not calls:
                     answer = text
                     break
+                if i == 0:
+                    calls = self._fan_out_all(calls, "\n".join(said), recent)
                 outputs = []
                 for call in calls:
                     used.append(call.get("name"))

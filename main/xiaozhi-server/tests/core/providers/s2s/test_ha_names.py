@@ -208,6 +208,51 @@ def test_name_rivals_lists_devices_the_user_words_do_not_tell_apart():
     assert H.name_rivals("把空气净化器关了", "把空气净化器关了", "intent__HassTurnOff", {"name": "甲净化器"}, two) == two
 
 
+def test_says_all():
+    for said in ("都关了吧", "把甲地的灯全部打开", "所有的灯", "灯全关了", "全打开", "一起关了", "统统关掉", "灯全灭了"):
+        assert H.says_all(said), said
+    # "全"后面不是动作的不算："除甲醛"曾被转写成"出价全"
+    for said in ("把灯关了", "出价全净化器关了", "", None):
+        assert not H.says_all(said), said
+
+
+_LIGHTS = ("下面是我家智能设备列表（位置，设备名，entity_id），可以通过homeassistant控制\n"
+           "甲地书房,书房灯,light.a1\n甲地1号,小台灯,light.a2\n甲地1号,音箱,media_player.a3\n"
+           "老家卧室,卧室灯,light.b1\n丙地,吊灯,light.c1\n")
+
+
+def _at_place(said: str, recent: str | None = None, entity_id: str = "light.a1", es: list | None = None) -> list[str]:
+    return H.all_at_place(_LIGHTS, said, said if recent is None else recent, entity_id, entries() if es is None else es)
+
+
+def test_all_at_place_lists_same_kind_devices_in_the_named_place():
+    # 位置写法不统一也算（"甲地书房""甲地1号"）；只要同类（音箱不算）；别处不算；第一盏填错也不影响
+    assert _at_place("把甲地的灯全关了", entity_id="light.b1") == ["light.a1", "light.a2"]
+    assert _at_place("把甲地的喇叭都关了", entity_id="media_player.a3") == ["media_player.a3"]
+    # 区域的别名、两处地点
+    assert _at_place("把老家的灯都关了") == ["light.b1"]
+    assert _at_place("把甲地和老家的灯都关了") == ["light.a1", "light.a2", "light.b1"]
+
+
+def test_all_at_place_takes_the_latest_sentence_with_a_place():
+    assert _at_place("都关了吧", "甲地有哪些灯\n都关了吧") == ["light.a1", "light.a2"]
+    # 这句说了地点：前几句提过别处也不算；这句没说，取最近提到的那一处
+    assert _at_place("把老家的灯都打开", "甲地有哪些灯\n把老家的灯都打开") == ["light.b1"]
+    assert _at_place("都关了吧", "甲地有哪些灯\n老家呢\n都关了吧") == ["light.b1"]
+
+
+def test_all_at_place_gives_up_when_unsure():
+    assert _at_place("把灯全关了") == []                                # 没有地点
+    assert _at_place("都这么晚了，把甲地的书房灯关了") == []             # 点了具体设备
+    assert _at_place("把甲地的灯都打开，除了台灯") == []
+    # 排除的词：地点可能正是要排除的
+    for said in ("除了甲地，灯都关了", "把老家的灯都关了，甲地的不用", "甲地的灯留一盏，都关了", "别把甲地的灯都关了", "不要把甲地的灯都关了"):
+        assert _at_place(said) == [], said
+    # 取不到名单（认不出地点）、设备列表为空，都不展开；表头那行不算设备
+    assert _at_place("把甲地的灯全关了", es=[]) == []
+    assert H.all_at_place("你是小智", "把甲地的灯全关了", "把甲地的灯全关了", "light.a1", entries()) == []
+
+
 def test_name_rivals_lets_through_clear_words_all_words_and_other_calls():
     for said, name in (("把戊地卧室的遮光窗帘拉上", "戊地1号卧室布帘"), ("把客厅纱帘关上", "戊地1号客厅纱帘"),
                        ("打开大净化器", "大净化器"), ("打开戊地的甲牌风扇", "戊地甲牌风扇"), ("打开己地的风扇", "己地甲牌净化风扇"),
