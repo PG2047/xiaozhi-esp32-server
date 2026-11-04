@@ -24,6 +24,7 @@ import base64
 import contextlib
 import json
 import os
+import re
 import time
 
 from websockets.asyncio.client import connect
@@ -48,6 +49,7 @@ _HA_CACHE: dict = {"t": 0.0, "entries": []}  # GetLiveContext 解析出的设备
 # 喊停那句里不算"别的话"的词：口头的"一下 / 一点 / 下来"、称呼、客气话和语气词（见 _has_more），长的在前
 _STOP_FILLERS = ("好不好", "可以吗", "一下", "一点", "下来", "好吗", "行吗", "好的", "谢谢", "那个", "先", "你", "我", "好",
                  "吧", "啊", "呀", "呢", "嗯", "哦", "噢", "喔", "唉", "诶", "欸", "哎", "嘛", "啦", "了", "吗")
+_SENTENCE_END = re.compile(r"[。！？!?….]+")   # 判断告别时切出回复的最后一句
 
 
 def _trim_silence(pcm: bytes, rate: int, rms: int = 200, pad_ms: int = 40) -> bytes:
@@ -904,8 +906,14 @@ class S2SProvider(S2SProviderBase):
         if not self.close_on_goodbye or not assistant_txt:
             return False
         said = (self.last_user_text + "".join(self.in_text))
-        return (any(w in said for w in self.goodbye_words) and len(assistant_txt) <= 16
-                and any(w in assistant_txt for w in self.goodbye_words))
+        if not any(w in said for w in self.goodbye_words):
+            return False
+        # 11-04 真机：用户在模型念长回复时说拜拜，模型的告别会和长回复并成一段（"…还要查别的吗?拜拜!"）。
+        # 整段超过 16 字就只看最后一句，否则要等空闲关闭，这期间喊唤醒词会被当成普通的话
+        farewell = assistant_txt
+        if len(farewell) > 16:
+            farewell = ([s for s in _SENTENCE_END.split(farewell) if s.strip()] or [""])[-1]
+        return len(farewell) <= 16 and any(w in farewell for w in self.goodbye_words)
 
     async def _flush_input_text(self) -> None:
         txt = "".join(self.in_text).strip()
