@@ -414,3 +414,10 @@ def all_named(said: str, recent: str, tool_name: str, entries: list[dict], domai
         return []
     names = [next((n for n in _names(e) if matched(tool_name, {"name": n}, entries) == [e]), None) for e in hits]
     return [] if None in names else names
+
+
+def names_listed_device(said: str, entries: list[dict], domains: Iterable[str] = DEFAULT_DOMAINS) -> bool:
+    """用户这句话点了名单里（智能设备列表以外）的设备：地点词和灯的名字里也有的词不算（"窗帘"算，"卧室"不算）。"""
+    text = _without_places(said, area_tokens(entries))
+    lights = set().union(*(_name_parts(e) for e in entries if e["domain"] == "light"))
+    return any(w in text for e in entries if e["domain"] in set(domains) for w in _name_parts(e) - lights)

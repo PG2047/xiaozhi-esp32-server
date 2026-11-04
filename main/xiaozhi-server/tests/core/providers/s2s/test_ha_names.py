@@ -391,3 +391,17 @@ def test_sounds_like_command():
         assert H.sounds_like_command(said), said
     for said in ("戊地的灯都坏了", "戊地的灯都好久没开了", "戊地的灯都是新换的", "戊地那边的灯都亮着呢", "戊地的窗帘都关着呢", ""):
         assert not H.sounds_like_command(said), said
+
+
+def test_names_listed_device_ignores_places_and_words_lights_have_too():
+    for said in ("把戊地的窗帘都关上，灯打开", "把窗帘和灯都关了", "把戊地的净化风扇都关了"):
+        assert H.names_listed_device(said, _name_entries()), said
+    for said in ("把戊地的灯全关了", "都关了吧", "把书房灯关了", "把灯全部调到百分之三十"):
+        assert not H.names_listed_device(said, _name_entries()), said
+    assert not H.names_listed_device("把戊地的窗帘都关上", [])
+    es = [{"names": ["卧室灯"], "domain": "light", "areas": [], "device_class": None},
+          {"names": ["卧室窗帘"], "domain": "cover", "areas": [], "device_class": "curtain"}]
+    assert not H.names_listed_device("把卧室的灯都关了", es) and H.names_listed_device("把窗帘都关了", es)
+    # 名单里不收的（传感器）不算
+    es.append({"names": ["窗台温度"], "domain": "sensor", "areas": [], "device_class": "temperature"})
+    assert not H.names_listed_device("窗台温度都多少了", es)

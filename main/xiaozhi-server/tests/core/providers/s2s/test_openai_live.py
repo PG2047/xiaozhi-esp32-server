@@ -1526,6 +1526,13 @@ def test_low_confidence_set_state_is_trusted_only_when_it_will_fan_out():
     # 选的是别的工具：置信度低还是退回小模型
     rec = _after_first_call("把甲地的灯全关了", [_text_reply("没听清。")], tool="intent__HassTurnOff", conf=0.4)
     assert rec["calls"] == [] and rec["auto"] == [0] and rec["commentary"] == "没听清。"
+    # 陈述句：选了 hass_set_state 也退回小模型，不动灯
+    for said in ("甲地的灯都坏了", "甲地的灯都好久没开了"):
+        rec = _after_first_call(said, [_text_reply("怎么了？")], conf=0.3)
+        assert rec["calls"] == [] and rec["auto"] == [0] and rec["commentary"] == "怎么了？", said
+    # 说的是名单里的设备（纱帘）：选了 hass_set_state 也退回小模型，不把灯带上
+    rec = _after_first_call("把甲地的灯和纱帘都关了", [_text_reply("没听清。")], conf=0.4)
+    assert rec["calls"] == [] and rec["auto"] == [0] and rec["commentary"] == "没听清。"
 
 
 def test_short_answer_with_low_confidence_after_asking_still_fans_out():

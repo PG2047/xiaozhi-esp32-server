@@ -833,9 +833,12 @@ class S2SProvider(S2SProviderBase):
         last = said[-1] if said else ""
         try:
             # 会展开成一处的灯的句子，decisions 选了 hass_set_state 就信它：展开只用小模型填的动作。置信度常不到 0.6（只答"乙地"时 0.33～0.41），
-            # 退回小模型自选会只填区域，HA 按区域控制的不只是灯（11-04 模拟："把乙地的灯全打开"填成 HassTurnOn {area}）
-            sure = ((asked_all or ha_names.says_all(last))
-                    and bool(ha_names.all_at_place(self.conn.prompt, last, recent, "light.", self._ha_entries, asked_all)[0]))
+            # 退回小模型自选会只填区域，HA 按区域控制的不只是灯（11-04 模拟："把乙地的灯全打开"填成 HassTurnOn {area}）。
+            # 陈述句不算（"乙地的灯都坏了"低置信度选了 hass_set_state，信了就把那一处的灯都关了）；说的是窗帘这类设备也不算
+            # （"把乙地的窗帘都关上，灯打开"强制填参把窗帘名字填进 entity_id）
+            sure = ((asked_all or (ha_names.says_all(last) and ha_names.sounds_like_command(last)))
+                    and bool(ha_names.all_at_place(self.conn.prompt, last, recent, "light.", self._ha_entries, asked_all)[0])
+                    and not ha_names.names_listed_device(last, self._ha_entries, self.ha_names_domains))
             first = await self._decide_first(ctx, items, tools, sure) if self.tool_picker == "decisions" else None
             for i in range(max(1, self.tool_rounds)):
                 if i == 0 and first:
