@@ -9,7 +9,8 @@ HA 的意图工具（MCP 里叫"平台__Hass意图"，如 intent__HassTurnOn、f
 小模型照抄名字（同一批句子 51/52）。名单的副作用：HA 里有不带地名的别名时，用户说的地方没有这台设备，模型会照抄别处设备的
 别名（"把乙地的X关了"关掉甲地的 X）。规则又不让把地点拆到 area，HA 自己的区域过滤也就不起作用了，所以执行前过一道地点守卫：
 用户最后一句话提到的区域和这次调用会命中的设备不在一处，就不执行。再加一道区域歧义检查：没填 name、会一次控制多台，
-用户又没说"都 / 全部"，也不执行、回问是哪一台（设备名没识别出来时小模型会退成只填区域）。
+用户又没说"都 / 全部"，也不执行、回问是哪一台（设备名没识别出来时小模型会退成只填区域）。设备歧义检查管另一半：
+填了 name，但用户的话分不开这台和同类的另一台（"把甲地的窗帘关上"，小模型替用户挑了卧室那幅），同样不执行、回问。
 
 名字、区域都来自 HA，这里不写任何地名。只读：只调 GetLiveContext。
 """
@@ -30,6 +31,11 @@ AMBIGUOUS = "用户没说是哪一台、上面不止一台对得上时，不要�
 
 def norm(s: Any) -> str:
     return str(s or "").strip().casefold()
+
+
+def _names(e: dict) -> list[str]:
+    """跳过 HA 拼出来的"设备名  实体名"（中间两个空格）。"""
+    return [n for n in e["names"] if "  " not in n] or e["names"]
 
 
 def _split(v: Any) -> list[str]:
@@ -134,7 +140,7 @@ def dispatch_text(tools: Iterable[dict], entries: list[dict], domains: Iterable[
     for e in entries or []:
         if e["domain"] not in domains:
             continue
-        names = [n for n in e["names"] if "  " not in n] or e["names"]   # 跳过 HA 拼出来的"设备名  实体名"（中间两个空格）
+        names = _names(e)
         rows.append(" / ".join([names[0]] + sorted(names[1:], key=len)[:aliases]))
     if rows:
         parts.append(LIST_HEAD)
@@ -211,6 +217,12 @@ _ALL_WORDS = re.compile(r"都|全部|所有|全都|一起|统统|全(?=[关开�
 _NOT_ACTIONABLE = {"sensor", "binary_sensor"}
 
 
+def ask_which(hits: list[dict], where: str = "") -> str:
+    """交给 Live 的说明：没有执行，问用户是哪一台。"""
+    names = "、".join(e["names"][0] for e in hits[:4]) + ("等" if len(hits) > 4 else "")
+    return f"没有执行：用户没说是哪一台，{where}有 {len(hits)} 台对得上（{names}）。问用户要控制哪一台。"
+
+
 def area_ambiguity(utterance: str, tool_name: str, args: dict, entries: list[dict]) -> str | None:
     """没填 name（只填区域 / 类别）的控制调用：用户没说"都 / 全部 / 所有 / 全…"、会命中的可控设备又不止一台时，
     返回交给 Live 的说明（不执行，回问是哪一台）；只有一台、用户明说了要全部、或者填了 name，都放行。
@@ -224,9 +236,44 @@ def area_ambiguity(utterance: str, tool_name: str, args: dict, entries: list[dic
     hits = [e for e in matched(tool_name, a, entries) if e["domain"] not in _NOT_ACTIONABLE]
     if len(hits) <= 1:
         return None
-    names = "、".join(e["names"][0] for e in hits[:4]) + ("等" if len(hits) > 4 else "")
-    where = f"{a['area']}" if isinstance(a.get("area"), str) else "家里"
-    return f"没有执行：用户没说是哪一台，{where}有 {len(hits)} 台对得上（{names}）。问用户要控制哪一台。"
+    return ask_which(hits, f"{a['area']}" if isinstance(a.get("area"), str) else "家里")
+
+
+def _name_parts(e: dict) -> set[str]:
+    """设备各个名字里长度 ≥ 2 的连续片段（转小写、去空格）。纯数字不要：别名里的门牌号（"108"）会撞上"调到100"。"""
+    parts: set[str] = set()
+    for n in _names(e):
+        t = norm(n).replace(" ", "")
+        parts |= {t[i:j] for i in range(len(t)) for j in range(i + 2, len(t) + 1)}
+    return {x for x in parts if not x.isdigit()}
+
+
+def says_device_word(text: str, devices: Iterable[dict]) -> bool:
+    """这句话里有没有这些设备名字的片段。"""
+    t = norm(text).replace(" ", "")
+    return any(x in t for e in devices for x in _name_parts(e))
+
+
+def name_rivals(utterance: str, recent: str, tool_name: str, args: dict, entries: list[dict],
+                domains: Iterable[str] = DEFAULT_DOMAINS) -> list[dict]:
+    """填了 name、只命中一台的控制调用：用户说没说清是这一台。对同 domain 的每一台别的设备，用户最近的话（recent）里
+    要有一个词只在这一台的名字里、不在那一台的名字里，才算分开了。地名不用单独处理：同一处的设备都带它，分不开；
+    别处的设备不带，用户说了就分开了。全都分开返回 []；否则返回这一台和分不开的那几台（按名单顺序）。
+
+    只判名单里的 domain（灯走 hass_set_state，不归这里管）；用户说了"都 / 全部"、这一轮一句都还没听到（utterance 为空）、
+    HA 本来就找不到或有重名，都放行。11-03 空跑："把甲地的窗帘关上"小模型每次都替用户挑一幅，规则里写了不要挑也没用。"""
+    a = {k: v for k, v in (args or {}).items() if v is not None and not (isinstance(v, str) and not v.strip())}
+    if not isinstance(a.get("name"), str) or norm(a["name"]) == "all":
+        return []
+    if not (utterance or "").strip() or _ALL_WORDS.search(utterance):
+        return []
+    hits = matched(tool_name, a, entries)
+    if len(hits) != 1 or hits[0]["domain"] not in set(domains):
+        return []
+    e, text = hits[0], norm(recent).replace(" ", "")
+    mine = _name_parts(e)
+    group = [s for s in entries if s is e or (s["domain"] == e["domain"] and not any(x in text for x in mine - _name_parts(s)))]
+    return group if len(group) > 1 else []
 
 
 def tidy_args(tool: dict, args: dict, entries: list[dict]) -> dict:
