@@ -679,3 +679,12 @@ def get_system_error_response(config: dict) -> str:
         str: 系统错误时的回复
     """
     return config.get("system_error_response", "主人，小智现在有点忙，我们稍后再试吧。")
+
+
+# client-id 是设备的静态凭据，device-id 是设备 MAC，都不进日志
+_HEADERS_HIDDEN_IN_LOG = {"client-id", "device-id", "authorization"}
+
+
+def headers_for_log(headers) -> dict:
+    """返回只用于写日志的请求头副本：去掉设备身份和凭据，其他字段照旧；传入的对象不动，后面还要靠它取 device-id / client-id。"""
+    return {k: v for k, v in dict(headers).items() if k.lower() not in _HEADERS_HIDDEN_IN_LOG}

@@ -19,6 +19,7 @@ from core.utils.util import (
     check_vad_update,
     check_asr_update,
     filter_sensitive_info,
+    headers_for_log,
 )
 from typing import Dict, Any
 from collections import deque
@@ -219,7 +220,7 @@ class ConnectionHandler:
             else:
                 self.client_ip = ws.remote_address[0]
             self.logger.bind(tag=TAG).info(
-                f"{self.client_ip} conn - Headers: {self.headers}"
+                f"{self.client_ip} conn - Headers: {headers_for_log(self.headers)}"
             )
 
             self.device_id = self.headers.get("device-id", None)
