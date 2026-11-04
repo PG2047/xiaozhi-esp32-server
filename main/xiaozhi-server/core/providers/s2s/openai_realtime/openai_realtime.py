@@ -283,6 +283,7 @@ class S2SProvider(S2SProviderBase):
                     f"滞后记忆 {self.lag_prior_ms} ms 本段估了 {self.gate.stats['lag_est']} 次都没确认，清掉，"
                     f"下一段回到配置先验 {int(self.config.get('gate_lag_prior_ms', 200))} ms")
         self.logger.bind(tag=TAG).info(f"Realtime 会话结束: {self.stats}")
+        self.record_session(self.model, self.stats)
 
     # ---------- 设备 → 模型 ----------
     async def on_pcm(self, pcm16k: bytes) -> None:

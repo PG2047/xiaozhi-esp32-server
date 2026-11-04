@@ -54,6 +54,8 @@ log:
   log_file: "server.log"
   # 设置数据文件路径
   data_dir: data
+  # 状态页台账目录（core/utils/status_ledger.py）：会话统计和遮掉敏感内容的告警。不配就不写
+  # status_dir: data/status
 
 # 使用完声音文件后删除文件(Delete the sound file when you are done using it)
 delete_audio: true

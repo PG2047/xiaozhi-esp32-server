@@ -604,3 +604,19 @@ def test_attach_succeeds_and_upstream_close_closes_connection():
         await rt.ws.close()                                          # 上游断开
         await wait_until(lambda: conn.closed, what="连接被关闭")
     run_scenario(sc)
+
+
+def test_close_writes_status_ledger(tmp_path):
+    async def sc(rt, conn, url):
+        conn.config["log"] = {"status_dir": str(tmp_path)}
+        conn.device_name = "微雪"
+        p = S2SProvider({"api_key": "k", "url": url, "type": "openai_realtime", "model_name": "gpt-realtime-2.1",
+                         "idle_close_s": 0}, conn)
+        conn.s2s = p
+        await p.open()
+        p.stats["turns"] = 4
+        await p.close()
+    run_scenario(sc)
+    row = json.loads((tmp_path / "sessions.jsonl").read_text(encoding="utf-8"))
+    assert row["device"] == "微雪" and row["brain"] == "openai_realtime" and row["model"] == "gpt-realtime-2.1"
+    assert row["stats"]["turns"] == 4 and row["duration_s"] >= 0

@@ -92,3 +92,17 @@ def test_no_change_cases(tmp_path):
     assert load_device_overrides(str(p), "aa:bb:cc:dd:ee:01") is None
     p.write_text("devices: [1, 2]\n", encoding="utf-8")
     assert load_device_overrides(str(p), "aa:bb:cc:dd:ee:01") is None
+
+
+def test_device_name_comes_from_registry(tmp_path):
+    p = tmp_path / "devices.yaml"
+    p.write_text(REG + '  "aa:bb:cc:dd:ee:09": {brain: cascade}\n', encoding="utf-8")
+    named = Conn("aa:bb:cc:dd:ee:01", str(p))
+    apply_device_overrides(named)
+    assert named.device_name == "s3"
+    unnamed = Conn("aa:bb:cc:dd:ee:09", str(p))
+    apply_device_overrides(unnamed)
+    assert unnamed.device_name == "未命名设备 09"
+    unknown = Conn("aa:bb:cc:dd:ee:99", str(p))
+    apply_device_overrides(unknown)
+    assert not hasattr(unknown, "device_name")

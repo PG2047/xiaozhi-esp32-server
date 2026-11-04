@@ -354,6 +354,7 @@ class S2SProvider(S2SProviderBase):
         if self.speech_gate is not None:
             self.stats["speech_gate"] = self.speech_gate.stats
         self.logger.bind(tag=TAG).info(f"Live 会话结束: {self.stats}")
+        self.record_session(self.model, self.stats)
 
     # ---------- 设备 → 模型 ----------
     async def on_pcm(self, pcm16k: bytes) -> None:
