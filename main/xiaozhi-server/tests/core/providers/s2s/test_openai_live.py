@@ -612,6 +612,46 @@ def test_goodbye_word_inside_a_question_does_not_close():
     run(sc)
 
 
+def _closes_when_user_speaks_during_reply(user, reply):
+    """模型念着这段回复时用户说话，这段播完后会话是否结束（先后顺序和真机一样）。"""
+    result = {}
+
+    async def sc(lv, conn, p):
+        await lv.emit({"type": "session.output_transcript.delta", "delta": reply})
+        await lv.audio(6, 2000)
+        await lv.emit({"type": "session.input_transcript.delta", "delta": user})
+        await _real_sleep(0.05)
+        await lv.audio(5, 0)
+        await wait_until(lambda: conn.closed or ("tts", "stop") in conn.websocket.states(), timeout=8, what="这段播完")
+        await _real_sleep(0.2)
+        result["closed"] = conn.close_after_chat
+    run(sc)
+    return result["closed"]
+
+
+@pytest.mark.parametrize("user,reply", [    # 11-04 真机和外放日志的原句：模型的告别和前面的长回复并成了一段
+    ("拜拜", "今天宜祭祀、出行、结婚、宴会、求医,忌修置产室、开渠、穿井、破屋坏垣这些。你想知道今天适合做什么,还是需要避开什么呢?拜拜!"),
+    ("拜拜", "好,我看下宜忌。今天宜祭祀、出行、结婚嫁娶这些,忌修置产室和开渠。你需要我帮你查今天...好嘞,拜拜!"),
+    ("再见", "宜祭祀、出行、结婚、宴会等,忌修置产室、开渠、破屋坏垣。还要我说说其它细节吗?嗯,回头见!"),
+])
+def test_goodbye_merged_into_a_long_reply_closes(user, reply):
+    assert _closes_when_user_speaks_during_reply(user, reply)
+
+
+@pytest.mark.parametrize("user,reply", [
+    ("嗯", "故事讲到这里就结束了,他们挥挥手各自回家。大家一起说,再见!"),     # 用户没告别
+    ("拜拜", "拜拜是告别的话,和再见差不多。今天农历九月廿六,还想知道别的吗?"),     # 最后一句里没有告别词
+    ("拜拜", "今天农历九月廿六,宜祭祀、出行。从前的人分开的时候都会说再见然后挥手走很远很远的路"),     # 最后一句太长，只是提到
+    ("拜拜", "今天宜祭祀、出行、结婚、宴会、嫁娶、求医疗病。忌修置产室、开渠、穿井、破屋坏垣、苫盖等。"),     # 回复里没有告别词，等空闲关闭
+])
+def test_long_reply_without_a_goodbye_at_the_end_stays_open(user, reply):
+    assert not _closes_when_user_speaks_during_reply(user, reply)
+
+
+def test_short_reply_is_judged_as_a_whole():
+    assert _closes_when_user_speaks_during_reply("拜拜", "拜拜!祝你今天愉快。")
+
+
 def test_early_audio_buffered_then_drained_in_order_only_for_willing_provider():
     from core.utils.s2s import drain_early_audio, s2s_buffer_early_audio
 
