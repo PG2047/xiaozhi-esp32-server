@@ -284,6 +284,12 @@ def name_rivals(utterance: str, recent: str, tool_name: str, args: dict, entries
 _EXCEPT_WORDS = re.compile(r"除|别|不|留|算了")
 
 
+def _device_rows(prompt: str) -> list[list[str]]:
+    """提示词里智能设备列表的行：[位置, 设备名, entity_id]。"""
+    return [p for p in ([x.strip() for x in line.split(",")] for line in (prompt or "").splitlines())
+            if len(p) == 3 and re.fullmatch(r"\w+\.\w+", p[2])]
+
+
 def all_at_place(prompt: str, said: str, recent: str, entity_id: str, entries: list[dict],
                  asked: bool = False) -> tuple[list[str], str | None]:
     """"把甲地的灯全关了"要控制哪些设备，返回 (设备, 交给 Live 的回问)。设备是提示词的智能设备列表（每行"位置,设备名,entity_id"）里，
@@ -295,8 +301,7 @@ def all_at_place(prompt: str, said: str, recent: str, entity_id: str, entries: l
     哪句都没有地点（"把灯全关了"）、这类设备又不止在一处：不替用户把几处房子的都控制了，先回问。asked 表示上一次委托问过：这次答了地点
     就控制那一处，答"都关"才控制全部，没答上来（"嗯""第一个"，或者转写还没到）再问一遍。11-04 模拟：问完用户只说"嗯"，小模型一轮就把
     三处的 10 盏灯都调了，所以这里连小模型一轮出好几个调用的也拦。"""
-    rows = [p for p in ([x.strip() for x in line.split(",")] for line in (prompt or "").splitlines())
-            if len(p) == 3 and re.fullmatch(r"\w+\.\w+", p[2])]
+    rows = _device_rows(prompt)
     if _EXCEPT_WORDS.search(said or "") or says_device_word(said, [{"names": [p[1]]} for p in rows]):
         return [], None
     same = [p for p in rows if p[2].split(".")[0] == entity_id.split(".")[0]]
@@ -315,6 +320,57 @@ def all_at_place(prompt: str, said: str, recent: str, entity_id: str, entries: l
     if asked and says_all(said):
         return [p[2] for p in same], None
     return [], f"没有执行：用户没说是哪一处，{'、'.join(where)}都有这类设备，一共 {len(same)} 台。问用户要控制哪一处，还是全部。"
+
+
+# 点名几台设备时，设备名之间和前后不算动作的字：连接词、语气词，以及"关掉 / 关闭 / 关上""打开"和"关""开"的差别
+_NOT_ACTION = re.compile(r"[\s，,、。；;！!：:]|以及|还有|一起|全部|全都|统统|所有|然后|接着|麻烦|一下|那个|这个"
+                         r"|和|跟|与|及|同|并|把|将|给|帮|请|你|我|也|都|全|再|先|还|了|吧|啊|呀|哦|嘛|呗|掉|闭|上|打")
+# 客气的问法，"不"不是否定
+_POLITE_ASK = re.compile(r"能不能|可不可以|行不行|好不好")
+
+
+def _squash(text: Any) -> str:
+    """比设备名用：转小写、去空格和"的"（"书房的灯"也算"书房灯"）。"""
+    return norm(text).replace(" ", "").replace("的", "")
+
+
+def named_devices(prompt: str, said: str, entity_id: str, entries: list[dict]) -> list[str]:
+    """"把书房灯和客厅大灯关了"要控制的设备：用户这句话（said）里整个说出来的、设备列表里的设备，按说的先后，至少两台。
+    只算完整的设备名：片段（"客厅的灯"）可能是别处的客厅，拿不准。动作照小模型填的，每台都一样，所以拿不准都返回 []，
+    照旧只控制小模型填的那一个：
+    - 有排除、否定的词（"除了书房灯""卧室灯不用关""书房灯不关"）；
+    - 说了地点，这台不在那里（"把乙地的卧室灯和书房灯关了"，乙地的卧室灯可能另有名字），或者同名的不止一台分不开；
+    - 小模型填的不是这几台之一（它对这句话的理解和名字对不上），或者这几台不同类；
+    - 动作不止一种：每台设备名前后的话去掉连接词之后不一样（"书房灯关了，客厅大灯打开""一盏调到三十，一盏调到五十"）。
+      "把"前面的不算动作（"都这么晚了，把书房灯和客厅大灯关了"）。
+    名单没取到时认不出地点，地点这一条就不查，别的照查。"""
+    rows = _device_rows(prompt)
+    names = sorted({_squash(p[1]) for p in rows if len(_squash(p[1])) >= 2}, key=len, reverse=True)
+    if not names or _EXCEPT_WORDS.search(_POLITE_ASK.sub("", said or "")):
+        return []
+    pattern = re.compile("|".join(map(re.escape, names)))      # 长的在前："台灯带"不会算成"台灯"
+    text = _squash(said)
+    hit = list(dict.fromkeys(pattern.findall(text)))
+    if len(hit) < 2:
+        return []
+    pieces = pattern.split(text)
+    tokens = area_tokens(entries)
+    places = mentioned_areas("\n".join(pieces), tokens)        # 去掉设备名再找，设备名里带的地点词不算用户说了地点
+    words = {w.replace(" ", "") for a in places for w in tokens[a]}
+    targets = []
+    for name in hit:
+        same = [p[2] for p in rows if _squash(p[1]) == name and (not words or any(w in _squash(p[0]) for w in words))]
+        if len(same) != 1:
+            return []
+        targets.append(same[0])
+    if entity_id not in targets or len({t.split(".")[0] for t in targets}) != 1:
+        return []
+    # 地点和位置也不算动作（"把甲地的书房灯和甲地客厅的客厅大灯关了"）
+    drop = sorted((words | {_squash(p[0]) for p in rows}) - {""}, key=len, reverse=True)
+    pieces = [re.sub("|".join(map(re.escape, drop)) or "$^", "", x) for x in pieces]
+    if pieces[0].endswith(("把", "将")):
+        pieces[0] = ""
+    return targets if len({_NOT_ACTION.sub("", x) for x in pieces} - {""}) <= 1 else []
 
 
 def tidy_args(tool: dict, args: dict, entries: list[dict]) -> dict:

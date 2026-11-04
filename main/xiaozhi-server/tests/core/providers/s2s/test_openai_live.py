@@ -1462,3 +1462,58 @@ def test_no_fan_out_for_other_tools():
     """别的工具（同样是短结果）照旧：说了"都"也是一个调用、直接交回。"""
     rec = _after_first_call("甲地都几点了", [], first=_light_call("light.a1", name="llm__GetDateTime"), tool="llm__GetDateTime")
     assert len(rec["calls"]) == 1 and rec["auto"] == [] and rec["commentary"].startswith("已调用 llm__GetDateTime")
+
+
+def test_named_lights_fan_out_to_exactly_those_lights():
+    """"把书房灯和客厅大灯关了"：强制填参只出第一盏，服务端按说的名字换成这两盏（不是甲地的每一盏），结果给小模型总结。说了"都""一起"也一样。"""
+    for said in ("把书房灯和客厅大灯关了", "把书房灯和客厅大灯一起关了", "把书房灯和客厅大灯都关了"):
+        rec = _after_first_call(said, [_text_reply("书房灯和客厅大灯都关了。")])
+        assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2"], said
+        assert all(c["state"] == {"type": "turn_off"} for c in rec["calls"])
+        assert rec["auto"] == [2] and rec["commentary"] == "书房灯和客厅大灯都关了。"
+
+
+def test_named_lights_keep_the_filled_action():
+    first = {"type": "function_call", "call_id": "c0", "name": "hass_set_state",
+             "arguments": json.dumps({"state": {"type": "brightness_value", "input": 30}, "entity_id": "light.a1"})}
+    rec = _after_first_call("把书房灯和客厅大灯调到百分之三十", [_text_reply("调好了。")], first=first)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2"]
+    assert all(c["state"] == {"type": "brightness_value", "input": 30} for c in rec["calls"])
+
+
+def test_named_lights_only_this_sentence_counts():
+    """上一轮的设备不算：刚关了书房灯，接着说"客厅大灯也关了"就只控制客厅大灯。"""
+    rec = _after_first_call("客厅大灯也关了", [], first=_light_call("light.a2"),
+                            history=[("user", "把书房灯关了"), ("assistant", "书房灯关了。")])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a2"] and rec["auto"] == []
+    # 上一句直接交回后才落进 history，也算在这次委托的 said 里：只看最后一句，书房灯不再控制一遍
+    rec = _after_first_call(["把书房灯关了", "客厅大灯也关了"], [], first=_light_call("light.a2"))
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a2", "light.a2"] and rec["auto"] == []
+
+
+def test_named_lights_as_the_answer_to_which_place():
+    """"把灯全关了"回问是哪一处，用户答了两盏灯的名字：就控制这两盏。"""
+    rec = _after_first_call(["把灯全关了", "书房灯和客厅大灯"], [_text_reply("书房灯和客厅大灯都关了。")])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2"] and rec["auto"] == [2]
+
+
+def test_no_named_fan_out_when_unsure():
+    """动作不同、提到设备但不是都要控制、片段不算名字、有否定的词、单盏带"都"：还是小模型填的那一个、直接交回，不多走一轮。"""
+    for said in ("把书房灯关了，再把客厅大灯打开", "把书房灯调到三十，客厅大灯调到五十", "书房灯太亮了，把客厅大灯关了",
+                 "把书房灯和客厅灯关了", "书房灯不关，客厅大灯关了", "都这么晚了，把书房灯关了"):
+        rec = _after_first_call(said, [])
+        assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"] and rec["auto"] == [], said
+        assert rec["commentary"].startswith("已调用 hass_set_state"), said
+
+
+def test_no_named_fan_out_when_the_filled_light_is_not_named():
+    """小模型填的不是这两盏：它对这句话的理解和名字对不上，照它填的执行，不替它换。"""
+    rec = _after_first_call("把书房灯和客厅大灯关了", [], first=_light_call("light.b1"))
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.b1"] and rec["auto"] == []
+
+
+def test_no_named_fan_out_for_queries():
+    """查状态的工具不展开：这里只管控制。"""
+    rec = _after_first_call("书房灯和客厅大灯开着吗", [], first={"type": "function_call", "call_id": "c0", "name": "hass_get_state",
+                                                       "arguments": json.dumps({"entity_id": "light.a1"})}, tool="hass_get_state")
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"] and rec["auto"] == []

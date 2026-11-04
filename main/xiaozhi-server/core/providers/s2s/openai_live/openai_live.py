@@ -781,6 +781,24 @@ class S2SProvider(S2SProviderBase):
         return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}",
                      arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False)) for n, e in enumerate(targets)], None
 
+    def _fan_out_named(self, calls: list, said: str) -> list:
+        """"把书房灯和客厅大灯关了"：和"全关"同一个根因，强制填参只出第一盏，结果又短，不展开就只控制到第一盏。动作用小模型填的，
+        换成用户这句话（said）点名的那几台（见 ha_names.named_devices），每台一个调用，结果交给小模型总结。点名不到两台的照旧。"""
+        if len(calls) != 1 or calls[0].get("name") != "hass_set_state":
+            return calls
+        try:
+            args = json.loads(calls[0].get("arguments") or "{}")
+        except ValueError:
+            return calls
+        if not isinstance(args, dict):
+            return calls
+        targets = ha_names.named_devices(self.conn.prompt, said, str(args.get("entity_id") or ""), self._ha_entries)
+        if not targets:
+            return calls
+        self.logger.bind(tag=TAG).info(f"Live 点名展开 hass_set_state：{len(targets)} 个设备")
+        return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}",
+                     arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False)) for n, e in enumerate(targets)]
+
     async def _client_delegation(self, did: str) -> None:
         """Live 把一件事委托出来（没有请求正文）：用最近几句对话拼出请求，小模型选工具、ToolRunner 执行，结果交回 Live 转述。"""
         t0 = time.time()
@@ -816,6 +834,7 @@ class S2SProvider(S2SProviderBase):
                 if i == 0:
                     # 只看最后一句：上一次委托时还没落进 history 的那句也会算进 said，它的"全关"不是这句的意思
                     calls, ask = self._fan_out_all(calls, said[-1] if said else "", recent, asked_all)
+                    calls = self._fan_out_named(calls, said[-1] if said else "")
                 outputs = []
                 for call in calls:
                     used.append(call.get("name"))
