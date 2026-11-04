@@ -760,12 +760,38 @@ class S2SProvider(S2SProviderBase):
         self.logger.bind(tag=TAG).info(f"Live 设备歧义拦下 {name} {call.get('arguments')}：{blocked}")
         return blocked
 
+    def _fan_out_intent(self, calls: list, said: str, recent: str) -> list:
+        """"把甲地的窗帘都关上"走 HA 意图：小模型有时一幅一轮，默认 3 轮用完还没关完；有时漏了几幅还说都关了；有时只填区域，用户没点的那种
+        也动了（"把甲地的纱帘都关上"连布帘一起关），或者 device_class 填错一幅都找不到（11-04 模拟）。和灯一样：工具和动作用小模型填的，
+        设备照名单（见 ha_names.all_named），每台一个调用，结果交给小模型总结。小模型一轮出好几个调用、动作不一样的照它填的。"""
+        tool = calls[0].get("name") or ""
+        intents = ha_names.device_intents(self._tool_list()) if self.ha_names and self._ha_entries else {}
+        if tool not in intents or any(c.get("name") != tool for c in calls):
+            return calls
+        try:
+            filled = [json.loads(c.get("arguments") or "{}") for c in calls]
+        except ValueError:
+            return calls
+        if not all(isinstance(a, dict) for a in filled):
+            return calls
+        actions = [{k: v for k, v in a.items() if k not in ha_names.TARGET_ARGS} for a in filled]
+        if any(a != actions[0] for a in actions):
+            return calls
+        names = ha_names.all_named(said, recent, tool, self._ha_entries, self.ha_names_domains)
+        if len(names) < 2:
+            return calls
+        self.logger.bind(tag=TAG).info(f"Live 全部展开 {tool}：{len(names)} 个设备")
+        return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}",
+                     arguments=json.dumps(dict(actions[0], name=x), ensure_ascii=False)) for n, x in enumerate(names)]
+
     def _fan_out_all(self, calls: list, said: str, recent: str, asked: bool) -> tuple[list, str | None]:
         """"把甲地的灯全关了"：强制填参只出一个 hass_set_state，结果又只有几个字，不展开就只控制到第一盏。动作用小模型填的，
         换成那一处同类设备每台一个调用（设备照设备列表，见 ha_names.all_at_place），结果交给小模型总结。不让小模型自己补：
         11-04 模拟里它有时漏灯还说都关了（位置写法不统一的那一处），给了提示就跨房子多控，给了名单又抄错 entity_id。
         没说地点（"把灯全关了"）时第二个返回值是交给 Live 的回问，这次委托的调用都不执行。said 是用户最后一句话，asked 是上一次委托问过。"""
-        if any(c.get("name") != "hass_set_state" for c in calls) or not (asked or ha_names.says_all(said)):
+        if any(c.get("name") != "hass_set_state" for c in calls):
+            return self._fan_out_intent(calls, said, recent), None
+        if not (asked or ha_names.says_all(said)):
             return calls, None
         try:
             args = json.loads(calls[0].get("arguments") or "{}")

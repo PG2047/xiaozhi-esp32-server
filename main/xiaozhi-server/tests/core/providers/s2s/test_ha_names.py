@@ -305,3 +305,89 @@ def test_ask_which_lists_at_most_four_names():
     assert H.ask_which(es[:2]) == "没有执行：用户没说是哪一台，有 2 台对得上（戊地1号卧室布帘、戊地1号卧室纱帘）。问用户要控制哪一台。"
     assert H.ask_which(es[:5], "家里").startswith("没有执行：用户没说是哪一台，家里有 5 台对得上")
     assert "戊地1号客厅纱帘等）" in H.ask_which(es[:5]) and "甲牌" not in H.ask_which(es[:5])
+
+
+_CURTAINS = ["戊地1号卧室布帘", "戊地1号卧室纱帘", "戊地1号客厅布帘", "戊地1号客厅纱帘"]
+
+
+def _all_named(said, recent=None, tool="intent__HassSetPosition", es=None):
+    return H.all_named(said, said if recent is None else recent, tool, _name_entries() if es is None else es)
+
+
+def test_all_named_lists_the_whole_kind_at_the_place():
+    for said in ("把戊地的窗帘都关上", "戊地的窗帘都打开", "把戊地所有的窗帘合上", "把戊地1号的窗帘都关上", "把戊地楼下的窗帘全部打开",
+                 "帮我把戊地的窗帘都关上吧", "现在把戊地的窗帘都拉开一半", "都这么晚了，把戊地的窗帘都拉上", "戊地那边的窗帘都拉上",
+                 "拉上戊地所有的窗帘", "关上戊地的全部窗帘", "帮我打开戊地所有窗帘", "戊地的窗帘，都关上"):
+        assert _all_named(said) == _CURTAINS, said
+    # 没说地点、这类设备只在一处；说了两处，其中一处没有
+    assert _all_named("把窗帘都关上") == _CURTAINS and _all_named("把家里的窗帘全部拉开") == _CURTAINS
+    assert _all_named("把戊地和己地的窗帘都关上") == _CURTAINS
+    # 风扇两处都有：说了地点只算那一处。fan__ 工具只找风扇
+    assert _all_named("把己地的净化风扇都关了", tool="fan__HassFanSetSpeed") == ["己地甲牌净化风扇"]
+    assert _all_named("把戊地和己地的甲牌风扇都关了", tool="fan__HassFanSetSpeed") == ["戊地108甲牌净化风扇", "己地甲牌净化风扇"]
+
+
+def test_all_named_narrows_by_words_only_some_devices_have():
+    bedroom, living = _CURTAINS[:2], _CURTAINS[2:]
+    assert _all_named("把戊地卧室的窗帘都关上") == bedroom and _all_named("把卧室的窗帘都拉开") == bedroom
+    assert _all_named("把戊地客厅的窗帘全部打开") == living
+    assert _all_named("把戊地的纱帘都关上") == [_CURTAINS[1], _CURTAINS[3]]
+    assert _all_named("把戊地的遮光窗帘都拉开") == [_CURTAINS[0], _CURTAINS[2]]
+    assert _all_named("把戊地卧室的纱帘都关上") == [_CURTAINS[1]]             # 且：只有一台，调用方不展开
+    # 没有共同设备的词是"或"，有共同设备的是"且"
+    assert _all_named("把戊地卧室和客厅的窗帘都关上") == _CURTAINS
+    assert _all_named("把戊地的布帘和纱帘都拉开") == _CURTAINS
+    assert _all_named("把戊地卧室和客厅的纱帘都关上") == [_CURTAINS[1], _CURTAINS[3]]
+    assert _all_named("把卧室布帘和客厅纱帘都关上") == [_CURTAINS[0], _CURTAINS[3]]    # 整个名字只算整个名字
+
+
+def test_all_named_reads_the_latest_sentence_with_device_words_and_with_a_place():
+    assert _all_named("都关上吧", "戊地的窗帘有几幅\n都关上吧") == _CURTAINS
+    assert _all_named("都关上", "把戊地卧室的窗帘关上\n都关上") == _CURTAINS[:2]
+    assert _all_named("全部", "把戊地的窗帘关上\n全部") == _CURTAINS          # 回问之后的答复：没有动作也算
+    # 这句点了设备：前一句的房间不算
+    assert _all_named("把戊地的窗帘都关上", "把戊地卧室的纱帘拉开\n把戊地的窗帘都关上") == _CURTAINS
+    assert _all_named("窗帘也都关上", "把戊地的灯关了\n窗帘也都关上") == _CURTAINS
+    # 这句没说地点：地点取前一句的（这款风扇两处都有）
+    assert _all_named("甲牌风扇也都关了", "把戊地的灯关了\n甲牌风扇也都关了", tool="intent__HassTurnOff") == ["戊地108甲牌净化风扇"]
+    # 这句提到的地方没有窗帘：不算前一句的设备词
+    assert _all_named("把己地的窗帘都关上", "戊地的净化风扇开着吗\n把己地的窗帘都关上") == []
+
+
+def test_all_named_gives_up_when_unsure():
+    for said in ("除了卧室布帘，把戊地的窗帘都关上", "把戊地的窗帘都关上，纱帘不用", "把戊地的窗帘都关上，留着纱帘", "别把戊地的窗帘都关上",
+                 "戊地的窗帘都关了吗", "戊地的窗帘是不是都关了", "算了戊地的窗帘都关上"):
+        assert _all_named(said) == [], said                                  # 排除、否定、提问
+    for said in ("把戊地主卧的窗帘都关上", "把戊地靠窗的窗帘都拉开", "把戊地楼上的窗帘都关上", "把戊地窗帘靠窗的都关上", "把戊地的帘子都关上"):
+        assert _all_named(said) == [], said                                  # 名单里没有的修饰，范围可能更小
+    for said in ("把戊地的都关上", "都关上吧", "把戊地的设备都关了", "把己地的窗帘都关上"):
+        assert _all_named(said) == [], said                                  # 没点到那里有的设备
+    for said in ("把戊地的窗帘关上", "都这么晚了，把戊地的窗帘拉上", "我都说了把戊地的窗帘拉开"):
+        assert _all_named(said) == [], said                                  # 没说"都"，或者"都"不是说窗帘的
+    for said in ("戊地的窗帘都坏了", "戊地的窗帘都是新换的", "戊地的窗帘都关着呢", "戊地的窗帘都好久没开了"):
+        assert _all_named(said) == [], said                                  # 在说状态
+    assert _all_named("都关着呢", "戊地的窗帘有几幅\n都关着呢") == []
+    for said in ("把戊地的布帘都拉开，纱帘都关上", "把戊地的布帘都拉开纱帘都关上"):
+        assert _all_named(said) == [], said                                  # 动作不止一种
+    assert _all_named("把戊地的窗帘和净化风扇都关了") == []                  # 不止一类设备
+    assert _all_named("把戊地的书房灯都关了", tool="intent__HassTurnOff") == []   # 灯不归这里管
+    assert _all_named("把风扇都关了", tool="intent__HassTurnOff") == []      # 没说地点，两处都有
+    assert _all_named("把戊地的窗帘都关上", tool="fan__HassFanSetSpeed") == []    # 这个工具控制不了窗帘
+    assert _all_named("把戊地的窗帘都关上", es=[]) == []
+
+
+def test_all_named_picks_a_name_only_this_device_has():
+    def cover(*names):
+        return {"names": list(names), "domain": "cover", "areas": ["戊地"], "device_class": "curtain"}
+    # 第一个名字重名：用下一个；HA 拼的"设备名  实体名"不用
+    es = [cover("窗帘", "东窗帘", "东窗帘  电机"), cover("窗帘", "西窗帘")]
+    assert _all_named("把戊地的窗帘都关上", es=es) == ["东窗帘", "西窗帘"]
+    # 找不到认得准的名字：不展开
+    assert _all_named("把戊地的窗帘都关上", es=[cover("窗帘"), cover("窗帘", "西窗帘")]) == []
+
+
+def test_sounds_like_command():
+    for said in ("把戊地的灯全关了", "戊地的灯全部打开", "把灯都调到百分之三十", "都关了吧", "把戊地的灯全灭了", "接着把戊地的窗帘都放下来"):
+        assert H.sounds_like_command(said), said
+    for said in ("戊地的灯都坏了", "戊地的灯都好久没开了", "戊地的灯都是新换的", "戊地那边的灯都亮着呢", "戊地的窗帘都关着呢", ""):
+        assert not H.sounds_like_command(said), said

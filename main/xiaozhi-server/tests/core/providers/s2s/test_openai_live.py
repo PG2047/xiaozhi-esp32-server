@@ -1378,7 +1378,7 @@ def _light_call(entity: str, call_id: str = "c0", state: str = "turn_off", name:
 
 
 def _after_first_call(said: str | list[str], auto_rounds: list, first: dict | list | None = None, tool: str = "hass_set_state",
-                      history: list | None = None, conf: float = 0.95) -> dict:
+                      history: list | None = None, conf: float = 0.95, es: list | None = None, props: dict | None = None, **over) -> dict:
     """用户说 said（列表是一句一次委托），decisions 选 tool、强制填参填 first（默认只填甲地书房灯一个）；之后小模型每次自选按 auto_rounds
     依次回（多要一次会报错）。返回最后交回 Live 的话、依次执行的调用、小模型每次自选时看到的工具结果数。名单和设备列表用虚构的甲地、老家。"""
     from tests.core.providers.s2s.test_ha_names import entries
@@ -1398,8 +1398,8 @@ def _after_first_call(said: str | list[str], auto_rounds: list, first: dict | li
         p._decisions_call = fake_dec
         p._responses_call = fake_resp
         p._tool_list = lambda: [{"type": "function", "name": tool, "description": "设置设备状态",
-                                 "parameters": {"type": "object", "properties": {"entity_id": {"type": "string"}, "state": {"type": "object"}}}}]
-        p._ha_entries = entries()
+                                 "parameters": {"type": "object", "properties": props or {"entity_id": {"type": "string"}, "state": {"type": "object"}}}}]
+        p._ha_entries = entries() if es is None else es
         conn.prompt = _LIGHTS_PROMPT
         p.history += history or []
         p._guard_mark = len(p.history)
@@ -1413,7 +1413,7 @@ def _after_first_call(said: str | list[str], auto_rounds: list, first: dict | li
             p.history.append(("assistant", "好的。"))
         rec["commentary"] = [m for m in lv.received if m["type"] == "session.commentary.append"][-1]["content"]
         rec["calls"] = [json.loads(c["arguments"]) for c in conn.func_handler.calls]
-    _run_client(sc, tool_picker="decisions")
+    _run_client(sc, tool_picker="decisions", **over)
     return rec
 
 
@@ -1533,6 +1533,100 @@ def test_short_answer_with_low_confidence_after_asking_still_fans_out():
     rec = _after_first_call(["把灯全关了", "甲地"], [[_light_call("light.a2")], _text_reply("甲地的灯都关了。")], conf=0.4)
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3"]
     assert rec["auto"] == [0, 3] and rec["commentary"] == "甲地的灯都关了。"
+
+
+_SET_POSITION = "intent__HassSetPosition"
+_CURTAINS = ["戊地1号卧室布帘", "戊地1号卧室纱帘", "戊地1号客厅布帘", "戊地1号客厅纱帘"]
+
+
+def _intent_call(call_id: str = "c0", tool: str = _SET_POSITION, **args) -> dict:
+    return {"type": "function_call", "call_id": call_id, "name": tool, "arguments": json.dumps(args, ensure_ascii=False)}
+
+
+def _curtains(said: str | list[str], auto_rounds: list, first: dict | list, tool: str = _SET_POSITION, conf: float = 0.95, **over) -> dict:
+    """同 _after_first_call，设备表是虚构的戊地四幅窗帘（见 test_ha_names._name_entries），工具是 HA 意图。"""
+    from tests.core.providers.s2s.test_ha_names import _name_entries
+    return _after_first_call(said, auto_rounds, first=first, tool=tool, conf=conf, es=_name_entries(),
+                             props={"name": {"type": "string"}, "area": {"type": "string"}, "device_class": {"type": "array"},
+                                    "position": {"type": "integer"}}, **over)
+
+
+def test_curtains_all_words_fan_out_with_the_filled_action():
+    """"把戊地的窗帘都关上"：小模型只填了第一幅，服务端按名单换成每幅一个调用，动作照它填的，结果给小模型总结。"""
+    for said, position in (("把戊地的窗帘都关上", 0), ("把戊地的窗帘都拉开", 100), ("把戊地的窗帘都拉开一半", 50)):
+        rec = _curtains(said, [_text_reply("窗帘都好了。")], _intent_call(name=_CURTAINS[0], position=position))
+        assert rec["calls"] == [{"position": position, "name": n} for n in _CURTAINS], said
+        assert rec["auto"] == [4] and rec["commentary"] == "窗帘都好了。"
+
+
+def test_curtains_fan_out_replaces_area_calls():
+    """只填区域的调用也换：device_class 填错 HA 一幅都找不到；"纱帘"按区域会把布帘也动了。"""
+    rec = _curtains("把戊地的窗帘都关上", [_text_reply("好了。")], _intent_call(area="戊地楼下1号", device_class=["shade"], position=0))
+    assert rec["calls"] == [{"position": 0, "name": n} for n in _CURTAINS]
+    rec = _curtains("把戊地的纱帘都关上", [_text_reply("好了。")], _intent_call(area="戊地楼下1号", device_class=["curtain"], position=0))
+    assert rec["calls"] == [{"position": 0, "name": n} for n in (_CURTAINS[1], _CURTAINS[3])]
+
+
+def test_curtains_fan_out_replaces_several_calls_with_one_action():
+    """小模型一轮出了几幅、动作一样：范围照名单；动作不一样（或者工具不一样）照它填的。"""
+    two = [_intent_call("c0", name=_CURTAINS[0], position=0), _intent_call("c1", name=_CURTAINS[2], position=0)]
+    rec = _curtains("把戊地的窗帘都关上", [_text_reply("好了。")], two)
+    assert [c["name"] for c in rec["calls"]] == _CURTAINS and rec["auto"] == [4]
+    differ = [_intent_call("c0", name=_CURTAINS[0], position=0), _intent_call("c1", name=_CURTAINS[1], position=100)]
+    rec = _curtains("把戊地的窗帘都调一下", [_text_reply("好了。")], differ)
+    assert [c["position"] for c in rec["calls"]] == [0, 100]
+    mixed = [_intent_call("c0", tool="intent__HassTurnOff", name=_CURTAINS[0]), _intent_call("c1", tool="intent__HassTurnOn", name=_CURTAINS[1])]
+    rec = _curtains("把戊地的窗帘都关上", [_text_reply("好了。")], mixed, tool="intent__HassTurnOff")
+    assert [c["name"] for c in rec["calls"]] == _CURTAINS[:2]
+
+
+def test_curtains_no_fan_out_when_scope_is_not_plain():
+    """没说"都"、名单外的修饰、排除：照小模型填的。"""
+    rec = _curtains("把戊地主卧的窗帘都关上", [_text_reply("好了。")], _intent_call(name=_CURTAINS[0], position=0))
+    assert [c["name"] for c in rec["calls"]] == [_CURTAINS[0]]
+    rec = _curtains("把戊地的窗帘都关上，纱帘不用", [_text_reply("好了。")], _intent_call(name=_CURTAINS[0], position=0))
+    assert [c["name"] for c in rec["calls"]] == [_CURTAINS[0]]
+    # 只点到一台：还是一个调用、直接交回，不多走一轮小模型
+    rec = _curtains("都这么晚了，把戊地客厅的纱帘拉上", [], _intent_call(name=_CURTAINS[3], position=0))
+    assert [c["name"] for c in rec["calls"]] == [_CURTAINS[3]] and rec["auto"] == []
+    assert rec["commentary"].startswith(f"已调用 {_SET_POSITION}")
+    # 说了"都"却只点到一台：拿不准（"净化器都关了"，另一台名字里没有这个词也可能算），照小模型填的
+    area = {"area": "戊地楼下1号", "device_class": ["curtain"], "position": 0}
+    rec = _curtains("把戊地客厅的纱帘都拉上", [], _intent_call(**area))
+    assert rec["calls"] == [area]
+
+
+def test_curtains_without_all_words_are_still_asked():
+    """没说"都"：还是设备歧义回问（不执行）；答"都关上"才展开，交回的调用过得了地点守卫和歧义检查。"""
+    first = _intent_call(name=_CURTAINS[0], position=0)
+    rec = _curtains("把戊地的窗帘关上", [], first)
+    assert rec["calls"] == [] and "没有执行" in rec["commentary"]
+    rec = _curtains(["把戊地的窗帘关上", "都关上"], [_text_reply("都关上了。")], first)
+    assert [c["name"] for c in rec["calls"]] == _CURTAINS and rec["commentary"] == "都关上了。"
+
+
+def test_curtains_place_guard_still_blocks_other_places():
+    """别处没有窗帘：不展开，小模型照抄的设备还是被地点守卫拦下。"""
+    rec = _curtains("把己地的窗帘都关上", [], _intent_call(name=_CURTAINS[0], position=0))
+    assert rec["calls"] == [] and "没有执行" in rec["commentary"] and "己地老家" in rec["commentary"]
+
+
+def test_curtains_fan_out_only_in_the_first_round():
+    """总结那一轮小模型又调了一次：照它填的执行，不再展开一遍。"""
+    again = _intent_call("c9", name=_CURTAINS[0], position=0)
+    rec = _curtains("把戊地的窗帘都关上", [[again], _text_reply("好了。")], _intent_call(name=_CURTAINS[0], position=0))
+    assert [c["name"] for c in rec["calls"]] == _CURTAINS + [_CURTAINS[0]]
+
+
+def test_curtains_no_fan_out_with_ha_names_off():
+    rec = _curtains("把戊地的窗帘都关上", [], _intent_call(name=_CURTAINS[0], position=0), ha_names=False)
+    assert [c["name"] for c in rec["calls"]] == [_CURTAINS[0]]
+
+
+def test_curtains_all_word_before_the_action_does_not_fan_out():
+    """"都这么晚了，把戊地的窗帘拉上"：这个"都"不是说窗帘的，还是设备歧义回问。"""
+    rec = _curtains("都这么晚了，把戊地的窗帘拉上", [], _intent_call(name=_CURTAINS[0], position=0))
+    assert [c["name"] for c in rec["calls"]] == [_CURTAINS[0]]
 
 
 def test_fan_out_only_in_the_first_round():
