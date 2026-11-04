@@ -32,7 +32,7 @@ from core.handle.sendAudioHandle import (
 )
 from core.providers.s2s.audio import OpusFramer, Resampler
 from core.utils.dialogue import Message
-from core.utils.status_ledger import append_session
+from core.utils.status_ledger import append_session, is_server_process
 
 TAG = __name__
 
@@ -193,7 +193,9 @@ class S2SProviderBase(ABC):
             await self.speaker.interrupt()
 
     def record_session(self, model: str, stats: dict) -> None:
-        """会话结束写一行状态页台账（core/utils/status_ledger.py）。没配 log.status_dir 就什么都不做。"""
+        """会话结束写一行状态页台账（core/utils/status_ledger.py）。没配 log.status_dir 或不是 server 主进程就什么都不做。"""
+        if not is_server_process():
+            return
         status_dir = ((getattr(self.conn, "config", None) or {}).get("log") or {}).get("status_dir")
         append_session(status_dir, device=getattr(self.conn, "device_name", None), brain=self.config.get("type"),
                        model=model, started_at=self.started_at, stats=stats)

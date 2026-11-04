@@ -1276,7 +1276,9 @@ def test_pronoun_after_naming_the_device_is_not_asked_and_in_list_tools_are_unto
     _name_client(sc2)
 
 
-def test_close_writes_status_ledger_without_device_identity(tmp_path):
+def test_close_writes_status_ledger_without_device_identity(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["app.py"])
+
     async def sc(lv, conn, p):
         conn.config = dict(getattr(conn, "config", None) or {}, log={"status_dir": str(tmp_path)})
         conn.device_name = "书房"
@@ -1287,3 +1289,12 @@ def test_close_writes_status_ledger_without_device_identity(tmp_path):
     assert row["device"] == "书房" and row["model"] == "gpt-live-1"
     assert row["stats"]["segments"] == 2 and row["duration_s"] >= 0
     assert "aa:bb:cc:dd:ee:ff" not in json.dumps(row)
+
+
+def test_probe_process_does_not_write_status_ledger(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["-"])    # docker exec python - 跑的探针
+
+    async def sc(lv, conn, p):
+        conn.config = dict(getattr(conn, "config", None) or {}, log={"status_dir": str(tmp_path)})
+    run(sc)
+    assert not (tmp_path / "sessions.jsonl").exists()

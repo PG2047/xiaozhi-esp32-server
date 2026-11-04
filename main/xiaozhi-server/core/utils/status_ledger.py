@@ -7,6 +7,8 @@
     server.json      server 进程的启动时间
 
 目录由 config["log"]["status_dir"] 决定，没配就什么都不写（上游默认行为不变）。
+只有 server 主进程写：容器里常有 `docker exec python -` 跑的探针，它们也走 setup_logging 和 provider，
+混进来会把启动时间改掉，还会多出不是设备产生的会话和告警。调用方用 is_server_process() 判断。
 任何异常都只吞掉：写台账失败不能影响会话。
 """
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import time
 
 # 这些格式串把用户原话、工具参数或设备消息拼进了日志，只留前面的固定文字。加新的 error / warning 时带上用户文本的话，这里也要加一条。
@@ -35,6 +38,11 @@ _UUID = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 _IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 _BEARER = re.compile(r"\bbearer\s+\S+", re.I)
 _API_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}")
+
+
+def is_server_process() -> bool:
+    """镜像的 CMD 是 python app.py；探针的 argv[0] 是 "-"、"-c" 或自己的脚本名。"""
+    return os.path.basename(sys.argv[0] or "") == "app.py"
 
 
 def scrub_message(message: str) -> str | None:

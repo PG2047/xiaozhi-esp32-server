@@ -606,7 +606,9 @@ def test_attach_succeeds_and_upstream_close_closes_connection():
     run_scenario(sc)
 
 
-def test_close_writes_status_ledger(tmp_path):
+def test_close_writes_status_ledger(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["app.py"])
+
     async def sc(rt, conn, url):
         conn.config["log"] = {"status_dir": str(tmp_path)}
         conn.device_name = "微雪"

@@ -5,7 +5,7 @@ from loguru import logger
 from config.config_loader import load_config
 from config.settings import check_config_file
 from core.utils.cache.manager import cache_manager, CacheType
-from core.utils.status_ledger import add_error_sink
+from core.utils.status_ledger import add_error_sink, is_server_process
 
 SERVER_VERSION = "0.9.8"
 _logger_initialized = False
@@ -112,9 +112,9 @@ def setup_logging(config=None):
             diagnose=True,
         )
 
-        # 状态页的错误列表：配了 log.status_dir 才写，默认不写
+        # 状态页的错误列表：配了 log.status_dir 才写，默认不写；容器里跑的探针不写
         status_dir = log_config.get("status_dir")
-        if status_dir:
+        if status_dir and is_server_process():
             add_error_sink(logger, status_dir)
         _logger_initialized = True  # 标记为已初始化
 
