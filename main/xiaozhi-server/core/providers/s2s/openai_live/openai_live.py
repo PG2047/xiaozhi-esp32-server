@@ -792,7 +792,7 @@ class S2SProvider(S2SProviderBase):
 
         "把书房灯关了，再把客厅大灯打开"每台动作不同，不能套同一个动作：不换调用，第三个返回值是这几台，不直接交回，小模型看到第一个结果会接着做下一个，
         只能动这几台（见 _off_named）。11-04 模拟 12 句 × 6 遍：这样 70/72；每台强制填一次 64/72（后一台常填成前一台的动作）；用 tool_choice required
-        让小模型一次出全 0/72（还是只出一个）。"""
+        让小模型一次出全 0/72（还是只出一个）。再告诉它定下来的是哪几台之后 18 句 × 6 遍 108/108。"""
         tool = calls[0].get("name") if calls else None
         if tool not in _HASS_LIST_TOOLS:
             return calls, None, []

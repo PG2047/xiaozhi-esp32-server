@@ -372,10 +372,11 @@ def test_named_devices_partial_names_take_the_place_from_the_same_sentence():
                  "帮我关一下书房和客厅的灯", "把书房灯和客厅里的灯关了", "能不能把书房和客厅的灯关了", "把书房灯关了，客厅的也关了", "把书房灯关了，客厅灯也关了",
                  "把书房灯和客厅灯关了，我要睡了", "我要睡了，关掉书房和客厅的灯", "把书房灯和客厅灯关了，把窗帘拉上", "把书房和客厅的灯调到百分之三十",
                  "可以把书房和客厅的灯关了吗", "把书房和客厅的灯关了好吗", "把书房灯和客厅灯关一下好不好", "把书房和客厅的灯亮度调到五十", "把书房和客厅的灯调暗一点儿",
-                 "把书房和客厅的灯开开"):
+                 "把书房和客厅的灯开开", "把书房客厅的灯关了"):
         assert _named(said, prompt=_HOUSES) == ["light.a1", "light.a2"], said
     assert _named("把客厅灯和书房灯打开", prompt=_HOUSES) == ["light.a2", "light.a1"]
     assert _named("把客厅和书房的灯打开", prompt=_HOUSES) == ["light.a2", "light.a1"]
+    assert _named("把书房客厅卧室的灯都关了", prompt=_HOUSES) == ["light.a1", "light.a2", "light.a8"]
     # 完整的名字定地点：老家的灯带着客厅去老家；"卧室灯"这样的名字别处也可能这么叫，也跟着走
     assert _named("把客厅灯和卧室吸顶灯关了", prompt=_HOUSES + "老家卧室,卧室吸顶灯,light.b5\n") == ["light.b2", "light.b5"]
     assert _named("把卧室灯和客厅大灯关了", prompt=_HOUSES) == ["light.a8", "light.a2"]
@@ -433,6 +434,7 @@ def test_named_devices_answer_after_asking():
     assert answer("两边都关了吧") == (["light.a2", "light.b2", "light.b1", "light.a8"], None, False)
     # 答的地方只有其中一盏：控制那一盏；一盏都没有、没答上来（或者转写还没到）、那里还是有好几盏对得上：再问
     assert answer("甲地的", asked="把书房灯和厨房灯关了") == (["light.a1"], None, False)
+    assert answer("甲地", asked="把台灯和客厅灯关了") == (["light.a3", "light.a2"], None, False)     # 那里有完整名字的就是它
     many = _HOUSES + "老家客厅,客厅筒灯,light.b6\n"
     assert H.named_devices(many, "老家", "light.b2", entries(), False, "把客厅和卧室的灯关了")[1].startswith("没有执行")
     assert H.named_devices(many, "甲地", "light.b2", entries(), False, "把客厅和卧室的灯关了")[0] == ["light.a2", "light.a8"]
@@ -456,7 +458,7 @@ def test_named_devices_room_words_that_do_not_count():
     for said in ("我在客厅，把书房灯关了", "客厅太暗了，开一下书房灯", "到客厅了，把书房灯关了", "回客厅之前把书房灯关了", "把书房灯和客厅的窗帘关了",
                  "把书房和客厅的窗帘关了", "把书房灯和窗帘关了", "把书房和客厅关了", "把卧室大灯和书房灯关了", "把小台灯和书房灯关了",
                  "除了书房灯，把客厅灯关了", "把书房灯和客厅灯关了，卧室灯不用关", "不要关书房灯，把客厅灯关了", "把书房灯和客厅灯关了吗",
-                 "把书房灯和客厅灯修一下"):
+                 "把书房灯和客厅灯修一下", "把卧室客厅的窗帘关了", "把书房灯和卧室客厅的窗帘关了"):
         assert _named(said, prompt=_HOUSES) == [], said
 
 

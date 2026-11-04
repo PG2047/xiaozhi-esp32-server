@@ -333,7 +333,7 @@ _EXCEPT_QUERY = re.compile(r"除|别|留|算了")
 # 去掉 _NOT_ACTION 之后，一段话整个是这些才算动作。"太亮""开着""一样亮"不算：这时设备只是被提到，不一定要控制
 _ACTION = re.compile(r"开+|关|灭|熄灭|点亮|[亮暗](?:一?点|一些|些)?"
                      r"|(?:亮度|色温|颜色)?(?:(?:调|开|换|变|设置?)[到成为至].+|调[亮暗高低大小](?:一?点|一些|些)?)")
-# 单说房间（没带"灯"）后面得接这些才算点到：别的话（"客厅太暗了""客厅的窗帘"）里的房间不算
+# 单说房间（没带"灯"）后面接这些才算点到：别的话（"客厅太暗了""客厅的窗帘"）里的房间不算
 _AFTER_ROOM = re.compile(r"$|[和跟与及同、，,；;。！!也都全一再还并以]|关|开|打|调|灭|熄|亮|暗")
 
 
@@ -361,20 +361,21 @@ def _lamp_words(spots: list[dict]) -> dict[str, dict]:
     完整名字也可能是别处的卧室）；灯的名字的片段（"台灯""筒灯"）；单说房间。"""
     words: dict[str, dict] = {}
 
-    def add(word: str, spot: dict, exact: bool = False) -> None:
-        w = words.setdefault(word, {"rows": [], "exact": []})
+    def add(word: str, spot: dict, exact: bool = False, room: bool = False) -> None:
+        w = words.setdefault(word, {"rows": [], "exact": [], "room": False})
         if spot not in w["rows"]:
             w["rows"].append(spot)
         if exact:
             w["exact"].append(spot)
+        w["room"] = w["room"] or room
 
     for s in spots:
         name, lamp = s["name"], "灯" in s["name"] or s["id"].startswith("light.")
         if len(name) >= 2:
             add(name, s, True)
         if lamp and len(s["room"]) >= 2:
-            add(s["room"] + "灯", s)
-            add(s["room"], s)
+            add(s["room"] + "灯", s, room=True)
+            add(s["room"], s, room=True)
         for i, j in ((i, j) for i in range(len(name)) for j in range(i + 2, len(name) + 1)):
             if "灯" in name[i:j]:
                 add(name[i:j], s)
@@ -386,9 +387,12 @@ def _mentions(text: str, words: dict[str, dict]) -> tuple[list[dict], list[str]]
     if not words:
         return [], [text]
     found, pieces, at = [], [], 0
-    for m in re.finditer("|".join(map(re.escape, sorted(words, key=len, reverse=True))), text):
+    pattern = re.compile("|".join(map(re.escape, sorted(words, key=len, reverse=True))))
+    for m in pattern.finditer(text):
         w = words[m.group()]
-        if "灯" not in m.group() and not w["exact"] and not _AFTER_ROOM.match(text, m.end()):
+        # 单说房间：后面要接连接词、动作，或者紧跟下一个房间（"书房客厅的灯"）；"卧室大灯"的"卧室"不算
+        after = pattern.match(text, m.end())
+        if "灯" not in m.group() and not w["exact"] and not (_AFTER_ROOM.match(text, m.end()) or (after and words[after.group()]["room"])):
             continue
         found.append(dict(w, word=m.group()))
         pieces.append(text[at:m.start()])
