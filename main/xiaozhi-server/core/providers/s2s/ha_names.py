@@ -281,7 +281,7 @@ def name_rivals(utterance: str, recent: str, tool_name: str, args: dict, entries
     return group if len(group) > 1 else []
 
 
-_EXCEPT_WORDS = re.compile(r"除|别|不|留|算了")
+_EXCEPT_WORDS = re.compile(r"除|别|不|留|算了|吗")
 
 
 def all_at_place(prompt: str, said: str, recent: str, entity_id: str, entries: list[dict],
@@ -290,7 +290,7 @@ def all_at_place(prompt: str, said: str, recent: str, entity_id: str, entries: l
     和 entity_id 同类、位置属于用户说的地点的全部设备；地点取手边的话（recent，一行一句）里最近一句提到地点的（"都关了吧"看前一句）。
 
     这里定了就不再问小模型，所以拿不准都返回 ([], None)，照旧只控制小模型填的那一个：用户这句话（said）点了具体设备（"都这么晚了，
-    把书房灯关了"，"都"不是全部的意思）或者有排除、否定的词（"除了甲地""乙地的不用""都不关"）。
+    把书房灯关了"，"都"不是全部的意思）或者有排除、否定、提问的词（"除了甲地""乙地的不用""都不关""都关了吗"）。
 
     哪句都没有地点（"把灯全关了"）、这类设备又不止在一处：不替用户把几处房子的都控制了，先回问。asked 表示上一次委托问过：这次答了地点
     就控制那一处，答"都关"才控制全部，没答上来（"嗯""第一个"，或者转写还没到）再问一遍。11-04 模拟：问完用户只说"嗯"，小模型一轮就把

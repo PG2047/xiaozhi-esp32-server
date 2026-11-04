@@ -1309,7 +1309,8 @@ def _light_call(entity: str, call_id: str = "c0", state: str = "turn_off", name:
             "arguments": json.dumps({"state": {"type": state}, "entity_id": entity})}
 
 
-def _after_first_call(said: str | list[str], auto_rounds: list, first: dict | list | None = None, tool: str = "hass_set_state", history: list | None = None) -> dict:
+def _after_first_call(said: str | list[str], auto_rounds: list, first: dict | list | None = None, tool: str = "hass_set_state",
+                      history: list | None = None, conf: float = 0.95) -> dict:
     """用户说 said（列表是一句一次委托），decisions 选 tool、强制填参填 first（默认只填甲地书房灯一个）；之后小模型每次自选按 auto_rounds
     依次回（多要一次会报错）。返回最后交回 Live 的话、依次执行的调用、小模型每次自选时看到的工具结果数。名单和设备列表用虚构的甲地、老家。"""
     from tests.core.providers.s2s.test_ha_names import entries
@@ -1319,7 +1320,7 @@ def _after_first_call(said: str | list[str], auto_rounds: list, first: dict | li
         rounds = list(auto_rounds)
 
         async def fake_dec(ctx, tools):
-            return tool, 0.95
+            return tool, conf
 
         async def fake_resp(items, tools, force=None):
             if force:
@@ -1444,6 +1445,26 @@ def test_all_words_of_the_previous_sentence_do_not_fan_out_this_one():
     """上一句全关了甲地，这句没说"都"：只照小模型填的执行一个。"""
     rec = _after_first_call(["把甲地的灯全关了", "把它打开"], [_text_reply("都关了。")])
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3", "light.a1"]
+
+
+def test_low_confidence_set_state_is_trusted_only_when_it_will_fan_out():
+    """会展开的句子：decisions 选了 hass_set_state，置信度低也用它，不退回小模型自选（那里可能只填区域）。"""
+    rec = _after_first_call("把甲地的灯全关了", [_text_reply("都关了。")], conf=0.4)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3"] and rec["auto"] == [3]
+    # 不展开的句子照旧退回小模型自选：自选的结果交给它，第一轮就要自选一次（auto 里的 0）
+    for said, ran in (("把甲地的书房灯关了", ["light.a2"]), ("把甲地的灯关了", ["light.a2"]), ("把灯全关了", [])):
+        rec = _after_first_call(said, [[_light_call("light.a2")]], conf=0.4)
+        assert [c["entity_id"] for c in rec["calls"]] == ran and rec["auto"] == [0], said
+    # 选的是别的工具：置信度低还是退回小模型
+    rec = _after_first_call("把甲地的灯全关了", [_text_reply("没听清。")], tool="intent__HassTurnOff", conf=0.4)
+    assert rec["calls"] == [] and rec["auto"] == [0] and rec["commentary"] == "没听清。"
+
+
+def test_short_answer_with_low_confidence_after_asking_still_fans_out():
+    """回问之后只答地名时 decisions 的置信度常不到 0.6：第一句（没地点）照旧退回小模型自选，第二句（答了地点）信 hass_set_state。"""
+    rec = _after_first_call(["把灯全关了", "甲地"], [[_light_call("light.a2")], _text_reply("甲地的灯都关了。")], conf=0.4)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3"]
+    assert rec["auto"] == [0, 3] and rec["commentary"] == "甲地的灯都关了。"
 
 
 def test_fan_out_only_in_the_first_round():
