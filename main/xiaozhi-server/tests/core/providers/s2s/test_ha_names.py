@@ -282,8 +282,25 @@ _NAMED = ("下面是我家智能设备列表（位置，设备名，entity_id）
           "甲地1号,灯,light.a6\n甲地1号,台灯带,light.a7\n老家卧室,卧室灯,light.b1\n老家客厅,客厅吸顶灯,light.b2\n丙地,Pro灯,light.c1\n")
 
 
-def _named(said: str, entity_id: str = "light.a1", es: list | None = None, prompt: str = _NAMED) -> list[str]:
-    return H.named_devices(prompt, said, entity_id, entries() if es is None else es)
+def _named(said: str, entity_id: str = "light.a1", es: list | None = None, prompt: str = _NAMED, query: bool = False) -> list[str]:
+    """动作相同的句子（或者不展开的）：返回设备，不回问。"""
+    targets, question, differ = H.named_devices(prompt, said, entity_id, entries() if es is None else es, query)
+    assert question is None and not differ, said
+    return targets
+
+
+def _named_differ(said: str, entity_id: str = "light.a1", prompt: str = _NAMED) -> list[str]:
+    """每台动作不同的句子：返回设备。"""
+    targets, question, differ = H.named_devices(prompt, said, entity_id, entries())
+    assert question is None and differ, said
+    return targets
+
+
+def _named_ask(said: str, prompt: str = _NAMED, query: bool = False, asked: str = "") -> str:
+    """定不了是哪一处的句子：不控制设备，返回回问。"""
+    targets, question, differ = H.named_devices(prompt, said, "light.a1", entries(), query, asked)
+    assert targets == [] and question and question.startswith("没有执行") and not differ, said
+    return question
 
 
 def test_named_devices_lists_the_devices_said_in_full():
@@ -311,11 +328,23 @@ def test_named_devices_same_action_said_twice_or_a_clause_before_ba():
     assert _named("书房灯调到百分之三十，客厅大灯也调到百分之三十") == ["light.a1", "light.a2"]
 
 
-def test_named_devices_gives_up_on_different_actions():
-    for said in ("把书房灯关了，再把客厅大灯打开", "书房灯开，客厅大灯关", "打开书房灯，关掉客厅大灯", "开书房灯关客厅大灯",
-                 "把书房灯调亮，客厅大灯调暗", "把书房灯调到三十，客厅大灯调到五十", "打开书房灯和客厅大灯，关掉卧室灯",
-                 # 动作和设备对不上的句子：提到了设备，不是都要控制
-                 "书房灯太亮了，把客厅大灯关了", "把客厅大灯调到和书房灯一样亮", "我刚关了书房灯，再把客厅大灯打开"):
+def test_named_devices_flags_different_actions():
+    for said in ("把书房灯关了，再把客厅大灯打开", "书房灯开，客厅大灯关", "打开书房灯，关掉客厅大灯", "开书房灯关客厅大灯", "把书房灯关了，打开客厅大灯",
+                 "把书房灯调亮，客厅大灯调暗", "把书房灯调到三十，客厅大灯调到五十", "把书房灯调亮一点，客厅大灯关了", "先把书房灯打开，然后把客厅大灯调到五十",
+                 "把书房灯关了，再把客厅灯打开", "把书房灯关了再打开客厅大灯"):
+        assert _named_differ(said) == ["light.a1", "light.a2"], said
+    assert _named_differ("打开书房灯和客厅大灯，关掉卧室灯") == ["light.a1", "light.a2", "light.b1"]
+    assert _named_differ("书房灯调大一点，客厅大灯调小一点") == ["light.a1", "light.a2"]
+    # 不同类可以：每台的动作各填各的
+    assert _named_differ("把书房灯打开，音箱关了") == ["light.a1", "media_player.a5"]
+    # 小模型填的不是这几台：它理解的和名字对不上，不接着做
+    assert _named("把书房灯关了，再把客厅大灯打开", "light.b1") == []
+
+
+def test_named_devices_gives_up_when_a_device_is_only_mentioned():
+    """提到了设备，不是都要控制：动作和设备对不上。话只夹在设备名中间时，动作只对后一台说的（"太亮了，打开客厅大灯"不能把书房灯也打开）。"""
+    for said in ("书房灯太亮了，把客厅大灯关了", "书房灯太亮了，打开客厅大灯", "把客厅大灯调到和书房灯一样亮", "我刚关了书房灯，再把客厅大灯打开",
+                 "书房灯开着，把客厅大灯关了", "书房灯亮着，把客厅大灯关了", "书房灯太亮了，把客厅灯关了"):
         assert _named(said) == [], said
 
 
@@ -328,10 +357,118 @@ def test_named_devices_gives_up_on_except_negative_or_question_words():
         assert _named(said) == [], said
 
 
-def test_named_devices_fragments_are_not_names():
-    # 两处都有客厅，"客厅灯""客厅的灯"不算点名（只有一个完整的名字）；一个都没点也不算
-    for said in ("把书房灯和客厅灯关了", "把书房灯和客厅的灯关了", "把书房灯关了", "都这么晚了，把书房灯关了", "把甲地的灯都关了", "把灯关了", "", None):
+def test_named_devices_one_device_or_none():
+    for said in ("把书房灯关了", "都这么晚了，把书房灯关了", "把甲地的灯都关了", "把灯关了", "把客厅灯关了", "把客厅的灯都关了", "", None):
         assert _named(said) == [], said
+
+
+# 甲地、老家都有客厅和卧室，厨房只有老家有
+_HOUSES = _NAMED + "甲地卧室,卧室顶灯,light.a8\n老家厨房,烟机灯,light.b4\n"
+
+
+def test_named_devices_partial_names_take_the_place_from_the_same_sentence():
+    """"客厅灯""书房和客厅的灯"不是完整的名字，两处都有客厅：同一句里完整名字的设备在哪一处就是哪一处。"""
+    for said in ("把书房灯和客厅灯关了", "把书房灯和客厅的灯关了", "把书房和客厅的灯关了", "把书房的灯和客厅的灯关了", "书房、客厅的灯都关了",
+                 "帮我关一下书房和客厅的灯", "把书房灯和客厅里的灯关了", "能不能把书房和客厅的灯关了", "把书房灯关了，客厅的也关了", "把书房灯关了，客厅灯也关了",
+                 "把书房灯和客厅灯关了，我要睡了", "我要睡了，关掉书房和客厅的灯", "把书房灯和客厅灯关了，把窗帘拉上", "把书房和客厅的灯调到百分之三十",
+                 "可以把书房和客厅的灯关了吗", "把书房和客厅的灯关了好吗", "把书房灯和客厅灯关一下好不好", "把书房和客厅的灯亮度调到五十", "把书房和客厅的灯调暗一点儿",
+                 "把书房和客厅的灯开开"):
+        assert _named(said, prompt=_HOUSES) == ["light.a1", "light.a2"], said
+    assert _named("把客厅灯和书房灯打开", prompt=_HOUSES) == ["light.a2", "light.a1"]
+    assert _named("把客厅和书房的灯打开", prompt=_HOUSES) == ["light.a2", "light.a1"]
+    # 完整的名字定地点：老家的灯带着客厅去老家；"卧室灯"这样的名字别处也可能这么叫，也跟着走
+    assert _named("把客厅灯和卧室吸顶灯关了", prompt=_HOUSES + "老家卧室,卧室吸顶灯,light.b5\n") == ["light.b2", "light.b5"]
+    assert _named("把卧室灯和客厅大灯关了", prompt=_HOUSES) == ["light.a8", "light.a2"]
+    # 片段只有一处对得上所有说法：厨房只有老家有
+    assert _named("把客厅和厨房的灯关了", prompt=_HOUSES) == ["light.b2", "light.b4"]
+    # 灯名字的片段：说了地点就在那里找；"台灯"有完整名字就是它，不算"甲牌台灯"
+    assert _named("把大灯和书房灯关了", prompt=_HOUSES) == ["light.a2", "light.a1"]
+    assert _named("把吸顶灯和厨房灯关了", prompt=_HOUSES) == ["light.b2", "light.b4"]
+    assert _named("把书房灯和台灯关了", prompt=_HOUSES) == ["light.a1", "light.a3"]
+    # 小模型填的不算数：它可能填到另一处的客厅
+    assert _named("把书房灯和客厅灯关了", "light.b2", prompt=_HOUSES) == ["light.a1", "light.a2"]
+    # 同一个房间里不是灯的设备不算
+    assert _named("把书房灯和客厅灯关了", prompt=_HOUSES + "甲地客厅,音箱,media_player.a9\n") == ["light.a1", "light.a2"]
+
+
+def test_named_devices_partial_names_with_the_place_said():
+    for said in ("把老家的客厅和卧室的灯关了", "把老家的客厅灯和卧室灯关了", "把客厅和卧室的灯关了，老家的", "把老家客厅和老家卧室的灯关了"):
+        assert _named(said, prompt=_HOUSES) == ["light.b2", "light.b1"], said
+    assert _named("把甲地的客厅灯和卧室灯关了", prompt=_HOUSES) == ["light.a2", "light.a8"]
+    # 各说各的地点
+    assert _named("把甲地的客厅灯和老家的客厅灯关了", prompt=_HOUSES) == ["light.a2", "light.b2"]
+    assert _named("把书房灯和老家的客厅灯关了", prompt=_HOUSES) == ["light.a1", "light.b2"]
+
+
+def test_named_devices_asks_when_the_place_cannot_be_settled():
+    # 两处都对得上，同一句里没有别的线索：不能跨房子猜
+    for said in ("把客厅和卧室的灯关了", "把客厅灯和卧室灯关了", "把卧室灯和客厅灯都关了", "把客厅的灯和卧室的灯打开", "把客厅灯关了，再把卧室灯打开"):
+        msg = _named_ask(said, prompt=_HOUSES)
+        assert "甲地楼下1号" in msg and "乙地老家" in msg and "问用户要控制哪一处，还是都控制" in msg, said
+    # 片段不跨房子：完整的名字可以不在一处（见上），片段只认同一处
+    for said in ("把书房灯和厨房灯关了", "把书房和厨房的灯关了", "把甲牌台灯和厨房灯关了"):
+        msg = _named_ask(said, prompt=_HOUSES)
+        assert "甲地楼下1号" in msg and "乙地老家" in msg, said
+    # 说的地点没有这台：不能关到别处去
+    for said in ("把老家的书房灯和客厅大灯关了", "把老家的卧室灯和客厅大灯关了", "把甲地的厨房灯和书房灯关了", "把老家的客厅灯和书房灯关了"):
+        assert _named_ask(said, prompt=_HOUSES), said
+    # 两处都对得上时，不能各取一盏完整名字对得上的
+    swap = "甲地卧室,卧室灯,light.x1\n老家卧室,卧室顶灯,light.x2\n老家客厅,客厅灯,light.x3\n甲地客厅,客厅主灯,light.x4\n"
+    assert _named_ask("把卧室灯和客厅灯关了", prompt=swap)
+    # 同一处有好几盏对得上，也不替用户挑
+    many = "甲地客厅,主灯,light.x1\n甲地客厅,射灯,light.x2\n甲地书房,书房灯,light.x3\n"
+    assert "主灯、射灯" in _named_ask("把书房灯和客厅灯关了", prompt=many)
+    # 查询问的是查哪一处
+    assert "问用户要查哪一处，还是都查" in _named_ask("客厅和卧室的灯开着吗", prompt=_HOUSES, query=True)
+
+
+def test_named_devices_answer_after_asking():
+    def answer(said: str, query: bool = False, asked: str = "把客厅和卧室的灯关了"):
+        return H.named_devices(_HOUSES, said, "light.b2", entries(), query, asked)
+
+    assert answer("甲地的") == (["light.a2", "light.a8"], None, False)
+    assert answer("老家") == (["light.b2", "light.b1"], None, False)
+    assert answer("甲地的客厅灯和卧室灯") == (["light.a2", "light.a8"], None, False)    # 自己说全了
+    assert answer("都关") == (["light.a2", "light.b2", "light.b1", "light.a8"], None, False)
+    assert answer("两边都关了吧") == (["light.a2", "light.b2", "light.b1", "light.a8"], None, False)
+    # 答的地方只有其中一盏：控制那一盏；一盏都没有、没答上来（或者转写还没到）、那里还是有好几盏对得上：再问
+    assert answer("甲地的", asked="把书房灯和厨房灯关了") == (["light.a1"], None, False)
+    many = _HOUSES + "老家客厅,客厅筒灯,light.b6\n"
+    assert H.named_devices(many, "老家", "light.b2", entries(), False, "把客厅和卧室的灯关了")[1].startswith("没有执行")
+    assert H.named_devices(many, "甲地", "light.b2", entries(), False, "把客厅和卧室的灯关了")[0] == ["light.a2", "light.a8"]
+    assert "light.b6" in H.named_devices(many, "都关", "light.b2", entries(), False, "把客厅和卧室的灯关了")[0]
+    for said in ("嗯", "第一个", "", None):
+        assert _named_ask(said, prompt=_HOUSES, asked="把客厅和卧室的灯关了"), said
+    # 点了设备：照小模型的；不要了：不展开。问的是查询也一样，这时"不"不是在问状态
+    for said in ("就卧室灯吧", "书房灯", "厨房的", "就书房那个", "不用了", "算了"):
+        assert answer(said) == ([], None, False), said
+        assert answer(said, True, "客厅和卧室的灯开着吗") == ([], None, False), said
+    # 问完换了个查询：这句自己算
+    assert answer("书房灯和客厅大灯开着吗", True) == (["light.a1", "light.a2"], None, False)
+    # 问的那句动作不同、是查询
+    assert answer("老家", asked="把客厅灯关了，再把卧室灯打开") == (["light.b2", "light.b1"], None, True)
+    assert answer("甲地的", True, "客厅和卧室的灯开着吗") == (["light.a2", "light.a8"], None, False)
+    assert answer("都看看", True, "客厅和卧室的灯开着吗")[0] == ["light.a2", "light.b2", "light.b1", "light.a8"]
+
+
+def test_named_devices_room_words_that_do_not_count():
+    """房间词在别的话里（"我在客厅"）、说的是别的设备（"客厅的窗帘"）、前面还有别的词（"卧室大灯""小台灯"）、有否定：不展开，也不回问。"""
+    for said in ("我在客厅，把书房灯关了", "客厅太暗了，开一下书房灯", "到客厅了，把书房灯关了", "回客厅之前把书房灯关了", "把书房灯和客厅的窗帘关了",
+                 "把书房和客厅的窗帘关了", "把书房灯和窗帘关了", "把书房和客厅关了", "把卧室大灯和书房灯关了", "把小台灯和书房灯关了",
+                 "除了书房灯，把客厅灯关了", "把书房灯和客厅灯关了，卧室灯不用关", "不要关书房灯，把客厅灯关了", "把书房灯和客厅灯关了吗",
+                 "把书房灯和客厅灯修一下"):
+        assert _named(said, prompt=_HOUSES) == [], said
+
+
+def test_named_devices_query():
+    for said in ("书房灯和客厅大灯开着吗", "书房灯和客厅大灯都关了吗", "书房灯和客厅大灯是不是都关了", "书房灯和客厅大灯的亮度是多少", "查一下书房灯和客厅大灯的状态",
+                 "书房灯和客厅灯开着吗", "书房和客厅的灯都关了吗"):
+        assert _named(said, query=True, prompt=_HOUSES) == ["light.a1", "light.a2"], said
+    # 只读：不管小模型填的是谁、同不同类
+    assert _named("书房灯和客厅大灯开着吗", "light.b1", query=True) == ["light.a1", "light.a2"]
+    assert _named("书房灯和音箱开着吗", query=True) == ["light.a1", "media_player.a5"]
+    for said in ("书房灯开着吗", "除了书房灯，客厅大灯和卧室灯开着吗", "别管书房灯，客厅大灯和卧室灯开着吗"):
+        assert _named(said, query=True) == [], said
 
 
 def test_named_devices_checks_the_place_the_user_said():
@@ -340,13 +477,11 @@ def test_named_devices_checks_the_place_the_user_said():
     assert _named("把甲地书房的书房灯和甲地客厅的客厅大灯关了") == ["light.a1", "light.a2"]
     assert _named("都这么晚了，把甲地的书房灯和客厅大灯关了") == ["light.a1", "light.a2"]
     assert _named("把甲地的书房灯和老家的卧室灯关了") == ["light.a1", "light.b1"]
-    # 说的地点没有这台：老家的客厅灯不叫这个名字，不能关到甲地去
-    assert _named("把老家的书房灯和客厅大灯关了", "light.b1") == []
-    assert _named("把老家的卧室灯和客厅大灯关了", "light.b1") == []
-    # 名字重名：说了地点能分开，没说就不展开
+    # 名字重名：说了地点、或者同一句里别的设备能分开，分不开就回问
     two = _NAMED + "老家书房,书房灯,light.b3\n"
-    assert _named("把书房灯和客厅大灯关了", prompt=two) == []
     assert _named("把甲地的书房灯和客厅大灯关了", prompt=two) == ["light.a1", "light.a2"]
+    assert _named("把书房灯和客厅大灯关了", prompt=two) == ["light.a1", "light.a2"]
+    assert _named_ask("把书房灯和客厅灯关了", prompt=two)
     # 设备名里带地点词不算用户说了地点：只说设备名，别处的同样要控制
     placed = "甲地书房,书房灯,light.a1\n乙地门口,乙地门灯,light.b1\n"
     assert _named("把书房灯和乙地门灯关了", prompt=placed) == ["light.a1", "light.b1"]
@@ -363,7 +498,8 @@ def test_named_devices_needs_the_filled_device_and_the_same_kind():
 def test_named_devices_without_the_lists():
     # 名单没取到：认不出地点，这一条不查，别的照查；提示词里没有设备列表就不展开
     assert _named("把书房灯和客厅大灯关了", es=[]) == ["light.a1", "light.a2"]
-    assert _named("把书房灯关了，再把客厅大灯打开", es=[]) == []
+    assert H.named_devices(_NAMED, "把书房灯关了，再把客厅大灯打开", "light.a1", []) == (["light.a1", "light.a2"], None, True)
+    assert _named("把书房灯和客厅灯关了", es=[]) == []                  # 不完整的说法要靠名单认地点
     assert _named("把书房灯和客厅大灯关了", prompt="你是小智") == []
 
 

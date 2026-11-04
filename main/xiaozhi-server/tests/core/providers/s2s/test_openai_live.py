@@ -1310,7 +1310,7 @@ def _light_call(entity: str, call_id: str = "c0", state: str = "turn_off", name:
 
 
 def _after_first_call(said: str | list[str], auto_rounds: list, first: dict | list | None = None, tool: str = "hass_set_state",
-                      history: list | None = None, conf: float = 0.95) -> dict:
+                      history: list | None = None, conf: float | list = 0.95, prompt: str = _LIGHTS_PROMPT) -> dict:
     """用户说 said（列表是一句一次委托），decisions 选 tool、强制填参填 first（默认只填甲地书房灯一个）；之后小模型每次自选按 auto_rounds
     依次回（多要一次会报错）。返回最后交回 Live 的话、依次执行的调用、小模型每次自选时看到的工具结果数。名单和设备列表用虚构的甲地、老家。"""
     from tests.core.providers.s2s.test_ha_names import entries
@@ -1320,7 +1320,7 @@ def _after_first_call(said: str | list[str], auto_rounds: list, first: dict | li
         rounds = list(auto_rounds)
 
         async def fake_dec(ctx, tools):
-            return tool, conf
+            return tool, conf.pop(0) if isinstance(conf, list) else conf
 
         async def fake_resp(items, tools, force=None):
             if force:
@@ -1332,7 +1332,7 @@ def _after_first_call(said: str | list[str], auto_rounds: list, first: dict | li
         p._tool_list = lambda: [{"type": "function", "name": tool, "description": "设置设备状态",
                                  "parameters": {"type": "object", "properties": {"entity_id": {"type": "string"}, "state": {"type": "object"}}}}]
         p._ha_entries = entries()
-        conn.prompt = _LIGHTS_PROMPT
+        conn.prompt = prompt
         p.history += history or []
         p._guard_mark = len(p.history)
         for n, s in enumerate([said] if isinstance(said, str) else said):
@@ -1519,9 +1519,9 @@ def test_named_lights_as_the_answer_to_which_place():
 
 
 def test_no_named_fan_out_when_unsure():
-    """动作不同、提到设备但不是都要控制、片段不算名字、有否定的词、单盏带"都"：还是小模型填的那一个、直接交回，不多走一轮。"""
-    for said in ("把书房灯关了，再把客厅大灯打开", "把书房灯调到三十，客厅大灯调到五十", "书房灯太亮了，把客厅大灯关了",
-                 "把书房灯和客厅灯关了", "书房灯不关，客厅大灯关了", "都这么晚了，把书房灯关了"):
+    """动作不同、提到设备但不是都要控制、有否定的词、单盏带"都"、只说一盏不完整的：还是小模型填的那一个、直接交回，不多走一轮。"""
+    for said in ("把书房灯关了，再把客厅大灯打开", "把书房灯调到三十，客厅大灯调到五十",
+                 "书房灯太亮了，把客厅大灯关了", "书房灯太亮了，打开客厅大灯", "书房灯不关，客厅大灯关了", "都这么晚了，把书房灯关了", "把客厅灯关了"):
         rec = _after_first_call(said, [])
         assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"] and rec["auto"] == [], said
         assert rec["commentary"].startswith("已调用 hass_set_state"), said
@@ -1533,8 +1533,104 @@ def test_no_named_fan_out_when_the_filled_light_is_not_named():
     assert [c["entity_id"] for c in rec["calls"]] == ["light.b1"] and rec["auto"] == []
 
 
-def test_no_named_fan_out_for_queries():
-    """查状态的工具不展开：这里只管控制。"""
-    rec = _after_first_call("书房灯和客厅大灯的亮度是多少", [], first={"type": "function_call", "call_id": "c0", "name": "hass_get_state",
-                                                            "arguments": json.dumps({"entity_id": "light.a1"})}, tool="hass_get_state")
+# 甲地、老家都有客厅和卧室
+_HOUSES_PROMPT = _LIGHTS_PROMPT + "老家客厅,客厅吸顶灯,light.b2\n甲地卧室,卧室顶灯,light.a4\n"
+
+
+def _get_call(entity: str = "light.a1", call_id: str = "c0") -> dict:
+    return {"type": "function_call", "call_id": call_id, "name": "hass_get_state", "arguments": json.dumps({"entity_id": entity})}
+
+
+def test_partial_names_fan_out_in_the_place_of_the_named_light():
+    """"把书房和客厅的灯关了"：两处都有客厅，书房灯在甲地就是甲地的客厅。小模型把第一盏填到老家的客厅也不算数。"""
+    for said in ("把书房和客厅的灯关了", "把书房灯和客厅灯关了"):
+        rec = _after_first_call(said, [_text_reply("都关了。")], prompt=_HOUSES_PROMPT)
+        assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2"] and rec["auto"] == [2], said
+        assert rec["commentary"] == "都关了。"
+    rec = _after_first_call("把客厅灯和书房灯关了", [_text_reply("都关了。")], first=_light_call("light.b2"), prompt=_HOUSES_PROMPT)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a2", "light.a1"]
+    assert all(c["state"] == {"type": "turn_off"} for c in rec["calls"])
+    # 说了地点就在那里
+    rec = _after_first_call("把老家的客厅和卧室的灯关了", [_text_reply("都关了。")], prompt=_HOUSES_PROMPT)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.b2", "light.b1"]
+
+
+def test_partial_names_without_a_place_ask_and_run_nothing():
+    """"把客厅和卧室的灯关了"：同一句里定不了是哪一处，什么都不执行，回问交给 Live；小模型自己一轮出了几盏也不执行。"""
+    rec = _after_first_call("把客厅和卧室的灯关了", [], prompt=_HOUSES_PROMPT)
+    assert rec["calls"] == [] and rec["auto"] == []
+    assert "没有执行" in rec["commentary"] and "甲地楼下1号、乙地老家" in rec["commentary"] and "问用户要控制哪一处" in rec["commentary"]
+    two = [_light_call("light.a2", "c0"), _light_call("light.b2", "c1")]
+    rec = _after_first_call("把客厅和卧室的灯关了", [_text_reply("是哪一处的灯？")], first=two, prompt=_HOUSES_PROMPT)
+    assert rec["calls"] == [] and rec["auto"] == [2] and rec["commentary"] == "是哪一处的灯？"
+    # 小模型一轮里混了查询也一样
+    rec = _after_first_call("把客厅和卧室的灯关了", [_text_reply("是哪一处的灯？")], first=[_light_call("light.a2", "c0"), _get_call("light.b2", "c1")],
+                            prompt=_HOUSES_PROMPT)
+    assert rec["calls"] == []
+
+
+def test_answer_after_asking_which_place_controls_those_lights():
+    said = "把客厅和卧室的灯关了"
+    rec = _after_first_call([said, "甲地的"], [_text_reply("都关了。")], prompt=_HOUSES_PROMPT)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a2", "light.a4"] and rec["commentary"] == "都关了。"
+    rec = _after_first_call([said, "老家"], [_text_reply("都关了。")], prompt=_HOUSES_PROMPT)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.b2", "light.b1"]
+    # "都关"说的是这几盏，不是所有的灯（不走全部的回问）
+    rec = _after_first_call([said, "都关"], [_text_reply("都关了。")], prompt=_HOUSES_PROMPT)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a2", "light.b2", "light.b1", "light.a4"]
+    # 没答上来：再问，什么都不执行，接着答地点还能接上
+    rec = _after_first_call([said, "嗯"], [], prompt=_HOUSES_PROMPT)
+    assert rec["calls"] == [] and "没有执行" in rec["commentary"]
+    rec = _after_first_call([said, "嗯", "甲地的"], [_text_reply("都关了。")], prompt=_HOUSES_PROMPT)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a2", "light.a4"]
+    # 点了设备：照小模型填的执行一个
+    rec = _after_first_call([said, "书房灯"], [], prompt=_HOUSES_PROMPT)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"] and "没有执行" not in rec["commentary"]
+
+
+def test_asking_which_place_only_counts_for_the_next_delegation():
+    rec = _after_first_call(["把客厅和卧室的灯关了", "书房灯", "甲地的"], [], prompt=_HOUSES_PROMPT)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a1"]
+
+
+def test_asking_again_keeps_the_sentence_being_asked_about():
+    """换了句话又定不了：答的是新的这句（打开），不是原来那句。"""
+    rec = _after_first_call(["把客厅灯和卧室灯关了", "把卧室灯和客厅灯打开", "老家"], [_text_reply("都开了。")], prompt=_HOUSES_PROMPT)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.b1", "light.b2"]
+    # 没答上来再问一遍时还记着原来那句
+    rec = _after_first_call(["把卧室灯和客厅灯关了", "嗯", "老家"], [_text_reply("都关了。")], prompt=_HOUSES_PROMPT)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.b1", "light.b2"]
+
+
+def test_low_confidence_is_trusted_for_named_lights_and_their_answer():
+    """会点名展开的句子和回问之后的答复：decisions 选了 hass_set_state，置信度低也用它，不退回小模型自选。"""
+    rec = _after_first_call("把书房和客厅的灯关了", [_text_reply("都关了。")], conf=0.4, prompt=_HOUSES_PROMPT)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2"] and rec["auto"] == [2]
+    rec = _after_first_call(["把客厅和卧室的灯关了", "甲地"], [_text_reply("都关了。")], conf=0.4, prompt=_HOUSES_PROMPT)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a2", "light.a4"]
+    # 查询答地点同样信
+    rec = _after_first_call(["客厅和卧室的灯开着吗", "甲地"], [_text_reply("都开着。")], first=_get_call(), tool="hass_get_state", conf=[0.95, 0.4],
+                            prompt=_HOUSES_PROMPT)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a2", "light.a4"]
+    # 问完说"不用了"：不信，退回小模型自选
+    rec = _after_first_call(["把客厅和卧室的灯关了", "不用了"], [_text_reply("好的。")], conf=[0.95, 0.4], prompt=_HOUSES_PROMPT)
+    assert rec["calls"] == [] and rec["commentary"] == "好的。"
+
+
+def test_named_query_reads_each_light():
+    """"书房灯和客厅大灯开着吗"：一盏一个查询，结果交给小模型总结。"""
+    for said in ("书房灯和客厅大灯开着吗", "书房灯和客厅大灯都关了吗", "书房和客厅的灯开着吗"):
+        rec = _after_first_call(said, [_text_reply("书房灯开着，客厅大灯关着。")], first=_get_call(), tool="hass_get_state", prompt=_HOUSES_PROMPT)
+        assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2"] and rec["auto"] == [2], said
+        assert rec["commentary"] == "书房灯开着，客厅大灯关着。"
+
+
+def test_named_query_without_a_place_asks():
+    rec = _after_first_call("客厅和卧室的灯开着吗", [], first=_get_call(), tool="hass_get_state", prompt=_HOUSES_PROMPT)
+    assert rec["calls"] == [] and rec["auto"] == [] and "问用户要查哪一处" in rec["commentary"]
+
+
+def test_single_query_still_goes_straight_to_live():
+    rec = _after_first_call("书房灯开着吗", [], first=_get_call(), tool="hass_get_state")
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"] and rec["auto"] == []
+    assert rec["commentary"].startswith("已调用 hass_get_state")

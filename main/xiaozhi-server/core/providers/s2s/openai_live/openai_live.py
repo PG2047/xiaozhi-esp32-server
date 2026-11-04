@@ -39,6 +39,7 @@ from core.providers.s2s.tools import ToolRunner, to_realtime_tools
 
 TAG = __name__
 
+_HASS_LIST_TOOLS = ("hass_set_state", "hass_get_state")   # 按智能设备列表的 entity_id 控制 / 查询的工具
 LIVE_RATE = 16000       # 上下行都用 16 kHz（Live 支持 16 k / 24 k）
 WAKE_TRIGGER = "嘿，你好呀"
 TTS_RATE = 24000        # /v1/audio/speech 的 pcm 是 24 kHz 16-bit 单声道
@@ -136,6 +137,7 @@ class S2SProvider(S2SProviderBase):
         self._guard_mark = 0          # 上次委托结束时 history 的长度：地点守卫只看这之后用户说的话
         self._ha_asked: set[str] = set()   # 上一次委托回问时列的设备
         self._all_asked = False            # 上一次委托问过"全部"是哪一处（见 _fan_out_all）
+        self._named_asked = ""             # 上一次委托问过是哪一处的那句话（见 _fan_out_named）
         self.history: list[tuple[str, str]] = []
         self._session_sig = None
         self._calls: dict[str, asyncio.Task] = {}   # call_id → 执行中的工具
@@ -694,9 +696,9 @@ class S2SProvider(S2SProviderBase):
                     raise RuntimeError(f"HTTP {r.status}")
                 return await r.json()
 
-    async def _decide_first(self, ctx: str, items: list, tools: list, trust_set_state: bool = False):
+    async def _decide_first(self, ctx: str, items: list, tools: list, trust_hass: bool = False):
         """decisions 挑第一个工具；返回这一轮要执行的 function_call 列表，拿不准 / 不需要工具 / 出错时返回 None（退回 tool_model）。
-        trust_set_state：选了 hass_set_state 就不看置信度（见 _client_delegation）。"""
+        trust_hass：选了 hass_set_state / hass_get_state 就不看置信度（见 _client_delegation）。"""
         t0 = time.time()
         try:
             name, conf = await self._decisions_call(ctx, tools)
@@ -706,7 +708,7 @@ class S2SProvider(S2SProviderBase):
         by = {t["name"]: t for t in tools}
         ms = round(1000 * (time.time() - t0))
         low = conf is None or conf < self.decision_min_conf
-        if not name or name not in by or (low and not (trust_set_state and name == "hass_set_state")):
+        if not name or name not in by or (low and not (trust_hass and name in _HASS_LIST_TOOLS)):
             self.logger.bind(tag=TAG).info(f"Live decisions 选 {name}（置信度 {conf}）{ms} ms，退回 {self.tool_model}")
             return None
         self.logger.bind(tag=TAG).info(f"Live decisions 选 {name}（置信度 {conf}）{ms} ms")
@@ -783,23 +785,32 @@ class S2SProvider(S2SProviderBase):
         return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}",
                      arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False)) for n, e in enumerate(targets)], None
 
-    def _fan_out_named(self, calls: list, said: str) -> list:
-        """"把书房灯和客厅大灯关了"：和"全关"同一个根因，强制填参只出第一盏，结果又短，不展开就只控制到第一盏。动作用小模型填的，
-        换成用户这句话（said）点名的那几台（见 ha_names.named_devices），每台一个调用，结果交给小模型总结。点名不到两台的照旧。"""
-        if len(calls) != 1 or calls[0].get("name") != "hass_set_state":
-            return calls
+    def _fan_out_named(self, calls: list, said: str, asked: str = "") -> tuple[list, str | None]:
+        """"把书房灯和客厅大灯关了""把书房和客厅的灯关了""书房灯和客厅大灯开着吗"：和"全关"同一个根因，强制填参只出第一盏，结果又短，不展开就只到第一盏。
+        动作用小模型填的，换成用户这句话（said）点到的那几台（见 ha_names.named_devices），每台一个调用，结果交给小模型总结。点名不到两台的照旧。
+        定不了是哪一处时第二个返回值是交给 Live 的回问，这次委托的调用都不执行；asked 是上一次委托问过的那句话。"""
+        tool = calls[0].get("name") if calls else None
+        if tool not in _HASS_LIST_TOOLS:
+            return calls, None
         try:
             args = json.loads(calls[0].get("arguments") or "{}")
         except ValueError:
-            return calls
+            return calls, None
         if not isinstance(args, dict):
-            return calls
-        targets = ha_names.named_devices(self.conn.prompt, said, str(args.get("entity_id") or ""), self._ha_entries)
-        if not targets:
-            return calls
-        self.logger.bind(tag=TAG).info(f"Live 点名展开 hass_set_state：{len(targets)} 个设备")
+            return calls, None
+        targets, question, differ = ha_names.named_devices(self.conn.prompt, said, str(args.get("entity_id") or ""), self._ha_entries,
+                                                           tool == "hass_get_state", asked)
+        if question:
+            # 没答上来再问一遍时还记着原来那句；这句自己又定不了（换了句话）时记这句
+            own = ha_names.named_devices(self.conn.prompt, said, None, self._ha_entries, tool == "hass_get_state")[1]
+            self._named_asked = said if own else asked
+            self.logger.bind(tag=TAG).info(f"Live 点名回问 {tool}：{question}")
+            return calls, question
+        if not targets or differ or len(calls) > 1:     # 每台动作不同不能套同一个动作
+            return calls, None
+        self.logger.bind(tag=TAG).info(f"Live 点名展开 {tool}：{len(targets)} 个设备")
         return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}",
-                     arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False)) for n, e in enumerate(targets)]
+                     arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False)) for n, e in enumerate(targets)], None
 
     async def _client_delegation(self, did: str) -> None:
         """Live 把一件事委托出来（没有请求正文）：用最近几句对话拼出请求，小模型选工具、ToolRunner 执行，结果交回 Live 转述。"""
@@ -817,6 +828,7 @@ class S2SProvider(S2SProviderBase):
         recent = "\n".join(t for r, t in turns if r == "user")
         asked, self._ha_asked = self._ha_asked, set()
         asked_all, self._all_asked = self._all_asked, False
+        asked_named, self._named_asked = self._named_asked, ""
         intents = ha_names.device_intents(tools) if self.ha_names and self._ha_entries else {}
         answer, used, raw, ask = "", [], [], None
         # 只看最后一句：上一次委托时还没落进 history 的那句也会算进 said，它的"全关"不是这句的意思
@@ -826,6 +838,8 @@ class S2SProvider(S2SProviderBase):
             # 退回小模型自选会只填区域，HA 按区域控制的不只是灯（11-04 模拟："把乙地的灯全打开"填成 HassTurnOn {area}）
             sure = ((asked_all or ha_names.says_all(last))
                     and bool(ha_names.all_at_place(self.conn.prompt, last, recent, "light.", self._ha_entries, asked_all)[0]))
+            # 点名几台的句子同样不退回小模型自选；回问之后只答地名时可能是在答查询，动作这几条先不看
+            sure = sure or any(ha_names.named_devices(self.conn.prompt, last, None, self._ha_entries, bool(asked_named), asked_named)[:2])
             first = await self._decide_first(ctx, items, tools, sure) if self.tool_picker == "decisions" else None
             for i in range(max(1, self.tool_rounds)):
                 if i == 0 and first:
@@ -840,8 +854,10 @@ class S2SProvider(S2SProviderBase):
                     answer = text
                     break
                 if i == 0:
-                    calls, ask = self._fan_out_all(calls, last, recent, asked_all)
-                    calls = self._fan_out_named(calls, last)
+                    # 刚回问过"客厅和卧室的灯是哪一处"时答"都关"：说的是那几盏，不是所有的灯
+                    calls, ask = (calls, None) if asked_named else self._fan_out_all(calls, last, recent, asked_all)
+                    if not ask:
+                        calls, ask = self._fan_out_named(calls, last, asked_named)
                 outputs = []
                 for call in calls:
                     used.append(call.get("name"))
