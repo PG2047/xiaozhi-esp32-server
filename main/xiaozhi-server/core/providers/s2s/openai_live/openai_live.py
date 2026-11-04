@@ -694,8 +694,9 @@ class S2SProvider(S2SProviderBase):
                     raise RuntimeError(f"HTTP {r.status}")
                 return await r.json()
 
-    async def _decide_first(self, ctx: str, items: list, tools: list):
-        """decisions 挑第一个工具；返回这一轮要执行的 function_call 列表，拿不准 / 不需要工具 / 出错时返回 None（退回 tool_model）。"""
+    async def _decide_first(self, ctx: str, items: list, tools: list, trust_set_state: bool = False):
+        """decisions 挑第一个工具；返回这一轮要执行的 function_call 列表，拿不准 / 不需要工具 / 出错时返回 None（退回 tool_model）。
+        trust_set_state：选了 hass_set_state 就不看置信度（见 _client_delegation）。"""
         t0 = time.time()
         try:
             name, conf = await self._decisions_call(ctx, tools)
@@ -704,7 +705,8 @@ class S2SProvider(S2SProviderBase):
             return None
         by = {t["name"]: t for t in tools}
         ms = round(1000 * (time.time() - t0))
-        if not name or name not in by or conf is None or conf < self.decision_min_conf:
+        low = conf is None or conf < self.decision_min_conf
+        if not name or name not in by or (low and not (trust_set_state and name == "hass_set_state")):
             self.logger.bind(tag=TAG).info(f"Live decisions 选 {name}（置信度 {conf}）{ms} ms，退回 {self.tool_model}")
             return None
         self.logger.bind(tag=TAG).info(f"Live decisions 选 {name}（置信度 {conf}）{ms} ms")
@@ -817,8 +819,14 @@ class S2SProvider(S2SProviderBase):
         asked_all, self._all_asked = self._all_asked, False
         intents = ha_names.device_intents(tools) if self.ha_names and self._ha_entries else {}
         answer, used, raw, ask = "", [], [], None
+        # 只看最后一句：上一次委托时还没落进 history 的那句也会算进 said，它的"全关"不是这句的意思
+        last = said[-1] if said else ""
         try:
-            first = await self._decide_first(ctx, items, tools) if self.tool_picker == "decisions" else None
+            # 会展开成一处的灯的句子，decisions 选了 hass_set_state 就信它：展开只用小模型填的动作。置信度常不到 0.6（只答"乙地"时 0.33～0.41），
+            # 退回小模型自选会只填区域，HA 按区域控制的不只是灯（11-04 模拟："把乙地的灯全打开"填成 HassTurnOn {area}）
+            sure = ((asked_all or ha_names.says_all(last))
+                    and bool(ha_names.all_at_place(self.conn.prompt, last, recent, "light.", self._ha_entries, asked_all)[0]))
+            first = await self._decide_first(ctx, items, tools, sure) if self.tool_picker == "decisions" else None
             for i in range(max(1, self.tool_rounds)):
                 if i == 0 and first:
                     calls, out = first, []
@@ -832,9 +840,8 @@ class S2SProvider(S2SProviderBase):
                     answer = text
                     break
                 if i == 0:
-                    # 只看最后一句：上一次委托时还没落进 history 的那句也会算进 said，它的"全关"不是这句的意思
-                    calls, ask = self._fan_out_all(calls, said[-1] if said else "", recent, asked_all)
-                    calls = self._fan_out_named(calls, said[-1] if said else "")
+                    calls, ask = self._fan_out_all(calls, last, recent, asked_all)
+                    calls = self._fan_out_named(calls, last)
                 outputs = []
                 for call in calls:
                     used.append(call.get("name"))
