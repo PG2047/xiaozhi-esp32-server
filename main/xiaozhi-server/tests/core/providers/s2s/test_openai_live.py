@@ -1192,12 +1192,43 @@ def test_named_call_asks_until_user_tells_the_device_apart():
 
 
 def test_answer_with_words_not_in_names_is_not_asked_twice_and_ask_does_not_carry_over():
-    """用户答的词名单里没有（"第一个"）：还是那一批设备，不再问，照小模型选的执行。下一次新的说不清的命令照样要问。"""
+    """用户答的词名单里没有（"第一个"）：还是那一批设备，不再问，照小模型选的执行。放行一次就用掉了，接着再来一句说不清的照样要问。"""
     async def sc(lv, conn, p):
         assert "没有执行" in await _ask_round(lv, p, "把戊地的窗帘关上", "戊地1号卧室布帘", "o1")
         await _ask_round(lv, p, "第一个", "戊地1号卧室布帘", "o2")
         assert _ran(conn) == ["戊地1号卧室布帘"]
-        assert "没有执行" in await _ask_round(lv, p, "把戊地的窗帘关上", "戊地1号客厅纱帘", "o3")
+        assert "没有执行" in await _ask_round(lv, p, "再来一个", "戊地1号客厅纱帘", "o3")
+        assert _ran(conn) == ["戊地1号卧室布帘"]
+    _name_client(sc)
+
+
+def test_answer_with_device_words_is_still_judged_by_those_words():
+    """用户答了"客厅的"，小模型却选了卧室那幅：还是那一批设备，但这句话里有设备的词，不能放行。"""
+    async def sc(lv, conn, p):
+        assert "4 台" in await _ask_round(lv, p, "把戊地的窗帘关上", "戊地1号卧室布帘", "w1")
+        assert "4 台" in await _ask_round(lv, p, "客厅的", "戊地1号卧室布帘", "w2")
+        assert _ran(conn) == []
+    _name_client(sc)
+
+
+def test_repeating_the_request_after_an_unanswered_ask_asks_again():
+    """回问之后用户没答（没有委托，上次问的设备还记着），过一会儿又说了一遍：照样问，不能当成答过了。"""
+    async def sc(lv, conn, p):
+        assert "4 台" in await _ask_round(lv, p, "把戊地的窗帘关上", "戊地1号卧室布帘", "r1")
+        assert "4 台" in await _ask_round(lv, p, "把戊地的窗帘关上", "戊地1号卧室布帘", "r2")
+        assert _ran(conn) == []
+    _name_client(sc)
+
+
+def test_answer_without_device_words_reads_only_the_last_sentence():
+    """委托结束后转写才落进 history 时，下一次委托看得到上一句（带"窗帘"）：判设备词只看最后这句，"第一个"照样放行。"""
+    off = "intent__HassTurnOff"
+
+    async def sc(lv, conn, p):
+        call = {"name": off, "arguments": json.dumps({"name": "戊地1号卧室布帘"}, ensure_ascii=False)}
+        assert "4 台" in await _delegate(lv, p, "把戊地的窗帘关上", call, "l1")
+        await p._flush_input_text()
+        await _delegate(lv, p, "第一个", call, "l2")
         assert _ran(conn) == ["戊地1号卧室布帘"]
     _name_client(sc)
 

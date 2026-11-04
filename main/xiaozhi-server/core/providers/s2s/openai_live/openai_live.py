@@ -134,7 +134,7 @@ class S2SProvider(S2SProviderBase):
         self.ha_names_wait_s = float(c.get("ha_names_wait_s", 15))   # 等工具处理器初始化完（HA MCP 连上）的上限
         self._ha_entries: list[dict] = []
         self._guard_mark = 0          # 上次委托结束时 history 的长度：地点守卫只看这之后用户说的话
-        self._ha_asked: set[str] = set()   # 上一次委托回问时列的设备：这一批设备不会连着问两遍
+        self._ha_asked: set[str] = set()   # 上一次委托回问时列的设备
         self.history: list[tuple[str, str]] = []
         self._session_sig = None
         self._calls: dict[str, asyncio.Task] = {}   # call_id → 执行中的工具
@@ -739,12 +739,15 @@ class S2SProvider(S2SProviderBase):
         if blocked:
             self.logger.bind(tag=TAG).info(f"Live 区域歧义拦下 {name}：{blocked}")
             return blocked
-        # 填了 name，但用户的话分不开这台和同类的另一台：先问。和上一次问的还是同一批设备就放行：用户答的词（"第一个""靠窗那幅"）
-        # 名单里没有，小模型手边有对话上下文，再问就没完了；用户答了半截（"客厅的"）时这一批会变小，接着问剩下的
+        # 填了 name，但用户的话分不开这台和同类的另一台：先问。只放行一种情况：还是上一次问的那一批设备，用户最后这句话里也没有
+        # 这些设备的词（"第一个""靠窗那幅"，名单里没有，靠小模型手边的对话上下文，再问就没完了）。答了半截（"客厅的"）时这一批
+        # 会变小，接着问剩下的；带着设备的词却还是分不开（小模型选错了，或者上次问完没答、这次又说了一遍），也要问
         group = ha_names.name_rivals(utterance, utterance if recent is None else recent, name, tidy,
                                      self._ha_entries, self.ha_names_domains)
+        if not group:
+            return None
         names = {e["names"][0] for e in group}
-        if not group or names == asked:
+        if names == asked and not ha_names.says_device_word(utterance.rsplit("\n", 1)[-1], group):
             return None
         self._ha_asked = names
         blocked = ha_names.ask_which(group)

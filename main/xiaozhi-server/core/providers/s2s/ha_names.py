@@ -248,6 +248,12 @@ def _name_parts(e: dict) -> set[str]:
     return {x for x in parts if not x.isdigit()}
 
 
+def says_device_word(text: str, devices: Iterable[dict]) -> bool:
+    """这句话里有没有这些设备名字的片段。"""
+    t = norm(text).replace(" ", "")
+    return any(x in t for e in devices for x in _name_parts(e))
+
+
 def name_rivals(utterance: str, recent: str, tool_name: str, args: dict, entries: list[dict],
                 domains: Iterable[str] = DEFAULT_DOMAINS) -> list[dict]:
     """填了 name、只命中一台的控制调用：用户说没说清是这一台。对同 domain 的每一台别的设备，用户最近的话（recent）里

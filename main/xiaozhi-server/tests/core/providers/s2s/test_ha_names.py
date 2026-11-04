@@ -223,6 +223,14 @@ def test_name_rivals_lets_through_clear_words_all_words_and_other_calls():
     assert H.name_rivals("关了", "关了", "intent__HassTurnOff", {"name": "卧室布帘"}, one) == []   # 这类设备只有一台
 
 
+def test_says_device_word_only_for_words_in_device_names():
+    curtains = _name_entries()[:4]
+    for text in ("客厅的", "把戊地的窗帘关上", "布帘"):
+        assert H.says_device_word(text, curtains), text
+    for text in ("第一个", "靠窗那幅", "嗯", "", "调到100"):
+        assert not H.says_device_word(text, curtains), text
+
+
 def test_ask_which_lists_at_most_four_names():
     es = _name_entries()
     assert H.ask_which(es[:2]) == "没有执行：用户没说是哪一台，有 2 台对得上（戊地1号卧室布帘、戊地1号卧室纱帘）。问用户要控制哪一台。"
