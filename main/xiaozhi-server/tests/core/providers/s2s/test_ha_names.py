@@ -1,4 +1,4 @@
-"""ha_names：GetLiveContext 解析、调度用的名单、地点守卫、参数整理。地名和设备都是虚构的。
+"""ha_names：GetLiveContext 解析、调度用的名单、地点守卫、歧义检查、参数整理。地名和设备都是虚构的。
 运行：在 main/xiaozhi-server 目录下 `pytest tests/core/providers/s2s -q`。"""
 from __future__ import annotations
 
@@ -163,3 +163,68 @@ def test_area_ambiguity_lets_through_all_words_single_device_and_named_calls():
     assert H.area_ambiguity("丁地的关了", off, {"area": "丁地"}, es) is None                              # 传感器不算可控设备
     assert H.area_ambiguity("丙地风扇关了", off, {"name": "丙地风扇", "area": "丙地"}, es) is None         # 填了 name
     assert H.area_ambiguity("把乙地的风扇关了", off, {"area": "没有的区域"}, es) is None                   # HA 本来就找不到
+
+
+def _name_entries():
+    """戊地四幅窗帘（卧室 / 客厅 × 布帘 / 纱帘，布帘也叫遮光窗帘、纱帘也叫薄窗帘）、一台风扇、一台净化器、一盏灯；
+    己地一台同款风扇、一盏灯。别名里有 HA 拼的"设备名  实体名"。"""
+    here, there = ["戊地楼下1号", "戊地楼下", "1号", "戊地1号"], ["己地老家", "己地", "老家"]
+
+    def curtain(room, kind, other):
+        return {"names": [f"戊地1号{room}{kind}", f"1号{room}{kind}  窗帘电机", f"{room}{kind}", f"{room}{other}",
+                          f"戊地{room}{kind}", f"戊地{room}{other}"], "domain": "cover", "areas": here, "device_class": "curtain"}
+    return [curtain("卧室", "布帘", "遮光窗帘"), curtain("卧室", "纱帘", "薄窗帘"),
+            curtain("客厅", "布帘", "遮光窗帘"), curtain("客厅", "纱帘", "薄窗帘"),
+            {"names": ["戊地108甲牌净化风扇", "戊地甲牌风扇"], "domain": "fan", "areas": here, "device_class": None},
+            {"names": ["戊地108除醛净化器", "大净化器", "戊地除醛净化器"], "domain": "fan", "areas": here, "device_class": None},
+            {"names": ["己地甲牌净化风扇", "己地甲牌风扇"], "domain": "fan", "areas": there, "device_class": None},
+            {"names": ["戊地书房灯", "书房灯"], "domain": "light", "areas": here, "device_class": None},
+            {"names": ["己地书房灯"], "domain": "light", "areas": there, "device_class": None}]
+
+
+def _rivals(said, name, tool="intent__HassTurnOff", recent=None):
+    group = H.name_rivals(said, said if recent is None else recent, tool, {"name": name}, _name_entries())
+    return [e["names"][0] for e in group]
+
+
+def test_name_rivals_lists_devices_the_user_words_do_not_tell_apart():
+    curtains = ["戊地1号卧室布帘", "戊地1号卧室纱帘", "戊地1号客厅布帘", "戊地1号客厅纱帘"]
+    fans = ["戊地108甲牌净化风扇", "己地甲牌净化风扇"]
+    assert _rivals("把戊地的窗帘关上", "戊地1号卧室布帘") == curtains
+    # 说了一半：只剩分不开的那几台
+    assert _rivals("把戊地卧室的窗帘关上", "卧室布帘") == curtains[:2]
+    assert _rivals("把戊地的纱帘关上", "戊地1号客厅纱帘") == [curtains[1], curtains[3]]
+    # 没说地点：别处的同款也算；同处的净化器靠"风扇"分开了
+    assert _rivals("打开甲牌风扇", "戊地甲牌风扇") == fans
+    # 小模型挑错了：用户说纱帘，它填了布帘
+    assert _rivals("把客厅纱帘关上", "客厅布帘") == [curtains[2], curtains[3]]
+    # 别名里的"108"不因为"调到100"就算说清了
+    assert _rivals("把风扇调到100", "戊地108甲牌净化风扇", "fan__HassFanSetSpeed") == fans
+    # 同类只算同 domain：什么类别词都没说时，也不把风扇、灯列进来
+    assert _rivals("把戊地的关了", "戊地1号卧室布帘") == curtains
+    # HA 拼的"设备名  实体名"不算名字：只有它带"空气"，也不能靠这个词分开
+    two = [{"names": ["甲净化器", "型号X  空气净化器"], "domain": "fan", "areas": [], "device_class": None},
+           {"names": ["乙净化器"], "domain": "fan", "areas": [], "device_class": None}]
+    assert H.name_rivals("把空气净化器关了", "把空气净化器关了", "intent__HassTurnOff", {"name": "甲净化器"}, two) == two
+
+
+def test_name_rivals_lets_through_clear_words_all_words_and_other_calls():
+    for said, name in (("把戊地卧室的遮光窗帘拉上", "戊地1号卧室布帘"), ("把客厅纱帘关上", "戊地1号客厅纱帘"),
+                       ("打开大净化器", "大净化器"), ("打开戊地的甲牌风扇", "戊地甲牌风扇"), ("打开己地的风扇", "己地甲牌净化风扇"),
+                       ("把戊地的窗帘都关上", "戊地1号卧室布帘"),    # 说了"都"
+                       ("把窗帘关上", "窗帘"),                       # HA 找不到，它自己报错
+                       ("关书房灯", "戊地书房灯")):                  # 灯不归这里管
+        assert _rivals(said, name) == [], said
+    assert _rivals("", "戊地1号卧室布帘", recent="把戊地的窗帘关上") == []                 # 这一轮的转写还没到
+    assert _rivals("把它关了", "戊地1号客厅纱帘", recent="戊地客厅的纱帘开着吗\n把它关了") == []   # 前一句说过
+    area = {"area": "戊地楼下1号", "domain": ["cover"]}
+    assert H.name_rivals("把戊地的窗帘关上", "把戊地的窗帘关上", "intent__HassTurnOff", area, _name_entries()) == []   # 没填 name 归区域歧义
+    one = [e for e in _name_entries() if e["domain"] == "cover"][:1]
+    assert H.name_rivals("关了", "关了", "intent__HassTurnOff", {"name": "卧室布帘"}, one) == []   # 这类设备只有一台
+
+
+def test_ask_which_lists_at_most_four_names():
+    es = _name_entries()
+    assert H.ask_which(es[:2]) == "没有执行：用户没说是哪一台，有 2 台对得上（戊地1号卧室布帘、戊地1号卧室纱帘）。问用户要控制哪一台。"
+    assert H.ask_which(es[:5], "家里").startswith("没有执行：用户没说是哪一台，家里有 5 台对得上")
+    assert "戊地1号客厅纱帘等）" in H.ask_which(es[:5]) and "甲牌" not in H.ask_which(es[:5])
