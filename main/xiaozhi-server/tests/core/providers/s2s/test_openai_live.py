@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
+import re
+import wave
 
 import numpy as np
 import pytest
@@ -1055,7 +1058,8 @@ def test_responses_tools_sent_non_strict(monkeypatch):
 
     async def go():
         p = S2SProvider({"api_key": "k", "delegation_mode": "client", "tool_picker": "decisions", "echo_gate": False,
-                         "wake_greeting_text": ""}, FakeConn(asyncio.get_running_loop()))
+                         "wake_greeting_text": "", "tool_url": "http://gw/v1/responses", "tool_api_key": "gw"},
+                        FakeConn(asyncio.get_running_loop()))
 
         async def fake_dec(ctx, tools):
             return "intent__HassTurnOn", 0.9
@@ -1943,18 +1947,62 @@ def _plain_provider(**over):
     return S2SProvider({"api_key": "k", "echo_gate": False, "wake_greeting_text": "", **over}, conn)
 
 
-def test_responses_call_uses_tool_api_key_and_defaults_to_api_key():
+def test_responses_call_uses_tool_api_key_and_never_falls_back_to_the_live_key():
+    """OpenAI 那把 key 只给 Live 连接用：工具链路配错了要报错，不能悄悄用它。"""
+    msg = [{"role": "user", "content": "x"}]
+
     async def go():
         srv, seen = await _http_recorder({"output": []})
         try:
             url = str(srv.make_url("/v1/responses"))
-            await _plain_provider(tool_url=url, tool_api_key="gw")._responses_call([{"role": "user", "content": "x"}], [])
-            await _plain_provider(tool_url=url)._responses_call([{"role": "user", "content": "x"}], [])
-            await _plain_provider(tool_url=url, tool_api_key="")._responses_call([{"role": "user", "content": "x"}], [])
+            await _plain_provider(tool_url=url, tool_api_key="gw")._responses_call(msg, [])
+            for over in (dict(tool_url=url), dict(tool_url=url, tool_api_key=""), dict(tool_api_key="gw"), {}):
+                with pytest.raises(RuntimeError, match="tool_url"):
+                    await _plain_provider(**over)._responses_call(msg, [])
         finally:
             await srv.close()
-        assert seen == ["Bearer gw", "Bearer k", "Bearer k"]
+        assert seen == ["Bearer gw"]
     asyncio.run(go())
+
+
+def test_decisions_call_uses_tool_api_key_and_needs_its_own_url():
+    tool = [{"name": "t", "description": "d"}]
+
+    async def go():
+        srv, seen = await _http_recorder({"answers": [{"choice": "t", "confidence": 0.9}]})
+        try:
+            url = str(srv.make_url("/v1/decisions"))
+            assert await _plain_provider(decision_url=url, tool_api_key="gw")._decisions_call("ctx", tool) == ("t", 0.9)
+            for over in (dict(decision_url=url), dict(tool_api_key="gw"), {}):
+                with pytest.raises(RuntimeError, match="decision_url"):
+                    await _plain_provider(**over)._decisions_call("ctx", tool)
+        finally:
+            await srv.close()
+        assert seen == ["Bearer gw"]
+    asyncio.run(go())
+
+
+def test_only_the_live_connection_defaults_to_openai():
+    """默认地址里不能再有别的 OpenAI 接口：配漏了不会花到那把 key 上。"""
+    assert re.findall(r"https?://[^\s\"']*openai\.com", open(live_mod.__file__, encoding="utf-8").read()) == []
+
+    async def go():
+        p = _plain_provider()
+        assert p.url == "wss://api.openai.com/v1/live/sessions"
+        assert (p.tool_url, p.tool_api_key, p.decision_url, p.tts_url, p.tts_api_key) == ("", "", "", "", "")
+    asyncio.run(go())
+
+
+def test_delegation_without_tool_config_says_it_cannot_and_sends_nothing():
+    """配漏 tool_url：Live 转述"查不到"，不会有请求出去。"""
+    async def sc(lv, conn, p):
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "现在几点了"})
+        await _real_sleep(0.05)
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d1", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        said = [m for m in lv.received if m["type"] == "session.commentary.append"][0]
+        assert "查不到" in said["content"]
+    _run_client(sc)
 
 
 def _capture_body(calls):
@@ -1976,7 +2024,7 @@ def test_responses_call_limits_parallel_calls_only_when_asked():
         bodies = []
         srv = await _capture_body(bodies)()
         try:
-            p = _plain_provider(tool_url=str(srv.make_url("/v1/responses")))
+            p = _plain_provider(tool_url=str(srv.make_url("/v1/responses")), tool_api_key="gw")
             await p._responses_call([{"role": "user", "content": "x"}], [], one_call=True)
             await p._responses_call([{"role": "user", "content": "x"}], [])
         finally:
@@ -2053,14 +2101,49 @@ def test_one_call_is_off_with_the_decisions_picker():
 PHRASE_PCM = (np.ones(2400, np.int16) * 3000).tobytes()   # 100 ms @24k，够响，不会被当静音裁掉
 
 
+def _melo_reply(pcm=PHRASE_PCM, rate=24000, channels=1):
+    """Workers AI MeloTTS 的回复：base64 的 WAV 放在 result.audio。"""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return {"result": {"audio": base64.b64encode(buf.getvalue()).decode()}, "success": True, "errors": []}
+
+
+def _tts_over(srv, phrase_dir):
+    return dict(tts_url=str(srv.make_url("/ai/run")), tts_api_key="cf", phrase_dir=str(phrase_dir))
+
+
+def test_fixed_phrase_asks_cloudflare_with_its_own_key_not_the_live_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+    seen = []
+
+    async def go():
+        async def handler(request):
+            seen.append((request.path, request.headers.get("Authorization"), await request.json()))
+            return web.json_response(_melo_reply())
+        app = web.Application()
+        app.router.add_post("/{tail:.*}", handler)
+        srv = TestServer(app)
+        await srv.start_server()
+        try:
+            assert await _plain_provider(**_tts_over(srv, tmp_path))._tts_pcm("我在。", "唤醒应答")
+        finally:
+            await srv.close()
+    asyncio.run(go())
+    assert seen == [("/ai/run/@cf/myshell-ai/melotts", "Bearer cf", {"prompt": "我在。", "lang": "zh"})]
+
+
 def test_fixed_phrase_is_synthesized_once_and_read_from_file(tmp_path, monkeypatch):
     """合成一次存文件：清掉进程内缓存（相当于重启）再要，读文件、不调 TTS；换一句才再合成。"""
     monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
 
     async def go():
-        srv, seen = await _http_recorder(PHRASE_PCM)
+        srv, seen = await _http_recorder(_melo_reply())
         try:
-            over = dict(tts_url=str(srv.make_url("/v1/audio/speech")), phrase_dir=str(tmp_path / "phrases"))
+            over = _tts_over(srv, tmp_path / "phrases")
             first = await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答")
             assert first and len(seen) == 1
             live_mod._GREETING_CACHE.clear()
@@ -2077,9 +2160,9 @@ def test_fixed_phrase_file_keeps_24k_and_each_rate_resamples_from_it(tmp_path, m
     monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
 
     async def go():
-        srv, seen = await _http_recorder(PHRASE_PCM)
+        srv, seen = await _http_recorder(_melo_reply())
         try:
-            over = dict(tts_url=str(srv.make_url("/v1/audio/speech")), phrase_dir=str(tmp_path))
+            over = _tts_over(srv, tmp_path)
             low = _plain_provider(**over)
             low.speaker.sample_rate = 16000
             assert len(await low._tts_pcm("我在。", "唤醒应答")) < len(PHRASE_PCM)
@@ -2091,14 +2174,40 @@ def test_fixed_phrase_file_keeps_24k_and_each_rate_resamples_from_it(tmp_path, m
     asyncio.run(go())
 
 
-def test_fixed_phrase_tts_failure_saves_nothing_and_retries_next_time(tmp_path, monkeypatch):
-    """余额用完时 TTS 回 429：不存文件、不进缓存，充值后下一次唤醒自己补上。"""
+def test_fixed_phrase_from_44k_tts_is_stored_at_24k(tmp_path, monkeypatch):
+    """MeloTTS 回 44.1 kHz，文件仍是 24 kHz：100 ms 的声音存下来还是约 100 ms。"""
     monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+    pcm_44k = (np.ones(4410, np.int16) * 3000).tobytes()
 
     async def go():
-        srv, seen = await _http_recorder({"error": {"code": "credit_balance_exhausted"}}, status=429)
+        srv, seen = await _http_recorder(_melo_reply(pcm_44k, 44100))
         try:
-            over = dict(tts_url=str(srv.make_url("/v1/audio/speech")), phrase_dir=str(tmp_path / "phrases"))
+            p = _plain_provider(**_tts_over(srv, tmp_path))
+            p.speaker.sample_rate = 24000
+            out = await p._tts_pcm("我在。", "唤醒应答")
+            assert abs(len(out) - len(PHRASE_PCM)) <= 8 and len(seen) == 1
+        finally:
+            await srv.close()
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("status,reply", [
+    (429, {"success": False, "errors": [{"code": 3036, "message": "over quota"}]}),     # 免费额度用完
+    (200, {"success": False, "result": None}),
+    (200, {"result": {"audio": "不是 base64"}}),
+    (200, b"not json"),
+    (200, "stereo"),
+])
+def test_fixed_phrase_tts_failure_saves_nothing_and_retries_next_time(tmp_path, monkeypatch, status, reply):
+    """TTS 失败：不存文件、不进缓存，下一次唤醒自己补上。"""
+    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+    if reply == "stereo":
+        reply = _melo_reply(channels=2)
+
+    async def go():
+        srv, seen = await _http_recorder(reply, status=status)
+        try:
+            over = _tts_over(srv, tmp_path / "phrases")
             assert await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答") == b""
             assert await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答") == b""
             assert len(seen) == 2 and not (tmp_path / "phrases").exists()
@@ -2112,10 +2221,32 @@ def test_fixed_phrase_still_plays_when_the_file_cannot_be_written(tmp_path, monk
     (tmp_path / "occupied").write_text("这是文件，建不了目录")
 
     async def go():
-        srv, seen = await _http_recorder(PHRASE_PCM)
+        srv, seen = await _http_recorder(_melo_reply())
         try:
-            p = _plain_provider(tts_url=str(srv.make_url("/v1/audio/speech")), phrase_dir=str(tmp_path / "occupied" / "phrases"))
+            p = _plain_provider(**_tts_over(srv, tmp_path / "occupied" / "phrases"))
             assert await p._tts_pcm("我在。", "唤醒应答") and len(seen) == 1
         finally:
             await srv.close()
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("half", ["", "tts_url", "tts_api_key"])
+def test_fixed_phrase_without_tts_config_only_reads_the_file(tmp_path, monkeypatch, half):
+    """没配 TTS（或只配一半）：不发请求；有文件照播，没文件不播，也不进缓存，文件放上去下次就能用。"""
+    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+
+    async def go():
+        srv, seen = await _http_recorder(_melo_reply())
+        try:
+            full = _tts_over(srv, tmp_path)
+            over = {"phrase_dir": full["phrase_dir"], **({half: full[half]} if half else {})}
+            p = _plain_provider(**over)
+            p.speaker.sample_rate = 24000
+            assert await p._tts_pcm("我在。", "唤醒应答") == b""
+            with open(p._phrase_path("我在。"), "wb") as f:
+                f.write(PHRASE_PCM)
+            assert await p._tts_pcm("我在。", "唤醒应答") == PHRASE_PCM
+        finally:
+            await srv.close()
+        assert seen == []
     asyncio.run(go())
