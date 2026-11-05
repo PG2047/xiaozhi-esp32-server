@@ -80,5 +80,8 @@ class ASRProvider(ASRProviderBase):
         if not isinstance(text, str):
             logger.bind(tag=TAG).error("Cloudflare 语音识别失败：回复里没有 result.text")
             return "", file_path
-        logger.bind(tag=TAG).debug(f"语音识别耗时 {time.monotonic() - start:.3f}s")
-        return text.strip(), file_path
+        text = text.strip()
+        # 不写转写内容（识别结果另有日志）。结果为空也要留一条：不然分不清是转写没听出来，还是服务端的 VAD 根本没切出这一句
+        logger.bind(tag=TAG).info(f"Cloudflare 语音识别 {time.monotonic() - start:.2f} s，音频 {len(artifacts.pcm_bytes) / 32000:.1f} s"
+                                  + ("" if text else "，结果为空"))
+        return text, file_path
