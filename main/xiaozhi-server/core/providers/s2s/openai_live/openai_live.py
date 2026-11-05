@@ -176,6 +176,7 @@ class S2SProvider(S2SProviderBase):
         # 上一次委托问过 HA 意图是哪一处（见 _fan_out_where）。和 _all_asked 分开：答"甲地的"时灯那条路读 _all_asked，会把甲地的灯都展开了
         self._where_asked = False
         self._named_asked = ""             # 上一次委托问过是哪一处的那句话（见 ha_names.partial_names）
+        self._except_asked: set[str] = set()   # 上一次委托问过"别处控制哪一类"时不动的地点（见 ha_names.except_kind_question）
         self.history: list[tuple[str, str]] = []
         self._session_sig = None
         self._calls: dict[str, asyncio.Task] = {}   # call_id → 执行中的工具
@@ -788,11 +789,12 @@ class S2SProvider(S2SProviderBase):
         return calls or None
 
     def _check_ha_call(self, call: dict, intents: dict, utterance: str, recent: str | None = None,
-                       asked: set[str] | frozenset[str] = frozenset(), last: str = "") -> str | None:
+                       asked: set[str] | frozenset[str] = frozenset(), last: str = "",
+                       keep_out: set[str] | frozenset[str] = frozenset()) -> str | None:
         """HA 意图调用执行前：domain 误填成 device_class 的挪过去（改写 call 里的参数，后面记进对话的也是改后的）；
         用户说的地点和会命中的设备不在一处、或者没说清是哪一台 / 哪一类时，返回交给 Live 的说明、不执行。
         utterance 是上次委托之后用户说的话，recent 是小模型手边的那几句（默认同 utterance），asked 是上一次委托回问时列的设备，
-        last 是用户最后一句话。"""
+        last 是用户最后一句话，keep_out 是上一句说过不动、这句还算数的地点。"""
         name = call.get("name") or ""
         try:
             args = json.loads(call.get("arguments") or "{}")
@@ -808,7 +810,7 @@ class S2SProvider(S2SProviderBase):
         # 这句说了地点就只看这句：上一句常落在委托标记之后（交回之后 Live 才开口），它的地点不能放过这句没说的地方
         # （11-05 模拟：上文"把甲地的窗帘都关上"，这句"把乙地的风扇也都关了"，又把甲地的窗帘关了一遍）
         said_here = ha_names.mentioned_areas(last, ha_names.area_tokens(self._ha_entries))
-        blocked = ha_names.place_conflict(last if said_here else utterance, name, tidy, self._ha_entries)
+        blocked = ha_names.place_conflict(last if said_here else utterance, name, tidy, self._ha_entries, keep_out)
         if blocked:
             self.logger.bind(tag=TAG).info(f"Live 地点守卫拦下 {name}：{blocked}")
             return blocked
@@ -846,7 +848,8 @@ class S2SProvider(S2SProviderBase):
         self.logger.bind(tag=TAG).info(f"Live 设备歧义拦下 {name} {call.get('arguments')}：{blocked}")
         return blocked
 
-    def _check_set_state(self, call: dict, last: str, only: list[str] | None = None) -> str | None:
+    def _check_set_state(self, call: dict, last: str, only: list[str] | None = None,
+                         keep_out: set[str] | frozenset[str] = frozenset()) -> str | None:
         """hass_set_state 执行前：用户这句话（last）说了地点、这台设备却在别处时，返回交给小模型 / Live 的说明、不执行（见 ha_names.listed_place_conflict）。
         每一轮都查：跨房子发生在第一轮展开之后，第二轮小模型把上文那一处的灯又调了一遍。
         only 是不完整的说法定下来的那几台（见 ha_names.partial_names）：范围已经定了，只能动这几台，填到别处（另一处房子同名房间的灯）的不执行。"""
@@ -859,7 +862,7 @@ class S2SProvider(S2SProviderBase):
         if only:
             entity = args.get("entity_id")
             return None if entity in only else f"没有执行：用户这句话点到的设备是{self._named_list(only)}，不是 {entity}。"
-        blocked = ha_names.listed_place_conflict(self.conn.prompt, last, str(args.get("entity_id") or ""), self._ha_entries)
+        blocked = ha_names.listed_place_conflict(self.conn.prompt, last, str(args.get("entity_id") or ""), self._ha_entries, keep_out)
         if blocked:
             self.logger.bind(tag=TAG).info(f"Live 地点守卫拦下 hass_set_state {args.get('entity_id')}：{blocked}")
         return blocked
@@ -970,6 +973,23 @@ class S2SProvider(S2SProviderBase):
         return [*(dict(first, call_id=f"{first.get('call_id')}_{n}", arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False))
                   for n, e in enumerate(only)), *(c for c in calls if c.get("name") != "hass_set_state")], None
 
+    def _lights_after_asking(self, calls: list, last: str, keep_out: set[str]) -> list:
+        """问过"别处控制哪一类"，答了灯或者全部：小模型填的是灯、动作只有一种时，范围照设备列表定，不动的地点不算（见 ha_names.lights_except）。"""
+        if not (ha_names.says_all(last) or "灯" in last) or any(c.get("name") != "hass_set_state" for c in calls):
+            return calls
+        try:
+            filled = [json.loads(c.get("arguments") or "{}") for c in calls]
+        except ValueError:
+            return calls
+        if not all(isinstance(a, dict) for a in filled) or any(a.get("state") != filled[0].get("state") for a in filled):
+            return calls
+        targets = ha_names.lights_except(self.conn.prompt, str(filled[0].get("entity_id") or ""), self._ha_entries, keep_out)
+        if not targets:
+            return calls
+        self.logger.bind(tag=TAG).info(f"Live 答了哪一类，展开 hass_set_state：{len(targets)} 个设备")
+        return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}",
+                     arguments=json.dumps(dict(filled[0], entity_id=e), ensure_ascii=False)) for n, e in enumerate(targets)]
+
     def _will_fan_out(self, said: str, recent: str, asked: bool) -> bool:
         """这句选了灯的话 _fan_out_all 会接手（展开或回问），小模型只要给出动作。这时还不知道选的是不是灯，所以"把某地的窗帘都关了"也算：
         第一轮只出一个调用，HA 意图按区域一次就能控制全，没控制全的第二轮起不限（11-05 回归窗帘全部 48/48）。"""
@@ -998,6 +1018,7 @@ class S2SProvider(S2SProviderBase):
         asked_all, self._all_asked = self._all_asked, False
         asked_where, self._where_asked = self._where_asked, False
         asked_named, self._named_asked = self._named_asked, ""
+        asked_except, self._except_asked = self._except_asked, set()
         intents = ha_names.device_intents(tools) if self.ha_names and self._ha_entries else {}
         answer, used, raw, ask, ran = "", [], [], None, []
         # 只看最后一句：上一次委托时还没落进 history 的那句也会算进 said，它的"全关"不是这句的意思
@@ -1028,7 +1049,10 @@ class S2SProvider(S2SProviderBase):
                 resp = await self._responses_call(items, [set_state], force="hass_set_state", one_call=True)
                 first = [o for o in resp.get("output") or [] if o.get("type") == "function_call"] or None
             # 小模型自己选工具时第一轮只要一个调用：Haiku 会把一处的灯一盏盏写全（十盏约 1100 token、3.5 s），写完还是被展开替换或者被回问拦下（11-05 空跑）
-            one_call = self.tool_picker != "decisions" and self._will_fan_out(last, recent, asked_all)
+            # 说了不动哪里、没说别处哪一类：先问。答了之后不动的地点还算数（keep_out），范围照列表定，不走下面没说地点就回问的展开
+            except_ask, excluded = ha_names.except_kind_question(last, asked_except, self._ha_entries)
+            keep_out = ha_names.still_kept_out(last, asked_except, self.conn.prompt, self._ha_entries) if asked_except else set()
+            one_call = self.tool_picker != "decisions" and (bool(except_ask) or (not keep_out and self._will_fan_out(last, recent, asked_all)))
             partial_left = bool(only or question)
             # 每台动作不同时小模型可能一台一轮，多给几轮
             for i in range(max(1, self.tool_rounds) + (len(only) if differ else 0)):
@@ -1044,11 +1068,20 @@ class S2SProvider(S2SProviderBase):
                 if not calls:
                     answer = text or "\n".join(ran)
                     break
-                if i == 0:
+                if i == 0 and keep_out:
+                    calls = self._lights_after_asking(calls, last, keep_out)
+                elif i == 0:
                     # 刚回问过"客厅和卧室的灯是哪一处"时答"都关"：说的是那几盏，不是所有的灯
                     calls, ask = (calls, None) if asked_named and (only or question) else self._fan_out_all(calls, last, recent, asked_all)
                     if not ask:
                         calls, ask = self._fan_out_where(calls, last, recent, asked_where)
+                if except_ask and not ask and any(c.get("name") == "hass_set_state" or c.get("name") in intents for c in calls):
+                    ask = except_ask
+                    self._except_asked = excluded
+                    # 答"净化器""全部"时调用落在这一批里，不再问哪一台、哪一类（见 _check_ha_call）
+                    self._ha_kinds_asked |= {e["names"][0] for e in ha_names.would_switch("intent__HassTurnOff", {}, self._ha_entries)
+                                             if not e["areas"] or e["areas"][0] not in excluded}
+                    self.logger.bind(tag=TAG).info(f"Live 排除句回问：{ask}")
                 # 第一个控制灯的那一轮才算（强制填参失败时小模型自选，可能先查状态）
                 if partial_left and not ask and any(c.get("name") == "hass_set_state" or (own and c.get("name") in intents) for c in calls):
                     partial_left = False
@@ -1059,9 +1092,11 @@ class S2SProvider(S2SProviderBase):
                 outputs = []
                 for call in calls:
                     used.append(call.get("name"))
-                    blocked = ask or (self._check_ha_call(call, intents, "\n".join(said), recent, asked, last)
-                                      if call.get("name") in intents and not call.get("scoped")
-                                      else self._check_set_state(call, last, only) if call.get("name") == "hass_set_state" else None)
+                    blocked = ask or (ha_names.outside_kind_answer(last, call.get("name") == "hass_set_state")
+                                      if keep_out and (call.get("name") == "hass_set_state" or call.get("name") in intents) else None)
+                    blocked = blocked or (self._check_ha_call(call, intents, "\n".join(said), recent, asked, last, keep_out)
+                                          if call.get("name") in intents and not call.get("scoped")
+                                          else self._check_set_state(call, last, only, keep_out) if call.get("name") == "hass_set_state" else None)
                     result = blocked or await self.tools.run(call.get("name") or "", call.get("arguments") or "{}")
                     outputs.append(result)
                     ran.append(f"已调用 {call.get('name')}（参数 {call.get('arguments') or '{}'}），结果：{result[:self.direct_max_chars]}")

@@ -445,6 +445,101 @@ def test_place_conflict_reads_an_excluded_place_the_other_way_round():
     assert H.place_conflict("除了甲地除醛净化器，把乙地的都关了", off, {"name": "乙地风扇"}, es) is None
 
 
+def _kind_question(said: str | None, asked: tuple = ()):
+    return H.except_kind_question(said, asked, entries())
+
+
+def test_except_without_a_kind_is_asked():
+    for said in ("除了甲地外，别的都关了", "除了甲地都关了", "甲地除外，都关了", "除了甲地，其他的都关掉", "甲地的不用，别的都关了",
+                 "别关甲地的，其他的都打开", "除了甲地，别的关了", "除了甲地，所有的都关了"):
+        question, excluded = _kind_question(said)
+        assert question.startswith("没有执行") and "只控制灯" in question and not question.startswith(H.NOT_AN_ERROR), said
+        assert excluded == {_HERE}, said
+
+
+def test_action_words_in_a_scene_name_are_not_a_kind():
+    """场景的别名里有"打开"：不算点了设备，还是要问。"""
+    es = [*entries(), {"names": ["甲地加湿器开启", "甲地加湿器打开"], "domain": "scene", "areas": [_HERE], "device_class": None}]
+    assert H.except_kind_question("除了甲地，别的都打开", (), es)[0]
+
+
+def test_except_with_a_kind_or_a_place_is_not_asked():
+    for said in ("除了甲地，把灯都关了", "除了甲地，把净化器都关了", "把灯都关了，甲地的不用", "除了甲地，别的设备都关了",     # 说了哪一类
+                 "除了书房灯，都关了", "把灯全关了", "把甲地的灯都关了", "",                                                      # 没有不动的地点
+                 "除了甲地，关了吧",                                                                                              # 没说"都 / 别的"
+                 "把老家的都关了，甲地的不用",                                                                                    # 说了要控制的地方
+                 "除了甲地都关了吗", "除了甲地都关着呢", "除了甲地都没关", "别把甲地的都关了", "不要把甲地的都关了", None):        # 提问、说状态、光是不让动
+        assert _kind_question(said) == (None, set()), said
+
+
+def test_answer_to_the_kind_question():
+    for said in ("只关灯", "灯", "全部", "都关了吧", "所有设备", "净化器", "除醛净化器", "老家的", "算了", "不用了"):
+        assert _kind_question(said, (_HERE,)) == (None, set()), said
+    # 没答上来、还没听到这一句：再问一遍，不动的地点还记着
+    for said in ("嗯", "第一个", "好的", "", None):
+        question, excluded = _kind_question(said, (_HERE,))
+        assert question.startswith("没有执行") and excluded == {_HERE}, said
+
+
+def test_guards_remember_the_place_kept_out_by_the_previous_sentence():
+    """上一句说的不动的地点：这句没提也算（上一句不一定在"用户说的话"里）。"""
+    es, off = entries(), "intent__HassTurnOff"
+    assert H.place_conflict("净化器", off, {"name": "除醛净化器"}, es) is None
+    msg = H.place_conflict("净化器", off, {"name": "除醛净化器"}, es, {_HERE})
+    assert msg.startswith(H.NOT_AN_ERROR) and "不动甲地楼下1号" in msg
+    assert H.place_conflict("净化器", off, {"name": "乙地风扇"}, es, {_HERE}) is None
+    assert _listed_conflict("只关灯", "light.b1") is None
+    assert H.listed_place_conflict(_LIGHTS, "只关灯", "light.b1", es, {_HOME}).startswith(H.NOT_AN_ERROR)
+    assert H.listed_place_conflict(_LIGHTS, "只关灯", "light.a1", es, {_HOME}) is None
+
+
+def test_still_kept_out_after_asking():
+    es = entries()
+    for said in ("只关灯", "全部", "都关了吧", "净化器", "嗯", ""):
+        assert H.still_kept_out(said, {_HOME}, _LIGHTS, es) == {_HOME}, said
+    # 又说了地点、点了列表里的一盏：是新的一句
+    for said in ("甲地的", "老家的也关", "把卧室灯关了"):
+        assert H.still_kept_out(said, {_HOME}, _LIGHTS, es) == set(), said
+
+
+def test_outside_kind_answer():
+    # 答了哪一类：另一类不动
+    assert H.outside_kind_answer("窗帘", True).startswith(H.NOT_AN_ERROR) and H.outside_kind_answer("净化器", True)
+    assert H.outside_kind_answer("只关灯", False).startswith(H.NOT_AN_ERROR) and H.outside_kind_answer("灯", False)
+    # 这一类放行；两类都点了、全部、没点类别都放行
+    assert H.outside_kind_answer("只关灯", True) is None and H.outside_kind_answer("灯都关了", True) is None
+    assert H.outside_kind_answer("窗帘", False) is None
+    assert H.outside_kind_answer("灯和窗帘", True) is None and H.outside_kind_answer("灯和窗帘", False) is None
+    for said in ("全部", "都关了吧", "所有设备", "", None):
+        assert H.outside_kind_answer(said, True) is None and H.outside_kind_answer(said, False) is None, said
+    # 不要了：什么都不动
+    for said in ("算了", "不用了", "不用", "不要了", "那就算了吧", "先不关了", "别关了", "别动了。", "算了，"):
+        assert H.outside_kind_answer(said, True).startswith(H.NOT_AN_ERROR), said
+        assert H.outside_kind_answer(said, False).startswith(H.NOT_AN_ERROR), said
+    # 这些不是不要了
+    for said in ("只关灯，别的不用", "不用关灯，关窗帘"):
+        assert not (H.outside_kind_answer(said, True) or "").endswith("不用再调用。"), said
+
+
+def test_lights_except_goes_by_the_list():
+    es = entries()
+    assert H.lights_except(_LIGHTS, "light.a1", es, {_HOME}) == ["light.a1", "light.a2", "light.c1"]     # 位置认不出的也算
+    assert H.lights_except(_LIGHTS, "light.b1", es, {_HERE}) == ["light.b1", "light.c1"]
+    assert H.lights_except(_LIGHTS, "media_player.a3", es, {_HOME}) == ["media_player.a3"]               # 只要同类
+    assert H.lights_except("你是小智", "light.a1", es, {_HOME}) == []
+
+
+def test_excluded_place_is_not_taken_as_the_place_of_a_later_sentence():
+    """上一句"除了老家"，这句"都关了吧"：不能把老家当成要控制的地方。"""
+    es = entries()
+    targets, question = H.all_at_place(_LIGHTS, "都关了吧", "除了老家，把灯都关了\n都关了吧", "light.a1", es)
+    assert targets == [] and question.startswith("没有执行")
+    # 再往前说过的地点还算
+    assert _at_place("都关了吧", "把甲地的灯关了\n除了老家\n都关了吧") == ["light.a1", "light.a2"]
+    # 名单里的设备也一样：范围不算己地，这里只有戊地有这个词
+    assert H.all_named("把净化器都关了", "除了己地\n把净化器都关了", "intent__HassTurnOff", _name_entries()) == ["戊地108除醛净化器"]
+
+
 def test_name_rivals_lets_through_clear_words_all_words_and_other_calls():
     for said, name in (("把戊地卧室的遮光窗帘拉上", "戊地1号卧室布帘"), ("把客厅纱帘关上", "戊地1号客厅纱帘"),
                        ("打开大净化器", "大净化器"), ("打开戊地的甲牌风扇", "戊地甲牌风扇"), ("打开己地的风扇", "己地甲牌净化风扇"),
