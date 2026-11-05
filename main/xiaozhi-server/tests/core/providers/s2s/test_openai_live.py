@@ -61,6 +61,51 @@ def run(scenario):
     asyncio.run(go())
 
 
+def _open_with(first_events, **over):
+    """假的 Live：收到 session.start 先回 first_events，再由 p.open() 决定成败。返回 open() 抛的异常，没抛就是 None。"""
+    class Scripted(FakeLive):
+        async def handler(self, ws):
+            self.ws = ws
+            async for raw in ws:
+                if json.loads(raw)["type"] == "session.start":
+                    for ev in first_events:
+                        await ws.send(json.dumps(ev))
+
+    async def go():
+        lv = Scripted()
+        async with serve(lv.handler, "127.0.0.1", 0) as srv:
+            url = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}/v1/live/sessions"
+            conn = FakeConn(asyncio.get_running_loop())
+            p = S2SProvider({"api_key": "k", "url": url, "echo_gate": False, "idle_close_s": 0, "wake_greeting_text": "", **over}, conn)
+            conn.s2s = p
+            try:
+                await p.open()
+            except Exception as e:  # noqa: BLE001
+                return e
+            finally:
+                await p.close()
+        return None
+    return asyncio.run(go())
+
+
+def test_missing_scope_before_session_started_does_not_fail_open():
+    """只开 Live 权限的 key：先来 missing_scope（历史压缩关闭），再来 session.started（11-05 实测），会话照常。"""
+    scope = {"type": "error", "error": {"type": "invalid_request_error", "code": "missing_scope", "message": "History compaction is disabled"}}
+    assert _open_with([scope, {"type": "session.started", "session": {"id": "live_x"}}]) is None
+
+
+def test_missing_scope_without_session_started_still_fails_open():
+    """真缺 Live 权限：等不到 session.started，超时，走回退。"""
+    scope = {"type": "error", "error": {"code": "missing_scope"}}
+    assert isinstance(_open_with([scope], connect_timeout_s=0.2), asyncio.TimeoutError)
+
+
+def test_other_first_event_errors_still_fail_open_with_the_code():
+    """余额告警的探针靠这句话里的 code 判断，不能变。"""
+    err = _open_with([{"type": "error", "error": {"code": "credit_balance_exhausted"}}])
+    assert isinstance(err, RuntimeError) and str(err) == "first event error credit_balance_exhausted"
+
+
 def test_session_start_and_silence_outside_segment_is_dropped():
     async def sc(lv, conn, p):
         assert lv.received[0]["session"]["model"] == "gpt-live-1"

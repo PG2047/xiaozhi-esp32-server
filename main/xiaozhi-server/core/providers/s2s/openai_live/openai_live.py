@@ -352,6 +352,12 @@ class S2SProvider(S2SProviderBase):
                         return ws
                     if "error" in str(ev.get("type")):
                         code = (ev.get("error") or {}).get("code")
+                        # 只开 Live 权限的 key 先收到 missing_scope（没有 api.responses.write，历史压缩关闭），接着照常
+                        # session.started（11-05 实测）。会话只有几分钟用不到压缩，不值得给 key 加 Responses 权限。
+                        # 真缺 Live 权限时等不到 session.started，这里超时，open() 照样失败
+                        if code == "missing_scope":
+                            self.logger.bind(tag=TAG).info("Live 历史压缩没开（key 没有 api.responses.write），只带最近的对话")
+                            continue
                         raise RuntimeError(f"first event {ev.get('type')} {code or ''}".strip())
             except BaseException:
                 self.spawn(ws.close())

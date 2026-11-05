@@ -18,7 +18,7 @@ from config.logger import setup_logging
 from core.handle.abortHandle import handleAbortMessage
 from core.providers.s2s.openai_realtime.openai_realtime import WAKE_TRIGGER, S2SProvider
 from core.utils.dialogue import Dialogue
-from core.utils.s2s import attach_s2s
+from core.utils.s2s import attach_s2s, s2s_selected
 from plugins_func.register import Action, ActionResponse
 
 # conftest 在 mock 模式把 asyncio.sleep 换成了不让出事件循环的空函数；上游节拍器和本测试的等待都要真睡。
@@ -580,9 +580,11 @@ def test_open_fails_on_error_first_event_and_attach_falls_back():
         conn.config["S2S"] = {"OpenAIRealtime": {"type": "openai_realtime", "api_key": "k", "url": url,
                                                  "connect_timeout_s": 1, "echo_gate": False}}
         got = await asyncio.get_running_loop().run_in_executor(None, attach_s2s, conn)
-        assert got is None
+        assert got is None and conn._s2s_failed is True and s2s_selected(conn) is False
         conn.config["selected_module"]["S2S"] = ""
+        conn._s2s_failed = False
         assert await asyncio.get_running_loop().run_in_executor(None, attach_s2s, conn) is None
+        assert conn._s2s_failed is False           # 没选 S2S 不算失败
     run_scenario(sc, first_event={"type": "error", "error": {"code": "invalid_api_key"}})
 
 
@@ -592,7 +594,7 @@ def test_attach_succeeds_and_upstream_close_closes_connection():
         conn.config["S2S"] = {"OpenAIRealtime": {"type": "openai_realtime", "api_key": "k", "url": url,
                                                  "connect_timeout_s": 2, "echo_gate": False, "idle_close_s": 0}}
         p = await asyncio.get_running_loop().run_in_executor(None, attach_s2s, conn)
-        assert isinstance(p, S2SProvider)
+        assert isinstance(p, S2SProvider) and s2s_selected(conn) is True
         conn.s2s = p
         await rt.wait_for("session.update")
         p.after_components_ready()                                   # 执行器线程里的那次同步
