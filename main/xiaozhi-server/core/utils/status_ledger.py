@@ -2,7 +2,8 @@
 
 状态页的网页进程只读这个目录，碰不到 docker、登记表和原始日志，所以这里写什么，页面最多就能漏什么：
 
-    sessions.jsonl   每段 S2S 会话结束写一行：设备名、大脑、模型、开始 / 结束时间、stats（只有计数，没有转写）
+    sessions.jsonl   每条连接结束写一行：设备名、大脑、模型、开始 / 结束时间、stats（只有计数，没有转写）。
+                     S2S 由 provider 写；走级联的连接（没选 S2S，或打开失败回退）由 s2s.record_cascade_session 写，回退的带 fallback_from
     errors.jsonl     WARNING 以上的日志，写之前遮掉设备标识、删掉带用户原话的尾巴
     server.json      server 进程的启动时间
 
@@ -62,22 +63,25 @@ def scrub_message(message: str) -> str | None:
     return text[:MAX_MESSAGE_CHARS]
 
 
-def append_session(status_dir, *, device, brain, model, started_at, stats, ended_at=None) -> None:
+def append_session(status_dir, *, device, brain, model, started_at, stats, ended_at=None, fallback_from=None) -> None:
     """写一行会话记录。stats 是 provider 的计数器，只放数字和数字列表，不放转写。"""
     if not status_dir:
         return
     try:
         ended_at = ended_at if ended_at is not None else time.time()
+        row = {
+            "device": device,
+            "brain": brain,
+            "model": model,
+            "started_at": round(started_at, 3),
+            "ended_at": round(ended_at, 3),
+            "duration_s": round(ended_at - started_at, 1),
+            "stats": stats,
+        }
+        if fallback_from:
+            row["fallback_from"] = fallback_from
         line = json.dumps(
-            {
-                "device": device,
-                "brain": brain,
-                "model": model,
-                "started_at": round(started_at, 3),
-                "ended_at": round(ended_at, 3),
-                "duration_s": round(ended_at - started_at, 1),
-                "stats": stats,
-            },
+            row,
             ensure_ascii=False,
             default=str,
         )

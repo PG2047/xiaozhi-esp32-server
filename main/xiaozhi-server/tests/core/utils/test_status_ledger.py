@@ -44,6 +44,12 @@ def test_append_session_writes_one_json_line(tmp_path):
                    "ended_at": 161.26, "duration_s": 61.3, "stats": stats}
 
 
+def test_append_session_records_fallback_only_when_set(tmp_path):
+    append_session(str(tmp_path), device="d", brain="cascade", model="m", started_at=1.0, ended_at=2.0, stats={},
+                   fallback_from="openai_realtime")
+    assert json.loads((tmp_path / "sessions.jsonl").read_text(encoding="utf-8"))["fallback_from"] == "openai_realtime"
+
+
 def test_append_session_is_a_noop_without_dir_and_never_raises(tmp_path):
     append_session(None, device="d", brain="b", model="m", started_at=1.0, stats={})
     blocked = tmp_path / "file"

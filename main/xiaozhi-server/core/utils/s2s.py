@@ -5,6 +5,7 @@ import os
 import sys
 
 from config.logger import setup_logging
+from core.utils.status_ledger import append_session, is_server_process
 
 TAG = __name__
 logger = setup_logging()
@@ -125,6 +126,7 @@ def _attach_s2s(conn):
         fut.result(timeout=timeout)
     except Exception as e:  # noqa: BLE001
         conn.logger.bind(tag=TAG).warning(f"S2S {selected} 打开失败，回退原版级联: {type(e).__name__}: {e}")
+        conn._s2s_failed = True    # 先于 provider.close()：它据此不写台账，这条连接由 record_cascade_session 记一行
         if fut is not None:
             fut.cancel()  # 超时的那次 open() 可能还在跑：取消掉，别让它事后建成一个没人管的会话
         if provider is not None:
@@ -138,3 +140,40 @@ def _attach_s2s(conn):
     # 这里在执行器线程：loop.call_later 不是线程安全的，要经 call_soon_threadsafe 排进事件循环再定时
     conn.loop.call_soon_threadsafe(conn.loop.call_later, 3.0, lambda: asyncio.ensure_future(drain_pending_texts(conn)))
     return provider
+
+
+def record_cascade_session(conn) -> None:
+    """走级联的连接在关闭时记一行状态页台账（S2S 的由 provider 自己记）。
+
+    只在关闭时数一次对话历史，不碰语音路径；close() 可能走多次，只记一次。
+    stats 不用 segments / turns：monitoring-stack 的余额探针靠这两个键证明 OpenAI key 还能用，级联不用那把 key。
+    """
+    if getattr(conn, "_cascade_recorded", False) or conn.s2s is not None or s2s_selected(conn):
+        return                 # s2s_selected 为真 = 选了 S2S 但还没建成就断开了，这条连接没有对话
+    conn._cascade_recorded = True
+    try:
+        started_ms = getattr(conn, "first_activity_time", 0)
+        status_dir = (conn.config.get("log") or {}).get("status_dir")
+        if not status_dir or not started_ms or not is_server_process():
+            return
+        selected = conn.config.get("selected_module") or {}
+        messages = getattr(conn.dialogue, "dialogue", [])
+        fallback_from = None
+        if getattr(conn, "_s2s_failed", False):
+            block = (conn.config.get("S2S") or {}).get(selected.get("S2S")) or {}
+            fallback_from = block.get("type") or selected.get("S2S")
+        llm = (conn.config.get("LLM") or {}).get(selected.get("LLM")) or {}
+        append_session(
+            status_dir,
+            device=getattr(conn, "device_name", None),
+            brain="cascade",
+            model=llm.get("model_name") or selected.get("LLM"),
+            started_at=started_ms / 1000,
+            stats={
+                "replies": sum(1 for m in messages if m.role == "assistant" and m.content),
+                "input_utts": sum(1 for m in messages if m.role == "user"),
+            },
+            fallback_from=fallback_from,
+        )
+    except Exception:  # noqa: BLE001  写台账失败不能影响连接关闭
+        pass
