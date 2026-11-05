@@ -182,6 +182,8 @@ def mentioned_areas(text: str, tokens: dict[str, set[str]]) -> set[str]:
     return {k for k, toks in tokens.items() if any(x.replace(" ", "") and x.replace(" ", "") in t for x in toks)}
 
 
+# 这种说明是写给小模型看的（"别处还没控制的话接着控制"）：它接着调用或者总结，不直接念给用户
+NOT_AN_ERROR = "没有执行，这不是出错："
 # 用户明说不动的地点。前置（"除了甲地""除开甲地和乙地"）到小句结束或"都 / 别的 / 其他 / 把 / 以外"为止；
 # 后置（"甲地的不用""甲地的灯不用关""甲地除外"）；前面带否定（"别关甲地的灯""不用管甲地"）。"要不把甲地的灯关了""要不要""用不用"是在提议，不算
 _EXCLUDE_HEAD = re.compile(r"除(?:了|开|去)?(.*?)(?=[，,。；;！!？?\n]|都|全|其他|其它|别的|把|将|以外|之外|外|$)")
@@ -240,7 +242,7 @@ def place_conflict(utterance: str, tool_name: str, args: dict, entries: list[dic
     hits = [e for e in matched(tool_name, args, entries) if e["areas"]]
     kept = sorted({e["areas"][0] for e in hits} & excluded)
     if kept:
-        return f"没有执行：用户说了不动{'、'.join(kept)}，这次调用会动到那里的设备。只控制别处的，或者问清用户要控制哪些。"
+        return f"{NOT_AN_ERROR}地点检查发现用户说了不动{'、'.join(kept)}，这次调用会动到那里的设备，所以没有控制。说别处的结果就好；别处还没控制的话接着控制。"
     off = [e for e in hits if said and e["areas"][0] not in said]
     if not off:
         return None
@@ -392,12 +394,12 @@ def listed_place_conflict(prompt: str, said: str, entity_id: str, entries: list[
     at = mentioned_areas(row[0], tokens) if row else set()
     if at & excluded:
         # 只说事实：11-05 模拟里写"不要控制它，也不用提它"时，用户的话被网关遮蔽的句子，小模型两次把这段当成可疑的指令告诉用户
-        return (f"没有执行，这不是出错：地点检查发现用户说了不动{'、'.join(sorted(at & excluded))}，这台设备在{row[0]}，所以没有控制它。"
+        return (f"{NOT_AN_ERROR}地点检查发现用户说了不动{'、'.join(sorted(at & excluded))}，这台设备在{row[0]}，所以没有控制它。"
                 "说别处的结果就好；别处还没控制的话接着控制。")
     if not at or not places or at & places:
         return None
     where = "、".join(sorted(places))
-    return (f"没有执行，这不是出错：用户这句说的是{where}，这台设备在{row[0]}，这句没有要控制它，不用重做，也不用提它。"
+    return (f"{NOT_AN_ERROR}用户这句说的是{where}，这台设备在{row[0]}，这句没有要控制它，不用重做，也不用提它。"
             f"只说{where}的结果；{where}还没控制的话接着控制，或者问清是哪一台。")
 
 

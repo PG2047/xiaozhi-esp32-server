@@ -1828,10 +1828,11 @@ def test_lights_of_the_earlier_place_are_not_controlled_again_in_a_later_round()
 
 
 def test_set_state_in_another_place_is_blocked_in_the_first_round_too():
-    """没说"都"，小模型填了别处的灯：不执行，说明直接交回。一轮两个调用只拦别处的那个。"""
-    rec = _after_first_call("把老家的灯关了", [])
-    assert rec["calls"] == [] and rec["auto"] == []
-    assert rec["commentary"].startswith("已调用 hass_set_state") and "没有执行" in rec["commentary"]
+    """没说"都"，小模型填了别处的灯：不执行，说明交给它，改对了照常控制，改不了由它问用户。一轮两个调用只拦别处的那个。"""
+    rec = _after_first_call("把老家的灯关了", [[_light_call("light.b1", "c8")]])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.b1"] and rec["auto"] == [1]
+    rec = _after_first_call("把老家的灯关了", [_text_reply("老家没有这盏灯，是哪一盏？")])
+    assert rec["calls"] == [] and rec["auto"] == [1] and rec["commentary"] == "老家没有这盏灯，是哪一盏？"
     two = [_light_call("light.a1", "c0"), _light_call("light.b1", "c1")]
     rec = _after_first_call("把老家的灯关了", [_text_reply("老家的灯关了。")], first=two)
     assert [c["entity_id"] for c in rec["calls"]] == ["light.b1"] and rec["commentary"] == "老家的灯关了。"
@@ -1873,9 +1874,9 @@ def test_lights_of_an_excluded_place_are_not_controlled():
     rec = _after_first_call("除了老家，把灯都关了", [[_light_call("light.b1", "c8")], _text_reply("甲地的灯都关了，老家没动。")], first=three)
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3"]
     assert rec["commentary"] == "甲地的灯都关了，老家没动。" and rec["auto"] == [3, 4]
-    # 这次委托的第一个调用就被拦：前面没有别的结果，直接交回，让 Live 问用户
-    rec = _after_first_call("除了老家，把灯都关了", [], first=_light_call("light.b1"))
-    assert rec["calls"] == [] and rec["auto"] == [] and "不动乙地老家" in rec["commentary"]
+    # 第一个调用就被拦：小模型看到说明后改对
+    rec = _after_first_call("除了老家，把灯都关了", [[_light_call("light.a1", "c8")]], first=_light_call("light.b1"))
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"] and rec["auto"] == [1]
     rec = _after_first_call("把灯都关了，甲地的不用", [_text_reply("老家的灯关了。")], first=[_light_call("light.b1", "c0"), _light_call("light.a1", "c1")])
     assert [c["entity_id"] for c in rec["calls"]] == ["light.b1"] and rec["commentary"] == "老家的灯关了。"
 
@@ -1887,10 +1888,23 @@ def test_intents_read_an_excluded_place_the_other_way_round():
     fan, purifier = _intent_call(tool=off, name="乙地风扇"), _intent_call(tool=off, name="除醛净化器")
     rec = _after_first_call("除了甲地，把净化器和风扇都关了", [], first=fan, tool=off, props=props)
     assert rec["calls"] == [{"name": "乙地风扇"}] and "没有执行" not in rec["commentary"]
-    rec = _after_first_call("除了甲地，把净化器和风扇都关了", [], first=purifier, tool=off, props=props)
-    assert rec["calls"] == [] and "不动甲地楼下1号" in rec["commentary"]
-    rec = _after_first_call(["把甲地的净化器关了", "把风扇都关了，甲地的不用"], [], first=purifier, tool=off, props=props)
-    assert rec["calls"] == [{"name": "除醛净化器"}] and "不动甲地楼下1号" in rec["commentary"]
+    rec = _after_first_call("除了甲地，把净化器和风扇都关了", [[fan]], first=purifier, tool=off, props=props)
+    assert rec["calls"] == [{"name": "乙地风扇"}] and rec["auto"] == [1]
+    rec = _after_first_call(["把甲地的净化器关了", "把风扇都关了，甲地的不用"], [_text_reply("甲地没动，要关哪一台？")], first=purifier, tool=off, props=props)
+    assert rec["calls"] == [{"name": "除醛净化器"}] and rec["commentary"] == "甲地没动，要关哪一台？"
+
+
+def test_questions_for_live_still_go_straight_back():
+    """写给 Live 的问句（问哪一处、哪一类）照旧直接交回，不多走一轮小模型；第二轮才问的也一样。说明是写给小模型的才接着问它。"""
+    rec = _after_first_call("把灯全关了", [])
+    assert rec["calls"] == [] and rec["auto"] == [] and "问用户要控制哪一处" in rec["commentary"]
+    off = "intent__HassTurnOff"
+    props = {"name": {"type": "string"}, "area": {"type": "string"}}
+    rec = _after_first_call("把甲地的都关了", [], first=_intent_call(tool=off, area="甲地楼下1号"), tool=off, props=props)
+    assert rec["calls"] == [] and rec["auto"] == [] and "哪一类" in rec["commentary"]
+    two = [_intent_call("c0", tool=off, name="除醛净化器"), _intent_call("c1", tool=off, name="客厅纱帘")]
+    rec = _after_first_call("把甲地的都关了", [[_intent_call("c8", tool=off, area="甲地楼下1号")]], first=two, tool=off, props=props)
+    assert [c["name"] for c in rec["calls"]] == ["除醛净化器", "客厅纱帘"] and rec["auto"] == [2] and "哪一类" in rec["commentary"]
 
 
 def test_reading_state_of_another_place_is_not_blocked():
@@ -2417,7 +2431,7 @@ def test_first_round_asks_for_one_call_when_the_server_will_fan_out():
 def test_first_round_leaves_parallel_calls_alone_when_the_server_will_not_fan_out():
     """点了设备、有排除、没说"都"：服务端不接手，小模型一轮出多个调用才控制得全。"""
     assert _one_call_flags("把书房灯和小台灯都关了") == [False]
-    assert _one_call_flags("除了甲地都关了") == [False]
+    assert _one_call_flags("除了老家都关了") == [False]
     assert _one_call_flags("把书房灯关了") == [False]
     assert _one_call_flags("把甲地的灯关了") == [False]     # 没说"都"，服务端不展开，小模型自己写全才控制得到
 
