@@ -1814,6 +1814,86 @@ def test_all_words_of_the_previous_sentence_do_not_fan_out_this_one():
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3", "light.a1"]
 
 
+def test_lights_of_the_earlier_place_are_not_controlled_again_in_a_later_round():
+    """上文说老家，这句说甲地：第一轮展开甲地的灯，第二轮小模型把老家的灯又调了一遍，不执行。两个调用的那一轮接着交小模型总结，
+    上一句也在 said 里（交回之后 Live 才开口），所以只看这句话说的地点。"""
+    extra = [_light_call("light.b1", "c8"), _light_call("light.a2", "c9")]
+    rec = _after_first_call(["把老家的灯都关了", "把甲地的灯也都关了"], [extra, _text_reply("甲地的灯都关了。")])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.b1", "light.a1", "light.a2", "light.a3", "light.a2"]
+    assert rec["commentary"] == "甲地的灯都关了。"
+    # 第二轮只出一个调用：拦下来也是短结果，和前面做过的一起直接交回，说明里有两处的名字
+    rec = _after_first_call(["把老家的灯都关了", "把甲地的灯也都关了"], [[_light_call("light.b1", "c8")]])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.b1", "light.a1", "light.a2", "light.a3"]
+    assert "没有执行" in rec["commentary"] and "甲地楼下1号" in rec["commentary"] and "老家卧室" in rec["commentary"]
+
+
+def test_set_state_in_another_place_is_blocked_in_the_first_round_too():
+    """没说"都"，小模型填了别处的灯：不执行，说明直接交回。一轮两个调用只拦别处的那个。"""
+    rec = _after_first_call("把老家的灯关了", [])
+    assert rec["calls"] == [] and rec["auto"] == []
+    assert rec["commentary"].startswith("已调用 hass_set_state") and "没有执行" in rec["commentary"]
+    two = [_light_call("light.a1", "c0"), _light_call("light.b1", "c1")]
+    rec = _after_first_call("把老家的灯关了", [_text_reply("老家的灯关了。")], first=two)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.b1"] and rec["commentary"] == "老家的灯关了。"
+
+
+def test_place_of_an_earlier_sentence_does_not_block_this_one():
+    """这句没说地点、句子里有排除词：照常执行，不算跨房子。"""
+    rec = _after_first_call(["把老家的灯都关了", "把书房灯打开"], [])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.b1", "light.a1"]
+    assert "没有执行" not in rec["commentary"]
+    rec = _after_first_call("除了老家，把灯都关了", [])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"] and "没有执行" not in rec["commentary"]
+    # 说老家的是天气，要控制的是书房灯
+    rec = _after_first_call("老家今天多少度，顺便把书房灯关了", [])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"] and "没有执行" not in rec["commentary"]
+    # 问过哪一处，答了之后第二轮还想调别处的：一样拦下
+    rec = _after_first_call(["把灯全关了", "甲地的"], [[_light_call("light.b1", "c8"), _light_call("light.a1", "c9")], _text_reply("甲地的灯都关了。")])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3", "light.a1"]
+
+
+def test_place_of_the_previous_sentence_does_not_let_an_intent_through():
+    """HA 意图也一样：上一句也在 said 里（交回之后 Live 才开口），这句说了别处时，上一句的地点不放行；这句没说地点才看上一句。"""
+    off = "intent__HassTurnOff"
+    props = {"name": {"type": "string"}, "area": {"type": "string"}}
+    purifier = _intent_call(tool=off, name="除醛净化器")       # 在甲地
+    rec = _after_first_call(["把甲地的净化器关了", "把老家的风扇也关了"], [], first=purifier, tool=off, props=props)
+    assert [c["name"] for c in rec["calls"]] == ["除醛净化器"]
+    assert "没有执行" in rec["commentary"] and "不是同一个地方" in rec["commentary"]
+    rec = _after_first_call(["把老家的风扇关了", "关掉吧"], [], first=purifier, tool=off, props=props)
+    assert rec["calls"] == [] and "不是同一个地方" in rec["commentary"]
+    # 这句说的地方就是设备所在：放行
+    rec = _after_first_call(["把老家的风扇关了", "把甲地的净化器关了"], [], first=purifier, tool=off, props=props)
+    assert [c["name"] for c in rec["calls"]] == ["除醛净化器"]
+
+
+def test_reading_state_of_another_place_is_not_blocked():
+    """只读的 hass_get_state 不管。"""
+    query = {"type": "function_call", "call_id": "c0", "name": "hass_get_state", "arguments": json.dumps({"entity_id": "light.a1"})}
+    rec = _after_first_call("老家的灯开着，书房灯呢", [], first=query, tool="hass_get_state")
+    assert rec["calls"] == [{"entity_id": "light.a1"}] and "没有执行" not in rec["commentary"]
+
+
+def test_check_set_state_ignores_bad_arguments():
+    from tests.core.providers.s2s.test_ha_names import entries
+
+    async def sc(lv, conn, p):
+        conn.prompt = _LIGHTS_PROMPT
+        p._ha_entries = entries()
+        assert p._check_set_state({"arguments": "{"}, "把老家的灯关了") is None
+        assert p._check_set_state({"arguments": "[1]"}, "把老家的灯关了") is None
+        assert p._check_set_state({}, "把老家的灯关了") is None
+        assert "没有执行" in p._check_set_state({"arguments": json.dumps({"entity_id": "light.a1"})}, "把老家的灯关了")
+    _run_client(sc)
+
+
+def test_dispatch_instructions_say_earlier_turns_were_done():
+    """小模型只看得到这次委托的工具记录：不说清楚，它会以为上文没真做，把上文那一处的灯又调一遍，还"更正"说没关成。"""
+    async def sc(lv, conn, p):
+        assert "不要重做" in p._dispatch_instructions() and "除非用户最后一句要求" in p._dispatch_instructions()
+    _run_client(sc)
+
+
 def test_low_confidence_set_state_is_trusted_only_when_it_will_fan_out():
     """会展开的句子：decisions 选了 hass_set_state，置信度低也用它，不退回小模型自选（那里可能只填区域）。"""
     rec = _after_first_call("把甲地的灯全关了", [_text_reply("都关了。")], conf=0.4)
