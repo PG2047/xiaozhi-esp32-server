@@ -47,6 +47,8 @@ TTS_RATE = 24000        # /v1/audio/speech 的 pcm 是 24 kHz 16-bit 单声道
 CONTEXT_CHUNK_CHARS = 400   # session.thinking.append 每条 content 上限 500 token，中文按 400 字切
 _GREETING_CACHE: dict[tuple, bytes] = {}   # (voice, 文本, 设备采样率) → PCM，进程内共用：只有第一次唤醒要等 TTS
 _HA_CACHE: dict = {"t": 0.0, "entries": []}  # GetLiveContext 解析出的设备表，进程内各连接共用（见 _load_ha_names）；只按一个 HA 缓存
+# 调用没走完（轮数用完、中途出错）时交给 Live 的话的开头，后面跟每个调用的结果
+UNFINISHED = "工具调用到这里停了，不会接着做，可能还有没做的。下面是已经调用的，照实告诉用户做了哪些，不要说都做完了，也不要说还在继续：\n"
 # 喊停那句里不算"别的话"的词：口头的"一下 / 一点 / 下来"、称呼、客气话和语气词（见 _has_more），长的在前
 _STOP_FILLERS = ("好不好", "可以吗", "一下", "一点", "下来", "好吗", "行吗", "好的", "谢谢", "那个", "先", "你", "我", "好",
                  "吧", "啊", "呀", "呢", "嗯", "哦", "噢", "喔", "唉", "诶", "欸", "哎", "嘛", "啦", "了", "吗")
@@ -807,12 +809,41 @@ class S2SProvider(S2SProviderBase):
         self.logger.bind(tag=TAG).info(f"Live 设备歧义拦下 {name} {call.get('arguments')}：{blocked}")
         return blocked
 
+    def _fan_out_intent(self, calls: list, said: str, recent: str) -> list:
+        """"把甲地的窗帘都关上"走 HA 意图：小模型有时一幅一轮，默认 3 轮用完还没关完；有时漏了几幅还说都关了；有时只填区域，用户没点的那种
+        也动了（"把甲地的纱帘都关上"连布帘一起关），或者 device_class 填错一幅都找不到（11-04 模拟）。和灯一样：工具和动作用小模型填的，
+        设备照名单（见 ha_names.all_named），每台一个调用，结果交给小模型总结。小模型一轮出好几个调用、动作不一样的照它填的。
+        一个调用已经正好是那几台（Haiku 常只填区域，也填对了）就不拆：HA 一次控制全，也少占每分钟的调用次数。"""
+        tool = calls[0].get("name") or ""
+        intents = ha_names.device_intents(self._tool_list()) if self.ha_names and self._ha_entries else {}
+        if tool not in intents or any(c.get("name") != tool for c in calls):
+            return calls
+        try:
+            filled = [json.loads(c.get("arguments") or "{}") for c in calls]
+        except ValueError:
+            return calls
+        if not all(isinstance(a, dict) for a in filled):
+            return calls
+        actions = [{k: v for k, v in a.items() if k not in ha_names.TARGET_ARGS} for a in filled]
+        if any(a != actions[0] for a in actions):
+            return calls
+        names = ha_names.all_named(said, recent, tool, self._ha_entries, self.ha_names_domains)
+        if len(names) < 2:
+            return calls
+        if len(calls) == 1 and ha_names.hits_exactly(tool, ha_names.tidy_args(intents[tool], filled[0], self._ha_entries), names, self._ha_entries):
+            return calls
+        self.logger.bind(tag=TAG).info(f"Live 全部展开 {tool}：{len(names)} 个设备")
+        return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}",
+                     arguments=json.dumps(dict(actions[0], name=x), ensure_ascii=False)) for n, x in enumerate(names)]
+
     def _fan_out_all(self, calls: list, said: str, recent: str, asked: bool) -> tuple[list, str | None]:
         """"把甲地的灯全关了"：强制填参只出一个 hass_set_state，结果又只有几个字，不展开就只控制到第一盏。动作用小模型填的，
         换成那一处同类设备每台一个调用（设备照设备列表，见 ha_names.all_at_place），结果交给小模型总结。不让小模型自己补：
         11-04 模拟里它有时漏灯还说都关了（位置写法不统一的那一处），给了提示就跨房子多控，给了名单又抄错 entity_id。
         没说地点（"把灯全关了"）时第二个返回值是交给 Live 的回问，这次委托的调用都不执行。said 是用户最后一句话，asked 是上一次委托问过。"""
-        if any(c.get("name") != "hass_set_state" for c in calls) or not (asked or ha_names.says_all(said)):
+        if any(c.get("name") != "hass_set_state" for c in calls):
+            return self._fan_out_intent(calls, said, recent), None
+        if not (asked or ha_names.says_all(said)):
             return calls, None
         try:
             args = json.loads(calls[0].get("arguments") or "{}")
@@ -859,14 +890,17 @@ class S2SProvider(S2SProviderBase):
         asked, self._ha_asked = self._ha_asked, set()
         asked_all, self._all_asked = self._all_asked, False
         intents = ha_names.device_intents(tools) if self.ha_names and self._ha_entries else {}
-        answer, used, raw, ask = "", [], [], None
+        answer, used, raw, ask, ran = "", [], [], None, []
         # 只看最后一句：上一次委托时还没落进 history 的那句也会算进 said，它的"全关"不是这句的意思
         last = said[-1] if said else ""
         try:
             # 会展开成一处的灯的句子，decisions 选了 hass_set_state 就信它：展开只用小模型填的动作。置信度常不到 0.6（只答"乙地"时 0.33～0.41），
-            # 退回小模型自选会只填区域，HA 按区域控制的不只是灯（11-04 模拟："把乙地的灯全打开"填成 HassTurnOn {area}）
-            sure = ((asked_all or ha_names.says_all(last))
-                    and bool(ha_names.all_at_place(self.conn.prompt, last, recent, "light.", self._ha_entries, asked_all)[0]))
+            # 退回小模型自选会只填区域，HA 按区域控制的不只是灯（11-04 模拟："把乙地的灯全打开"填成 HassTurnOn {area}）。
+            # 陈述句不算（"乙地的灯都坏了"低置信度选了 hass_set_state，信了就把那一处的灯都关了）；说的是窗帘这类设备也不算
+            # （"把乙地的窗帘都关上，灯打开"强制填参把窗帘名字填进 entity_id）
+            sure = ((asked_all or (ha_names.says_all(last) and ha_names.sounds_like_command(last)))
+                    and bool(ha_names.all_at_place(self.conn.prompt, last, recent, "light.", self._ha_entries, asked_all)[0])
+                    and not ha_names.names_listed_device(last, self._ha_entries, self.ha_names_domains))
             first = await self._decide_first(ctx, items, tools, sure) if self.tool_picker == "decisions" else None
             # 小模型自己选工具时第一轮只要一个调用：Haiku 会把一处的灯一盏盏写全（十盏约 1100 token、3.5 s），写完还是被展开替换或者被回问拦下（11-05 空跑）
             one_call = self.tool_picker != "decisions" and self._will_fan_out(last, recent, asked_all)
@@ -881,7 +915,7 @@ class S2SProvider(S2SProviderBase):
                 text = "".join(c.get("text", "") for o in out if o.get("type") == "message"
                                for c in (o.get("content") or []) if c.get("type") == "output_text").strip()
                 if not calls:
-                    answer = text
+                    answer = text or "\n".join(ran)
                     break
                 if i == 0:
                     calls, ask = self._fan_out_all(calls, last, recent, asked_all)
@@ -892,23 +926,25 @@ class S2SProvider(S2SProviderBase):
                                       if call.get("name") in intents else None)
                     result = blocked or await self.tools.run(call.get("name") or "", call.get("arguments") or "{}")
                     outputs.append(result)
+                    ran.append(f"已调用 {call.get('name')}（参数 {call.get('arguments') or '{}'}），结果：{result[:self.direct_max_chars]}")
                     items.append({"type": "function_call", "call_id": call.get("call_id"), "name": call.get("name"),
                                   "arguments": call.get("arguments") or "{}"})
                     items.append({"type": "function_call_output", "call_id": call.get("call_id"), "output": result})
                 if len(calls) == 1 and len(outputs[0]) <= self.direct_max_chars:
                     # 短结果直接交给 Live 转述，省一轮小模型。带上调用了什么、参数是什么：
-                    # 设音量这类工具只回"成功"，光给结果 Live 只会说"好了"（11-03 R26），带上参数它会说"调到六十了"
-                    call = calls[0]
-                    answer = f"已调用 {call.get('name')}（参数 {call.get('arguments') or '{}'}），结果：{outputs[0]}"
+                    # 设音量这类工具只回"成功"，光给结果 Live 只会说"好了"（11-03 R26），带上参数它会说"调到六十了"。
+                    # 前几轮做过的也带上，不然 Live 只知道最后这一个
+                    answer = "\n".join(ran)
                     break
                 # 长结果交给小模型总结成一两句，总结常会删掉细节（农历插件自己写着"仅在要求查询宜忌时才返回宜忌"），
                 # 用户接着问宜忌时 Live 手边没有真数据，就凭记忆编（11-03 直连 API：10 次接话 2 次编）；原文另作背景交给 Live
                 raw += [o for o in outputs if len(o) > self.direct_max_chars]
             else:
-                answer = answer or "这个我暂时没查到。"
+                # 轮数用完：走到这里每一轮都有调用，不能说"没查到"（11-04 模拟：关了三幅窗帘说"这个我暂时没查到"）
+                answer = UNFINISHED + "\n".join(ran)
         except Exception as e:  # noqa: BLE001
             self.logger.bind(tag=TAG).warning(f"Live 工具调度失败 {type(e).__name__}: {e}")
-            answer = "这个我暂时查不到，稍后再试。"
+            answer = UNFINISHED + "\n".join(ran) if ran else "这个我暂时查不到，稍后再试。"
         # 背景用 session.thinking.append：只当上下文、不要求念出来；每条 content 上限 500 token，按 400 字切，总长有上限
         context = "\n".join(raw)[:self.context_max_chars]
         for i in range(0, len(context), CONTEXT_CHUNK_CHARS):

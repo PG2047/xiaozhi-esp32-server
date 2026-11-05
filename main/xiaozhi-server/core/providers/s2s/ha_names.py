@@ -13,6 +13,8 @@ HA 的意图工具（MCP 里叫"平台__Hass意图"，如 intent__HassTurnOn、f
 填了 name，但用户的话分不开这台和同类的另一台（"把甲地的窗帘关上"，小模型替用户挑了卧室那幅），同样不执行、回问。
 用户说了"都"时区域歧义放行，但开关意图只填区域会动那一处所有类别的设备，所以类别歧义检查再问一次要哪一类。
 
+用户明说要控制一类时（"把甲地的窗帘都关上"），小模型一幅一轮会用完轮数、只填区域会多控或者找不到，所以范围照名单定，每台一个调用（all_named）。
+
 名字、区域都来自 HA，这里不写任何地名。只读：只调 GetLiveContext。
 """
 from __future__ import annotations
@@ -386,3 +388,90 @@ def tidy_args(tool: dict, args: dict, entries: list[dict]) -> dict:
         dc = [str(x) for x in _as_list(out.get("device_class") or [])]
         out["device_class"] = dc + [d for d in moved if d not in dc]
     return out
+
+
+# HA 意图工具里指定设备的参数，其余的是动作（position、percentage 这些）
+TARGET_ARGS = {"name", "area", "floor", "domain", "device_class"}
+# 说一整类设备时，设备词前面能出现的话；别的修饰（"主卧的窗帘""靠窗的窗帘"，名单里没有这个词）范围可能更小，服务端看不出来。
+# "把"前面的不算修饰（"现在把……"），没有"把"时句首可以是动作（"拉上甲地所有的窗帘"）
+_BA = re.compile(r"[把将]")
+_LEAD_VERB = re.compile(r"^(?:帮我|给我|帮忙|请|麻烦你?|我要|我想|你)*(?:关上|关掉|关闭|拉上|拉开|打开|合上|关|开)")
+_FILLER = re.compile(r"[的里家屋和跟与及也、]|那边|这边|还有")
+_CLAUSE = re.compile(r"[，,。；;！!？?]")
+
+
+_COMMAND_WORDS = re.compile(r"[关开打拉调灭熄合停收放升降]")
+_STATIVE_WORDS = re.compile(r"没|[关开拉合打亮]着")
+
+
+def sounds_like_command(said: str) -> bool:
+    """这句话像不像让设备动：有动作的字，也不是在说状态（"甲地的灯都坏了""好久没开了""都关着呢"）。"""
+    return bool(_COMMAND_WORDS.search(said or "")) and not _STATIVE_WORDS.search(said or "")
+
+
+def _without_places(text: str, tokens: dict[str, set[str]]) -> str:
+    """去掉地点词（长的先去），转小写、去空格。"""
+    t = norm(text).replace(" ", "")
+    for w in sorted({w.replace(" ", "") for ws in tokens.values() for w in ws}, key=len, reverse=True):
+        t = t.replace(w, "")
+    return t
+
+
+def _named_by(text: str, group: list[dict]) -> tuple[set[str], list[dict]]:
+    """text 里点到了 group 名字里的哪些词（只算最长的），这些词圈定哪几台。几个词一般是"且"（"卧室的纱帘"），
+    两个词没有共同的设备时是"或"（"卧室和客厅""布帘和纱帘"）。"""
+    parts = [_name_parts(e) for e in group]
+    found = {w for p in parts for w in p if w in text}
+    words = {w for w in found if not any(w != o and w in o for o in found)}
+    has = {w: {i for i, p in enumerate(parts) if w in p} for w in words}
+    return words, [e for i, e in enumerate(group)
+                   if all(i in has[w] or any(i in has[o] and not has[o] & has[w] for o in words) for w in words)]
+
+
+def _only_these_words(text: str, words: set[str]) -> bool:
+    """设备词（words）前面除了"都 / 全部"和地点（已去掉）没有别的修饰，前面的分句也没说别的设备（"布帘都拉开，纱帘都关上"动作不止一种）。"""
+    pat = re.compile("|".join(map(re.escape, sorted(words, key=len, reverse=True))))
+    end = max(m.start() for m in [*pat.finditer(text), *_ALL_WORDS.finditer(text)])
+    *before, head = _CLAUSE.split(text[:end])
+    if pat.search(head) and any(pat.search(c) for c in before):
+        return False
+    return not _FILLER.sub("", _LEAD_VERB.sub("", _ALL_WORDS.sub("", pat.sub("", _BA.split(head)[-1]))))
+
+
+def all_named(said: str, recent: str, tool_name: str, entries: list[dict], domains: Iterable[str] = DEFAULT_DOMAINS) -> list[str]:
+    """"把甲地的窗帘都关上"要控制哪些设备，返回每台设备让 HA 认得准的名字。范围只看用户的话和名单：地点取手边的话（recent，一行一句）里
+    最近一句提到地点的；设备词取最近一句点了设备的（"都关上吧"看前一句），只有一部分设备带的词会缩小范围（"卧室的窗帘""纱帘"）。
+
+    这里定了就不再问小模型，所以拿不准都返回 []，照旧执行小模型填的：用户这句话（said）没说"都 / 全部"（"把"前面的不算："都这么晚了，
+    把甲地的窗帘拉上"）；有排除、否定、提问的词；在说状态（"都坏了""都关着呢"；回问之后只答"全部"的不算，它没点设备）；没点到名单里的词，
+    或者还有名单里没有的修饰；点到的不止一类设备（一个工具一个动作）；没说地点、点到的设备又不止在一处；有一台没有 HA 认得准的名字。"""
+    if not says_all(_BA.split(said or "")[-1]) or _EXCEPT_WORDS.search(said or "") or _STATIVE_WORDS.search(said or ""):
+        return []
+    devices = [e for e in entries if e["domain"] in set(domains)]
+    tokens = area_tokens(entries)
+    if not _COMMAND_WORDS.search(said) and says_device_word(_without_places(said, tokens), devices):
+        return []
+    lines = (recent or "").split("\n")
+    places = next(filter(None, (mentioned_areas(t, tokens) for t in reversed(lines))), set())
+    text = next((t for t in (_without_places(x, tokens) for x in reversed(lines)) if says_device_word(t, devices)), "")
+    words, hits = _named_by(text, [e for e in devices if not places or (e["areas"] and e["areas"][0] in places)])
+    if not words or len({e["domain"] for e in hits}) != 1 or not _only_these_words(text, words):
+        return []
+    if not places and len({e["areas"][0] if e["areas"] else "" for e in hits}) > 1:
+        return []
+    names = [next((n for n in _names(e) if matched(tool_name, {"name": n}, entries) == [e]), None) for e in hits]
+    return [] if None in names else names
+
+
+def hits_exactly(tool_name: str, args: dict, names: list[str], entries: list[dict]) -> bool:
+    """这个调用在 HA 上命中的正好是 names 这几台（小模型只填区域也填对了）。"""
+    want = [e for n in names for e in matched(tool_name, {"name": n}, entries)]
+    hits = matched(tool_name, args, entries)
+    return len(hits) == len(want) and all(e in want for e in hits)
+
+
+def names_listed_device(said: str, entries: list[dict], domains: Iterable[str] = DEFAULT_DOMAINS) -> bool:
+    """用户这句话点了名单里（智能设备列表以外）的设备：地点词和灯的名字里也有的词不算（"窗帘"算，"卧室"不算）。"""
+    text = _without_places(said, area_tokens(entries))
+    lights = set().union(*(_name_parts(e) for e in entries if e["domain"] == "light"))
+    return any(w in text for e in entries if e["domain"] in set(domains) for w in _name_parts(e) - lights)
