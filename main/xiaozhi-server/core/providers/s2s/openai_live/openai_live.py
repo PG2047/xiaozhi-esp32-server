@@ -46,6 +46,7 @@ TAG = __name__
 LIVE_RATE = 16000       # 上下行都用 16 kHz（Live 支持 16 k / 24 k）
 WAKE_TRIGGER = "嘿，你好呀"
 TTS_RATE = 24000        # 固定应答文件的格式：24 kHz 16-bit 单声道，不同采样率的设备各自从它重采样
+PHRASE_PEAK = 20000     # MeloTTS 的声音很轻（11-05 "我在。"峰值 2820，满量程 32767），不放大的话比 Live 的声音轻很多
 CONTEXT_CHUNK_CHARS = 400   # session.thinking.append 每条 content 上限 500 token，中文按 400 字切
 _GREETING_CACHE: dict[tuple, bytes] = {}   # (voice, 文本, 设备采样率) → PCM，进程内共用：只有第一次唤醒要等 TTS
 _HA_CACHE: dict = {"t": 0.0, "entries": []}  # GetLiveContext 解析出的设备表，进程内各连接共用（见 _load_ha_names）；只按一个 HA 缓存
@@ -66,6 +67,12 @@ def _trim_silence(pcm: bytes, rate: int, rms: int = 200, pad_ms: int = 40) -> by
         return pcm
     pad = pad_ms // 10
     return b"".join(frames[max(0, loud[0] - pad):loud[-1] + 1 + pad])
+
+
+def _louder(pcm: bytes, peak: int = PHRASE_PEAK) -> bytes:
+    """太轻的声音放大到 peak，够响的不动。放大要在裁静音之前：裁静音按固定电平判断，声音太轻时字尾会被裁掉。"""
+    top = audioop.max(pcm, 2)
+    return audioop.mul(pcm, 2, peak / top) if 0 < top < peak else pcm
 
 
 def _melotts_pcm(data) -> tuple[bytes, int]:
@@ -460,7 +467,7 @@ class S2SProvider(S2SProviderBase):
                 return b""
             if rate != TTS_RATE:
                 raw = Resampler(rate, TTS_RATE).process(raw)
-            pcm = _trim_silence(raw, TTS_RATE)   # TTS 首尾带静音，唤醒后要马上出声
+            pcm = _trim_silence(_louder(raw), TTS_RATE)   # TTS 首尾带静音，唤醒后要马上出声
             if pcm:
                 self._save_phrase(path, pcm, what)
         if self.speaker.sample_rate != TTS_RATE:

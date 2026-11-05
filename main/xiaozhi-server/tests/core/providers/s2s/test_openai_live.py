@@ -2098,7 +2098,7 @@ def test_one_call_is_off_with_the_decisions_picker():
     assert _one_call_flags("把甲地的灯都关了", picker="decisions") == [False, False]
 
 
-PHRASE_PCM = (np.ones(2400, np.int16) * 3000).tobytes()   # 100 ms @24k，够响，不会被当静音裁掉
+PHRASE_PCM = (np.ones(2400, np.int16) * live_mod.PHRASE_PEAK).tobytes()   # 100 ms @24k，够响，不会被放大也不会被裁掉
 
 
 def _melo_reply(pcm=PHRASE_PCM, rate=24000, channels=1):
@@ -2188,6 +2188,26 @@ def test_fixed_phrase_from_44k_tts_is_stored_at_24k(tmp_path, monkeypatch):
             assert abs(len(out) - len(PHRASE_PCM)) <= 8 and len(seen) == 1
         finally:
             await srv.close()
+    asyncio.run(go())
+
+
+def test_fixed_phrase_quiet_tts_is_made_louder_and_keeps_its_quiet_tail(tmp_path, monkeypatch):
+    """MeloTTS 峰值只有约 2800：放大后再裁静音，字尾（电平低于裁静音门限）不能被裁掉。够响的声音不动，见上面的测试。"""
+    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+    body = np.ones(2400, np.int16) * 2800       # 100 ms
+    tail = np.ones(2400, np.int16) * 100        # 100 ms，放大前低于门限（200），放大后高于它
+    silence = np.zeros(4800, np.int16)          # 200 ms，放大后还是静音，要裁掉
+
+    async def go():
+        srv, _seen = await _http_recorder(_melo_reply(np.concatenate([body, tail, silence]).tobytes()))
+        try:
+            p = _plain_provider(**_tts_over(srv, tmp_path))
+            p.speaker.sample_rate = 24000
+            out = np.frombuffer(await p._tts_pcm("我在。", "唤醒应答"), np.int16)
+        finally:
+            await srv.close()
+        assert abs(int(out.max()) - live_mod.PHRASE_PEAK) <= 2
+        assert 4800 <= len(out) <= 4800 + 960 + 240      # 声音和字尾都在，后面只多留 40 ms（960 样本）和不满一帧的零头
     asyncio.run(go())
 
 
