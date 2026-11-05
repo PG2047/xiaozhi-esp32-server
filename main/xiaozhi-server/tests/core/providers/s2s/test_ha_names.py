@@ -667,6 +667,9 @@ def test_partial_names_one_word_needs_all_words():
     for said in ("把客厅灯关了", "把客厅的灯关了", "都这么晚了，把客厅灯关了", "把书房的灯都关了", "把书房灯关了", "把甲地客厅的灯都关了", "把灯都关了", "把甲地的灯都关了"):
         assert _partial(said) == [], said
     assert _partial("把吸顶灯都关了", prompt=_HOUSES + "老家卧室,卧室吸顶灯,light.b5\n") == ["light.b2", "light.b5"]
+    # 两处都说了
+    assert _partial("把甲地和老家的客厅灯都关了") == ["light.a2", "light.b2"]
+    assert _partial("把甲地和老家的客厅灯关了") == []
 
 
 def test_partial_names_ask_when_the_place_cannot_be_settled():

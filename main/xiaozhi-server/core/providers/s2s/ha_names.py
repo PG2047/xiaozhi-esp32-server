@@ -746,9 +746,9 @@ def partial_names(prompt: str, said: str, entries: list[dict], asked: str = "") 
         if not targets:
             return [], _ask_place(found), False
         return list(dict.fromkeys(targets)), None, differ
-    if len(found) == 1:                         # 说了"都"：那一处对得上的全算，几处都有就问
+    if len(found) == 1:                         # 说了"都"：说了的地点里对得上的全算，没说地点、几处都有就问
         r = [s for s in found[0]["rows"] if not bound[0] or s["house"] in bound[0]]
-        if len({s["house"] for s in r}) > 1:
+        if not bound[0] and len({s["house"] for s in r}) > 1:
             return [], _ask_place(found), False
         settled = [s["id"] for s in r]
     else:
