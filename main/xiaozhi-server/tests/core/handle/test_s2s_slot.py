@@ -21,6 +21,7 @@ from core.handle.abortHandle import handleAbortMessage
 from core.handle.receiveAudioHandle import startToChat
 from core.handle.textHandler.listenMessageHandler import ListenTextMessageHandler
 import core.connection as connection_mod
+import core.handle.receiveAudioHandle as receive_mod
 
 
 class FakeWS:
@@ -125,6 +126,59 @@ def test_initialize_components_falls_back_to_cascade_when_attach_returns_none(mo
         await asyncio.sleep(0)
         assert conn.s2s is None and conn.tts is tts and conn.asr is asr
         assert tts.opened == 1 and asr.opened == 1
+    asyncio.run(go())
+
+
+def test_after_s2s_fails_text_goes_to_the_cascade_not_the_pending_list(monkeypatch):
+    """11-05 真机：key 失效时 Live 打开失败，转写有结果，却一直记在待发里，大模型没收到，设备不回应。"""
+    seen = []
+
+    async def fake_intent(conn, text):
+        seen.append(text)
+        return True
+    monkeypatch.setattr(receive_mod, "handle_user_intent", fake_intent)
+
+    async def go():
+        conn = make_conn(asyncio.get_running_loop())
+        conn.config["selected_module"]["S2S"] = "OpenAILive"
+        await startToChat(conn, "还在连接时说的")           # 还没建成：先记着，不走级联
+        assert seen == [] and conn._s2s_pending_texts == ["还在连接时说的"]
+        conn._s2s_failed = True
+        await startToChat(conn, "现在几点了")
+        assert seen == ["现在几点了"]
+    asyncio.run(go())
+
+
+def test_pending_wake_text_is_replayed_to_the_cascade_when_s2s_fails(monkeypatch):
+    """唤醒词那句比打开失败早到：组件都好了之后交给级联，唤醒才有回应。"""
+    seen = []
+
+    class Dummy:
+        async def open_audio_channels(self, conn):
+            pass
+
+    async def fake_intent(conn, text):
+        seen.append(text)
+        return True
+    monkeypatch.setattr(receive_mod, "handle_user_intent", fake_intent)
+
+    def failed_attach(c):
+        c._s2s_failed = True
+        return None
+
+    async def go():
+        conn = make_conn(asyncio.get_running_loop())
+        conn.config["selected_module"]["S2S"] = "OpenAILive"
+        await ListenTextMessageHandler().handle(conn, {"state": "detect", "text": "你好小智"})
+        assert conn._s2s_pending_texts == ["嘿，你好呀"] and seen == []
+        monkeypatch.setattr(connection_mod, "attach_s2s", failed_attach)
+        monkeypatch.setattr(conn, "_initialize_tts", lambda: Dummy())
+        monkeypatch.setattr(conn, "_initialize_asr", lambda: Dummy())
+        monkeypatch.setattr(conn, "_init_prompt_enhancement", lambda: None)
+        monkeypatch.setattr(conn, "_inject_tool_call_fewshot", lambda: None)
+        await asyncio.get_running_loop().run_in_executor(None, conn._initialize_components)
+        await asyncio.tasks.sleep(0.05)
+        assert seen == ["嘿，你好呀"] and conn._s2s_pending_texts == []
     asyncio.run(go())
 
 
