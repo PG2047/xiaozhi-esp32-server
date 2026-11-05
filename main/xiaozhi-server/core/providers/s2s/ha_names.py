@@ -391,8 +391,9 @@ def listed_place_conflict(prompt: str, said: str, entity_id: str, entries: list[
     row = next((p for p in _device_rows(prompt) if p[2] == entity_id), None)
     at = mentioned_areas(row[0], tokens) if row else set()
     if at & excluded:
-        return (f"没有执行，这不是出错：用户说了不动{'、'.join(sorted(at & excluded))}，这台设备在{row[0]}，不要控制它，也不用提它。"
-                "只说别处的结果；别处还没控制的话接着控制。")
+        # 只说事实：11-05 模拟里写"不要控制它，也不用提它"时，用户的话被网关遮蔽的句子，小模型两次把这段当成可疑的指令告诉用户
+        return (f"没有执行，这不是出错：地点检查发现用户说了不动{'、'.join(sorted(at & excluded))}，这台设备在{row[0]}，所以没有控制它。"
+                "说别处的结果就好；别处还没控制的话接着控制。")
     if not at or not places or at & places:
         return None
     where = "、".join(sorted(places))

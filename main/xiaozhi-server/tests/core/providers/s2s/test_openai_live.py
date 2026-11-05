@@ -1821,10 +1821,10 @@ def test_lights_of_the_earlier_place_are_not_controlled_again_in_a_later_round()
     rec = _after_first_call(["把老家的灯都关了", "把甲地的灯也都关了"], [extra, _text_reply("甲地的灯都关了。")])
     assert [c["entity_id"] for c in rec["calls"]] == ["light.b1", "light.a1", "light.a2", "light.a3", "light.a2"]
     assert rec["commentary"] == "甲地的灯都关了。"
-    # 第二轮只出一个调用：拦下来也是短结果，和前面做过的一起直接交回，说明里有两处的名字
-    rec = _after_first_call(["把老家的灯都关了", "把甲地的灯也都关了"], [[_light_call("light.b1", "c8")]])
+    # 第二轮只出一个调用：说明是写给小模型看的，不直接交给 Live，它看到说明之后再总结
+    rec = _after_first_call(["把老家的灯都关了", "把甲地的灯也都关了"], [[_light_call("light.b1", "c8")], _text_reply("甲地的灯都关了。")])
     assert [c["entity_id"] for c in rec["calls"]] == ["light.b1", "light.a1", "light.a2", "light.a3"]
-    assert "没有执行" in rec["commentary"] and "甲地楼下1号" in rec["commentary"] and "老家卧室" in rec["commentary"]
+    assert rec["commentary"] == "甲地的灯都关了。" and rec["auto"] == [3, 4]
 
 
 def test_set_state_in_another_place_is_blocked_in_the_first_round_too():
@@ -1870,9 +1870,12 @@ def test_place_of_the_previous_sentence_does_not_let_an_intent_through():
 def test_lights_of_an_excluded_place_are_not_controlled():
     """"除了老家，把灯都关了"：第一轮甲地的都对，第二轮小模型多关了老家一盏，不执行；一轮里混着的也只拦老家那个。"""
     three = [_light_call(f"light.a{n}", f"c{n}") for n in (1, 2, 3)]
-    rec = _after_first_call("除了老家，把灯都关了", [[_light_call("light.b1", "c8")]], first=three)
+    rec = _after_first_call("除了老家，把灯都关了", [[_light_call("light.b1", "c8")], _text_reply("甲地的灯都关了，老家没动。")], first=three)
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3"]
-    assert "没有执行" in rec["commentary"] and "不动乙地老家" in rec["commentary"]
+    assert rec["commentary"] == "甲地的灯都关了，老家没动。" and rec["auto"] == [3, 4]
+    # 这次委托的第一个调用就被拦：前面没有别的结果，直接交回，让 Live 问用户
+    rec = _after_first_call("除了老家，把灯都关了", [], first=_light_call("light.b1"))
+    assert rec["calls"] == [] and rec["auto"] == [] and "不动乙地老家" in rec["commentary"]
     rec = _after_first_call("把灯都关了，甲地的不用", [_text_reply("老家的灯关了。")], first=[_light_call("light.b1", "c0"), _light_call("light.a1", "c1")])
     assert [c["entity_id"] for c in rec["calls"]] == ["light.b1"] and rec["commentary"] == "老家的灯关了。"
 
