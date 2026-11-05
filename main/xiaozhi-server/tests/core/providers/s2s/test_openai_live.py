@@ -1841,6 +1841,24 @@ def test_first_round_leaves_parallel_calls_alone_when_the_server_will_not_fan_ou
     assert _one_call_flags("把甲地的灯关了") == [False]     # 没说"都"，服务端不展开，小模型自己写全才控制得到
 
 
+def test_time_goes_in_the_message_not_in_the_dispatch_instructions():
+    """调度指令里不能有会变的东西：每分钟变一次，上游的提示词缓存和网关的隐私遮蔽都算新文本，多等 2 s。时间放在用户消息里。"""
+    seen = []
+
+    async def sc(lv, conn, p):
+        async def fake(items, tools):
+            seen.append(items[0]["content"])
+            return {"output": _text_reply("好的。")}
+        p._responses_call = fake
+        assert "当前时间" not in p._dispatch_instructions()
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "现在几点了"})
+        await _real_sleep(0.05)
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d1", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+    _run_client(sc)
+    assert seen[0].startswith("当前时间：") and seen[0].endswith("现在几点了")
+
+
 def test_one_call_is_off_with_the_decisions_picker():
     """新代码配旧模板（decisions + mini）行为不变：退回小模型那一次不限调用数。"""
     assert _one_call_flags("把甲地的灯都关了", picker="decisions") == [False, False]

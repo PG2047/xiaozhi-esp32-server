@@ -666,14 +666,13 @@ class S2SProvider(S2SProviderBase):
 
     # ---------- 工具（client delegation：自己选工具） ----------
     def _dispatch_instructions(self) -> str:
-        now = time.strftime("%Y-%m-%d %H:%M %A", time.localtime())
         # HA 意图工具的填法规则 + 智能设备列表以外的设备名单（decisions 和小模型都看；Live 主模型的指令里没有）
         ha = ha_names.dispatch_text(self._tool_list(), self._ha_entries, self.ha_names_domains) if self.ha_names else ""
         return (f"{self._instructions()}\n\n你现在是小智的工具调度：根据对话里用户最后一句话决定调用哪个工具。"
                 "日期、农历、时间、天气、家里设备的状态和控制、本机音量这类实时信息必须调用工具，不要凭记忆回答。"
                 # 11-03 夜对比：没有这一句时 gpt-4.1-mini 4/4 把"停一下"当成告别去调 handle_exit_intent
                 "“停一下”“等一下”“别说了”只是让小智先停下，不是结束对话，不要调用 handle_exit_intent；只有用户明确告别（再见、拜拜、没事了）才结束对话。"
-                f"拿到工具结果后用一两句中文说出结论；不需要工具就直接用一句话回答。当前时间：{now}" + (f"\n{ha}" if ha else ""))
+                "拿到工具结果后用一两句中文说出结论；不需要工具就直接用一句话回答。" + (f"\n{ha}" if ha else ""))
 
     @staticmethod
     def _dispatch_tools(tools: list) -> list:
@@ -845,6 +844,8 @@ class S2SProvider(S2SProviderBase):
         pending = "".join(self.in_text).strip()
         turns = self.history[-6:] + ([("user", pending)] if pending else [])
         ctx = "\n".join(f"{'用户' if r == 'user' else '小智'}：{t}" for r, t in turns) or self.last_user_text
+        # 时间放这里，不放调度指令：指令每分钟变一次的话，上游的提示词缓存和网关的隐私遮蔽（Magpie 对没见过的文本跑本地模型）都算新的，多等 2 s（11-05 实测）
+        ctx = f"当前时间：{time.strftime('%Y-%m-%d %H:%M %A', time.localtime())}\n{ctx}"
         items: list = [{"role": "user", "content": ctx}]
         tools = self._dispatch_tools(self._tool_list())
         # 地点守卫看的是上次委托之后用户说的话：还没落进 history 的转写，加上这期间落进 history 的用户发言
