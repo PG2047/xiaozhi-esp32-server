@@ -55,7 +55,7 @@ UNFINISHED = "工具调用到这里停了，不会接着做，可能还有没做
 # 喊停那句里不算"别的话"的词：口头的"一下 / 一点 / 下来"、称呼、客气话和语气词（见 _has_more），长的在前
 _STOP_FILLERS = ("好不好", "可以吗", "一下", "一点", "下来", "好吗", "行吗", "好的", "谢谢", "那个", "先", "你", "我", "好",
                  "吧", "啊", "呀", "呢", "嗯", "哦", "噢", "喔", "唉", "诶", "欸", "哎", "嘛", "啦", "了", "吗")
-_SENTENCE_END = re.compile(r"[。！？!?….]+")   # 判断告别时切出回复的最后一句
+_CLAUSE_END = re.compile(r"[。！？!?….，,、；;：:]+")   # 判断告别时切出回复的最后一小句
 THINK_TOOL = "think_deeper"     # 小模型用它把要查、要想的问题交给思考模型（见 _think）
 THINK_INSTRUCTIONS = ("你是语音助手小智的思考后台，你的答复会由小智念给用户听。用中文，两三句话说结论和关键数字，总共不超过一百字，不要 Markdown、链接和来源编号。"
                       "需要最新信息就联网查；行情这类会变的数字说“约”，并说明是什么时候的；查不到或者拿不准就直说，不要编。")
@@ -1271,11 +1271,12 @@ class S2SProvider(S2SProviderBase):
         said = (self.last_user_text + "".join(self.in_text))
         if not any(w in said for w in self.goodbye_words):
             return False
-        # 11-04 真机：用户在模型念长回复时说拜拜，模型的告别会和长回复并成一段（"…还要查别的吗?拜拜!"）。
-        # 整段超过 16 字就只看最后一句，否则要等空闲关闭，这期间喊唤醒词会被当成普通的话
+        # 11-04 真机：用户在模型念长回复时说拜拜，模型的告别会和长回复并成一段（"…还要查别的吗?拜拜!"）；
+        # 11-05 真机：话说到一半收尾时只隔一个逗号（"…才发现风其实,拜拜!"）。
+        # 整段超过 16 字就只看最后一小句，否则要等空闲关闭，这期间喊唤醒词会被当成普通的话
         farewell = assistant_txt
         if len(farewell) > 16:
-            farewell = ([s for s in _SENTENCE_END.split(farewell) if s.strip()] or [""])[-1]
+            farewell = ([s for s in _CLAUSE_END.split(farewell) if s.strip()] or [""])[-1]
         return len(farewell) <= 16 and any(w in farewell for w in self.goodbye_words)
 
     async def _flush_input_text(self) -> None:
