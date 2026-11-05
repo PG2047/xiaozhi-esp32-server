@@ -175,6 +175,7 @@ class S2SProvider(S2SProviderBase):
         self._all_asked = False            # 上一次委托问过"全部"是哪一处、哪一类（见 _fan_out_all）
         # 上一次委托问过 HA 意图是哪一处（见 _fan_out_where）。和 _all_asked 分开：答"甲地的"时灯那条路读 _all_asked，会把甲地的灯都展开了
         self._where_asked = False
+        self._named_asked = ""             # 上一次委托问过是哪一处的那句话（见 ha_names.partial_names）
         self.history: list[tuple[str, str]] = []
         self._session_sig = None
         self._calls: dict[str, asyncio.Task] = {}   # call_id → 执行中的工具
@@ -845,15 +846,19 @@ class S2SProvider(S2SProviderBase):
         self.logger.bind(tag=TAG).info(f"Live 设备歧义拦下 {name} {call.get('arguments')}：{blocked}")
         return blocked
 
-    def _check_set_state(self, call: dict, last: str) -> str | None:
+    def _check_set_state(self, call: dict, last: str, only: list[str] | None = None) -> str | None:
         """hass_set_state 执行前：用户这句话（last）说了地点、这台设备却在别处时，返回交给小模型 / Live 的说明、不执行（见 ha_names.listed_place_conflict）。
-        每一轮都查：跨房子发生在第一轮展开之后，第二轮小模型把上文那一处的灯又调了一遍。"""
+        每一轮都查：跨房子发生在第一轮展开之后，第二轮小模型把上文那一处的灯又调了一遍。
+        only 是不完整的说法定下来的那几台（见 ha_names.partial_names）：范围已经定了，只能动这几台，填到别处（另一处房子同名房间的灯）的不执行。"""
         try:
             args = json.loads(call.get("arguments") or "{}")
         except ValueError:
             return None
         if not isinstance(args, dict):
             return None
+        if only:
+            entity = args.get("entity_id")
+            return None if entity in only else f"没有执行：用户这句话点到的设备是{self._named_list(only)}，不是 {entity}。"
         blocked = ha_names.listed_place_conflict(self.conn.prompt, last, str(args.get("entity_id") or ""), self._ha_entries)
         if blocked:
             self.logger.bind(tag=TAG).info(f"Live 地点守卫拦下 hass_set_state {args.get('entity_id')}：{blocked}")
@@ -941,6 +946,30 @@ class S2SProvider(S2SProviderBase):
         return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}", scoped=True,
                      arguments=json.dumps(dict(actions[0], name=x), ensure_ascii=False)) for n, x in enumerate(names)], None
 
+    def _named_list(self, only: list[str]) -> str:
+        """这几台设备的说明，给小模型看。"""
+        where = {p[2]: f"{p[0]}的{p[1]}" for p in ha_names._device_rows(self.conn.prompt)}
+        return "、".join(f"{where.get(e, e)}（entity_id {e}）" for e in only)
+
+    def _fan_out_partial(self, calls: list, only: list[str], question: str | None, differ: bool) -> tuple[list, str | None]:
+        """"把书房和客厅的灯关了"：定不了是哪一处时第二个返回值是交给 Live 的回问，这次委托的调用都不执行。定下来了就换成那几台，每台一个调用，
+        动作用小模型填的，结果交给小模型总结；小模型同一轮别的工具（"……，把窗帘拉上"）照旧。每台动作不同的不换，小模型自己一台台做（见 _client_delegation）。"""
+        if question:
+            self.logger.bind(tag=TAG).info(f"Live 点名回问 hass_set_state：{question}")
+            return calls, question
+        first = next((c for c in calls if c.get("name") == "hass_set_state"), None)
+        if differ or not first:
+            return calls, None
+        try:
+            args = json.loads(first.get("arguments") or "{}")
+        except ValueError:
+            return calls, None
+        if not isinstance(args, dict):
+            return calls, None
+        self.logger.bind(tag=TAG).info(f"Live 点名展开 hass_set_state：{len(only)} 个设备")
+        return [*(dict(first, call_id=f"{first.get('call_id')}_{n}", arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False))
+                  for n, e in enumerate(only)), *(c for c in calls if c.get("name") != "hass_set_state")], None
+
     def _will_fan_out(self, said: str, recent: str, asked: bool) -> bool:
         """这句选了灯的话 _fan_out_all 会接手（展开或回问），小模型只要给出动作。这时还不知道选的是不是灯，所以"把某地的窗帘都关了"也算：
         第一轮只出一个调用，HA 意图按区域一次就能控制全，没控制全的第二轮起不限（11-05 回归窗帘全部 48/48）。"""
@@ -968,6 +997,7 @@ class S2SProvider(S2SProviderBase):
         asked, self._ha_asked = self._ha_asked, set()
         asked_all, self._all_asked = self._all_asked, False
         asked_where, self._where_asked = self._where_asked, False
+        asked_named, self._named_asked = self._named_asked, ""
         intents = ha_names.device_intents(tools) if self.ha_names and self._ha_entries else {}
         answer, used, raw, ask, ran = "", [], [], None, []
         # 只看最后一句：上一次委托时还没落进 history 的那句也会算进 said，它的"全关"不是这句的意思
@@ -981,10 +1011,27 @@ class S2SProvider(S2SProviderBase):
             sure = (not asked_where and (asked_all or (ha_names.says_all(last) and ha_names.sounds_like_command(last)))
                     and bool(ha_names.all_at_place(self.conn.prompt, last, recent, "light.", self._ha_entries, asked_all)[0])
                     and not ha_names.names_listed_device(last, self._ha_entries, self.ha_names_domains))
+            # 不完整的名字（"把书房和客厅的灯关了"）：只有 only 这几台能动，定不了是哪一处就回问（见 ha_names.partial_names）
+            only, question, differ = ha_names.partial_names(self.conn.prompt, last, self._ha_entries, asked_named)
+            # 这句自己定不了（不是答回问没答上来）。没答上来可能是说了别的事（"现在几点了"），要看小模型选了什么
+            own = bool(question) and bool(ha_names.partial_names(self.conn.prompt, last, self._ha_entries)[1])
+            if question:
+                # 小模型可能自己就问了（没有调用），下一次委托照样算在答。没答上来再问时还记着原来那句，这句自己又定不了（换了句话）时记这句
+                self._named_asked = last if own else asked_named
+            if differ:
+                # 每台动作不同，套不了同一个动作，小模型自己一台台做：告诉它定下来的是哪几台（"客厅灯"它自己填可能填到另一处）
+                items[0]["content"] += f"\n（这句话点到的设备是{self._named_list(only)}。按用户对每一台说的动作各调用一次，别的设备不要动。）"
             first = await self._decide_first(ctx, items, tools, sure) if self.tool_picker == "decisions" else None
+            # 定下来了或者要回问，小模型只要给出动作：自选时它可能先查状态，短结果直接交回灯没动；可能把地名认丢了反问（11-05 模拟）
+            set_state = next((t for t in tools if t.get("name") == "hass_set_state"), None)
+            if not first and set_state and (own or (only and not differ)):
+                resp = await self._responses_call(items, [set_state], force="hass_set_state", one_call=True)
+                first = [o for o in resp.get("output") or [] if o.get("type") == "function_call"] or None
             # 小模型自己选工具时第一轮只要一个调用：Haiku 会把一处的灯一盏盏写全（十盏约 1100 token、3.5 s），写完还是被展开替换或者被回问拦下（11-05 空跑）
             one_call = self.tool_picker != "decisions" and self._will_fan_out(last, recent, asked_all)
-            for i in range(max(1, self.tool_rounds)):
+            partial_left = bool(only or question)
+            # 每台动作不同时小模型可能一台一轮，多给几轮
+            for i in range(max(1, self.tool_rounds) + (len(only) if differ else 0)):
                 if i == 0 and first:
                     calls, out = first, []
                 else:
@@ -998,15 +1045,23 @@ class S2SProvider(S2SProviderBase):
                     answer = text or "\n".join(ran)
                     break
                 if i == 0:
-                    calls, ask = self._fan_out_all(calls, last, recent, asked_all)
+                    # 刚回问过"客厅和卧室的灯是哪一处"时答"都关"：说的是那几盏，不是所有的灯
+                    calls, ask = (calls, None) if asked_named and (only or question) else self._fan_out_all(calls, last, recent, asked_all)
                     if not ask:
                         calls, ask = self._fan_out_where(calls, last, recent, asked_where)
+                # 第一个控制灯的那一轮才算（强制填参失败时小模型自选，可能先查状态）
+                if partial_left and not ask and any(c.get("name") == "hass_set_state" or (own and c.get("name") in intents) for c in calls):
+                    partial_left = False
+                    calls, ask = self._fan_out_partial(calls, only, question, differ)
+                elif partial_left and not own and question:
+                    # 回问之后说了别的事，小模型选了别的工具：不再等答复
+                    partial_left, self._named_asked = False, ""
                 outputs = []
                 for call in calls:
                     used.append(call.get("name"))
                     blocked = ask or (self._check_ha_call(call, intents, "\n".join(said), recent, asked, last)
                                       if call.get("name") in intents and not call.get("scoped")
-                                      else self._check_set_state(call, last) if call.get("name") == "hass_set_state" else None)
+                                      else self._check_set_state(call, last, only) if call.get("name") == "hass_set_state" else None)
                     result = blocked or await self.tools.run(call.get("name") or "", call.get("arguments") or "{}")
                     outputs.append(result)
                     ran.append(f"已调用 {call.get('name')}（参数 {call.get('arguments') or '{}'}），结果：{result[:self.direct_max_chars]}")
@@ -1015,7 +1070,8 @@ class S2SProvider(S2SProviderBase):
                     items.append({"type": "function_call_output", "call_id": call.get("call_id"), "output": result})
                 # 地点守卫的说明是写给小模型看的：它接着调用或者总结，不念给用户。11-05 模拟：第一轮都对，第二轮小模型常多调一盏别处的
                 # （"把灯都关了，除了甲地"6 次 5 次），都走到这里。写给 Live 的问句（"问用户要控制哪一类"）照旧直接交回
-                if len(calls) == 1 and len(outputs[0]) <= self.direct_max_chars and not (blocked or "").startswith(ha_names.NOT_AN_ERROR):
+                if (len(calls) == 1 and len(outputs[0]) <= self.direct_max_chars and len(only) < 2 and not (partial_left and own)
+                        and not (blocked or "").startswith(ha_names.NOT_AN_ERROR)):
                     # 短结果直接交给 Live 转述，省一轮小模型。带上调用了什么、参数是什么：
                     # 设音量这类工具只回"成功"，光给结果 Live 只会说"好了"（11-03 R26），带上参数它会说"调到六十了"。
                     # 前几轮做过的也带上，不然 Live 只知道最后这一个
