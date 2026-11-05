@@ -56,6 +56,10 @@ UNFINISHED = "工具调用到这里停了，不会接着做，可能还有没做
 _STOP_FILLERS = ("好不好", "可以吗", "一下", "一点", "下来", "好吗", "行吗", "好的", "谢谢", "那个", "先", "你", "我", "好",
                  "吧", "啊", "呀", "呢", "嗯", "哦", "噢", "喔", "唉", "诶", "欸", "哎", "嘛", "啦", "了", "吗")
 _SENTENCE_END = re.compile(r"[。！？!?….]+")   # 判断告别时切出回复的最后一句
+THINK_TOOL = "think_deeper"     # 小模型用它把要查、要想的问题交给思考模型（见 _think）
+THINK_INSTRUCTIONS = ("你是语音助手小智的思考后台，你的答复会由小智念给用户听。用中文，两三句话说结论和关键数字，不要 Markdown、链接和来源编号。"
+                      "需要最新信息就联网查；行情这类会变的数字说“约”，并说明是什么时候的；查不到或者拿不准就直说，不要编。")
+_MD_NOISE = re.compile(r"\[\[?\d+\]?\]\([^)]*\)|https?://\S+|\*\*|<\|[a-z_]+\|>")   # 念出来没有意义的部分：来源编号、链接、加粗、模型的结束标记
 
 
 def _trim_silence(pcm: bytes, rate: int, rms: int = 200, pad_ms: int = 40) -> bytes:
@@ -150,6 +154,10 @@ class S2SProvider(S2SProviderBase):
         # 11-05：tool_url、tool_api_key 没有默认值，也不退回 api_key。那把 key 只给 Live 连接用，配错了工具调用报错，不会悄悄花到 OpenAI
         self.tool_url = str(c.get("tool_url") or "")
         self.tool_api_key = str(c.get("tool_api_key") or "")
+        # 思考模型（11-05）：选工具用便宜的小模型，要查、要想的问题由小模型调 think_deeper 交给它，可以联网。空 = 不开。
+        # 和工具调度走同一个网关和 key，只是模型（路由组）不同
+        self.think_model = str(c.get("think_model") or "")
+        self.think_timeout_s = float(c.get("think_timeout_s", 20))
         self.ack_delay_ms = int(c.get("ack_delay_ms", 800))
         self.tool_rounds = int(c.get("tool_rounds", 3))
         self.direct_max_chars = int(c.get("tool_direct_max_chars", 200))   # 单个工具结果不超过这么长就直接交给 Live 转述，省一轮
@@ -703,7 +711,11 @@ class S2SProvider(S2SProviderBase):
                 "日期、农历、时间、天气、家里设备的状态和控制、本机音量这类实时信息必须调用工具，不要凭记忆回答。"
                 # 11-03 夜对比：没有这一句时 gpt-4.1-mini 4/4 把"停一下"当成告别去调 handle_exit_intent
                 "“停一下”“等一下”“别说了”只是让小智先停下，不是结束对话，不要调用 handle_exit_intent；只有用户明确告别（再见、拜拜、没事了）才结束对话。"
-                "拿到工具结果后用一两句中文说出结论；不需要工具就直接用一句话回答。" + (f"\n{ha}" if ha else ""))
+                "拿到工具结果后用一两句中文说出结论；不需要工具就直接用一句话回答。"
+                # 11-05 真机：问 BTC 行情时小模型手边没有工具，只能答查不到
+                + ("要查最新信息（行情、新闻、比赛结果这类）、要计算、推理、比较分析，或者其他工具办不了、你拿不准的问题，调用 think_deeper，不要自己答，也不要说查不到。"
+                   "家里的设备、音量、日期时间、农历宜忌用对应的工具；闲聊、讲故事、一句话能答的常识不用调用。" if self.think_model else "")
+                + (f"\n{ha}" if ha else ""))
 
     @staticmethod
     def _dispatch_tools(tools: list) -> list:
@@ -986,7 +998,7 @@ class S2SProvider(S2SProviderBase):
         # 时间放这里，不放调度指令：指令每分钟变一次的话，上游的提示词缓存和网关的隐私遮蔽（Magpie 对没见过的文本跑本地模型）都算新的，多等 2 s（11-05 实测）
         ctx = f"当前时间：{time.strftime('%Y-%m-%d %H:%M %A', time.localtime())}\n{ctx}"
         items: list = [{"role": "user", "content": ctx}]
-        tools = self._dispatch_tools(self._tool_list())
+        tools = self._dispatch_tools(self._tool_list()) + self._think_tools()
         # 地点守卫看的是上次委托之后用户说的话：还没落进 history 的转写，加上这期间落进 history 的用户发言
         # （Live 先开口说一句时会把转写刷进 history）。更早的不看，否则上一轮提到的地方会误拦这一轮；
         # 多看到的地点只会让守卫放行，一句都看不到（转写还没到）就不拦
@@ -1044,6 +1056,15 @@ class S2SProvider(S2SProviderBase):
                 if not calls:
                     answer = text or "\n".join(ran)
                     break
+                think = next((c for c in calls if c.get("name") == THINK_TOOL), None)
+                if think and len(calls) > 1:
+                    calls = [c for c in calls if c is not think]   # 混着别的调用时先办别的，下一轮它还可以再问
+                elif think:
+                    used.append(THINK_TOOL)
+                    if partial_left and not own and question:      # 回问之后说了别的事：不再等答复（同下面选了别的工具）
+                        partial_left, self._named_asked = False, ""
+                    answer = "\n".join(ran + [await self._think(ctx, think.get("arguments"))])
+                    break
                 if i == 0:
                     # 刚回问过"客厅和卧室的灯是哪一处"时答"都关"：说的是那几盏，不是所有的灯
                     calls, ask = (calls, None) if asked_named and (only or question) else self._fan_out_all(calls, last, recent, asked_all)
@@ -1095,6 +1116,39 @@ class S2SProvider(S2SProviderBase):
         await self._send({"type": "session.commentary.append", "delegation_id": did, "content": (answer or "好的。")[:1500]})
         self.logger.bind(tag=TAG).info(f"Live 委托交回 tools={used} {round(1000 * (time.time() - t0))} ms 答复 {len(answer)} 字"
                                        f"{f'，背景 {len(context)} 字' if context else ''} t={time.time():.3f}")
+
+    def _think_tools(self) -> list[dict]:
+        if not self.think_model:
+            return []
+        return [{"type": "function", "name": THINK_TOOL, "description": "把要查最新信息或者要动脑筋的问题交给更强的模型，它可以联网。",
+                 "parameters": {"type": "object", "required": ["question"], "properties": {
+                     "question": {"type": "string", "description": "用户要问的问题，把上文省略的内容补全"}}}}]
+
+    async def _think(self, ctx: str, arguments: str | None) -> str:
+        """think_deeper：交给思考模型，答复直接交回 Live 转述，不再过小模型。出错、超时只说查不到，不影响这次委托。"""
+        import aiohttp
+        try:
+            question = str(json.loads(arguments or "{}").get("question") or "")
+        except (ValueError, AttributeError):
+            question = ""
+        body = {"model": self.think_model, "instructions": THINK_INSTRUCTIONS,
+                "input": [{"role": "user", "content": f"{ctx}\n\n要回答的问题：{question}" if question else ctx}],
+                "tools": [{"type": "web_search"}], "store": False}
+        t0 = time.time()
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.think_timeout_s)) as s:
+                async with s.post(self.tool_url, json=body, headers={"Authorization": f"Bearer {self.tool_api_key}"}) as r:
+                    if r.status != 200:
+                        raise RuntimeError(f"HTTP {r.status}")
+                    d = await r.json()
+        except Exception as e:  # noqa: BLE001
+            self.logger.bind(tag=TAG).warning(f"Live 思考模型失败 {round(1000 * (time.time() - t0))} ms {type(e).__name__}: {e}")
+            return "这个我暂时查不到，稍后再试。"
+        text = "".join(c.get("text", "") for o in d.get("output") or [] if o.get("type") == "message"
+                       for c in (o.get("content") or []) if c.get("type") == "output_text")
+        text = _MD_NOISE.sub("", text).strip()
+        self.logger.bind(tag=TAG).info(f"Live 思考模型 {round(1000 * (time.time() - t0))} ms 答复 {len(text)} 字")
+        return text or "这个我暂时查不到，稍后再试。"
 
     async def _maybe_continue(self) -> None:
         """这一轮后台回复里的函数调用全部交回、且回复已 completed，才让后台继续（否则报 function_call_outputs_required）。"""

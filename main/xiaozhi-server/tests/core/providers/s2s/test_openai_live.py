@@ -1118,6 +1118,136 @@ def test_responses_tools_sent_non_strict(monkeypatch):
     assert "strict" not in tool
 
 
+class _FakeGateway:
+    """假网关：记下请求体，按给定内容返回；raises 时模拟超时或连不上。"""
+    def __init__(self, reply=None, status=200, raises=None):
+        self.sent, self.reply, self.status, self.raises = [], reply, status, raises
+        gw = self
+
+        class Resp:
+            status = gw.status
+
+            async def __aenter__(self):
+                if gw.raises:
+                    raise gw.raises
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def json(self):
+                return gw.reply
+
+        class Session:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            def post(self, url, json=None, headers=None):
+                gw.sent.append(dict(json, _url=url, _auth=headers["Authorization"]))
+                return Resp()
+        self.session = Session
+
+
+def _think_reply(text):
+    return {"output": [{"type": "web_search_call"}, {"type": "message", "content": [{"type": "output_text", "text": text}]}]}
+
+
+THINK_CFG = {"think_model": "group/think", "tool_url": "http://gw/v1/responses", "tool_api_key": "gw"}
+
+
+def _delegate_with(p_calls):
+    """小模型按 p_calls 依次返回，跑一次委托，返回 (交给 Live 的答复, 小模型每次看到的工具名)。"""
+    result = {}
+
+    async def sc(lv, conn, p):
+        seen, script = [], list(p_calls)
+
+        async def fake(items, tools, **k):
+            seen.append([t["name"] for t in tools])
+            return {"output": script.pop(0)}
+        p._responses_call = fake
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "BTC 现在多少钱"})
+        await _real_sleep(0.05)
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "t1", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        result["answer"] = [m for m in lv.received if m["type"] == "session.commentary.append"][0]["content"]
+        result["seen"], result["handler"] = seen, [c["name"] for c in conn.func_handler.calls]
+    _run_client(sc, **THINK_CFG)
+    return result
+
+
+def _think_call(question="BTC 现在多少钱"):
+    return {"type": "function_call", "call_id": "c9", "name": "think_deeper", "arguments": json.dumps({"question": question}, ensure_ascii=False)}
+
+
+def test_think_tool_only_when_configured():
+    async def sc(lv, conn, p):
+        assert p._think_tools() == [] and "think_deeper" not in p._dispatch_instructions()
+    _run_client(sc)
+
+    async def sc2(lv, conn, p):
+        assert [t["name"] for t in p._think_tools()] == ["think_deeper"] and "think_deeper" in p._dispatch_instructions()
+    _run_client(sc2, **THINK_CFG)
+
+
+def test_think_goes_to_think_model_with_search_and_hands_answer_back(monkeypatch):
+    import aiohttp
+    gw = _FakeGateway(_think_reply("BTC 约八万美元[[1]](https://example.com/a)，**涨了一点**。<|eos|>"))
+    monkeypatch.setattr(aiohttp, "ClientSession", gw.session)
+    r = _delegate_with([[_think_call()]])
+    assert r["answer"] == "BTC 约八万美元，涨了一点。"
+    assert "think_deeper" in r["seen"][0] and len(r["seen"]) == 1         # 答复不再过小模型
+    assert r["handler"] == []                                             # 不走 ToolRunner
+    b = gw.sent[0]
+    assert b["model"] == "group/think" and b["tools"] == [{"type": "web_search"}] and b["_url"] == "http://gw/v1/responses" and b["_auth"] == "Bearer gw"
+    assert "BTC 现在多少钱" in b["input"][0]["content"] and "当前时间" in b["input"][0]["content"]
+
+
+def test_think_prompt_has_no_home_device_list(monkeypatch):
+    """家里的设备名单不发给思考模型：它用不上，也不该跟着联网查询走。"""
+    import aiohttp
+    gw = _FakeGateway(_think_reply("好"))
+    monkeypatch.setattr(aiohttp, "ClientSession", gw.session)
+
+    async def sc(lv, conn, p):
+        conn.prompt = "设备清单：甲地书房灯 light.study"
+        await p._think("用户：BTC", None)
+        assert "light.study" not in json.dumps(gw.sent[0], ensure_ascii=False)
+    _run_client(sc, **THINK_CFG)
+
+
+@pytest.mark.parametrize("kw", [{"status": 429, "reply": {}}, {"raises": asyncio.TimeoutError()}, {"reply": {"output": []}}])
+def test_think_failure_says_cannot_find(monkeypatch, kw):
+    import aiohttp
+    gw = _FakeGateway(**kw)
+    monkeypatch.setattr(aiohttp, "ClientSession", gw.session)
+    assert _delegate_with([[_think_call()]])["answer"] == "这个我暂时查不到，稍后再试。"
+
+
+def test_think_mixed_with_a_tool_runs_the_tool_first(monkeypatch):
+    import aiohttp
+    gw = _FakeGateway(_think_reply("约八万"))
+    monkeypatch.setattr(aiohttp, "ClientSession", gw.session)
+    tool = {"type": "function_call", "call_id": "c1", "name": "hass_state", "arguments": "{\"entity_id\": \"light.x\"}"}
+    r = _delegate_with([[tool, _think_call()]])
+    assert r["handler"] == ["hass_state"] and gw.sent == []     # 这一轮只办工具，短结果直接交回
+
+
+def test_small_model_text_reply_does_not_go_to_think_model(monkeypatch):
+    """小模型自己回问（"是哪一处的灯"）没有调用工具，不能送去思考模型。"""
+    import aiohttp
+    gw = _FakeGateway(_think_reply("不该到这里"))
+    monkeypatch.setattr(aiohttp, "ClientSession", gw.session)
+    r = _delegate_with([[{"type": "message", "content": [{"type": "output_text", "text": "是哪一处的灯？"}]}]])
+    assert r["answer"] == "是哪一处的灯？" and gw.sent == []
+
+
 def test_dispatch_tools_drops_lunar_dont_call_hint():
     from core.providers.s2s.openai_live.openai_live import S2SProvider as P
     t = [{"name": "get_lunar", "description": "用于农历。对于'今天农历是多少'、'今天农历日期'这样的基本查询，请直接使用context中的信息，不要调用此工具。"}]
