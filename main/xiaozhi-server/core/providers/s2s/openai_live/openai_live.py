@@ -22,6 +22,7 @@ import asyncio
 import audioop
 import base64
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -79,6 +80,8 @@ class S2SProvider(S2SProviderBase):
         self.wake_greeting_text = str(c.get("wake_greeting_text", "我在。") or "").strip()
         self.greeting_tts_model = str(c.get("greeting_tts_model") or "gpt-4o-mini-tts")
         self.tts_url = str(c.get("tts_url") or "https://api.openai.com/v1/audio/speech")
+        # 固定应答（"我在。""好。"）只合成一次：存在这个目录下，以后读文件，重启也不再调 TTS
+        self.phrase_dir = str(c.get("phrase_dir") or "data/live_phrases")
         self._greeting_task = None
         # 告别：Live 说完"再见"不会自己结束会话（11-03 R19：要等 45 秒空闲关闭）。用户这句里有告别词、
         # 模型这段回复又短又是告别，就在这段播完后关连接；工具（handle_exit_intent）置了 close_after_chat 也照办
@@ -117,6 +120,8 @@ class S2SProvider(S2SProviderBase):
         self.delegation_mode = str(c.get("delegation_mode") or "responses")
         self.tool_model = str(c.get("tool_model") or "gpt-4.1-mini")
         self.tool_url = str(c.get("tool_url") or "https://api.openai.com/v1/responses")
+        # tool_url 指向别家（如 Magpie 网关）时用这把 key；不配就用 api_key。Live 连接和 decisions 始终用 api_key
+        self.tool_api_key = str(c.get("tool_api_key") or "") or self.api_key
         self.ack_delay_ms = int(c.get("ack_delay_ms", 800))
         self.tool_rounds = int(c.get("tool_rounds", 3))
         self.direct_max_chars = int(c.get("tool_direct_max_chars", 200))   # 单个工具结果不超过这么长就直接交给 Live 转述，省一轮
@@ -395,26 +400,51 @@ class S2SProvider(S2SProviderBase):
     async def _ack_pcm(self) -> bytes:
         return await self._tts_pcm(self.stop_ack_text, "停下应答")
 
+    def _phrase_path(self, text: str) -> str:
+        """固定应答的文件名：音色 + 模型和文本的摘要，改了其中一样就是另一个文件、重新合成。"""
+        digest = hashlib.sha256(f"{self.greeting_tts_model}\n{text}".encode()).hexdigest()[:16]
+        return os.path.join(self.phrase_dir, f"{self.voice}-{digest}.pcm")
+
+    def _save_phrase(self, path: str, pcm: bytes, what: str) -> None:
+        """存不下只记一条日志：这次会话照样能播，下次重启再合成。"""
+        tmp = f"{path}.tmp"
+        try:
+            os.makedirs(self.phrase_dir, exist_ok=True)
+            with open(tmp, "wb") as f:
+                f.write(pcm)
+            os.replace(tmp, path)
+        except OSError as e:
+            self.logger.bind(tag=TAG).warning(f"{what} 存文件失败 {type(e).__name__}")
+
     async def _tts_pcm(self, text: str, what: str) -> bytes:
         key = (self.voice, text, self.speaker.sample_rate)
         if key in _GREETING_CACHE:
             return _GREETING_CACHE[key]
-        import aiohttp
-        body = {"model": self.greeting_tts_model, "voice": self.voice, "input": text,
-                "response_format": "pcm", "instructions": "自然、亲切、简短地应一声。"}
-        # 后台预取，超时放宽到 30 s：11-04 Tokyo 实测同样的请求有时 19 s 才回（"好。"19.0 s、2.0 s，"我在。"1.1 s），
-        # 6 s 超时会让重启后缓存还空的那批会话一直没有应答。播放那边最多只等 2.5 s，取得慢不耽误
+        path = self._phrase_path(text)
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
-                async with s.post(self.tts_url, json=body, headers={"Authorization": f"Bearer {self.api_key}"}) as r:
-                    if r.status != 200:
-                        self.logger.bind(tag=TAG).warning(f"{what} TTS 失败 HTTP {r.status}")
-                        return b""
-                    pcm = await r.read()
-        except Exception as e:  # noqa: BLE001
-            self.logger.bind(tag=TAG).warning(f"{what} TTS 失败 {type(e).__name__}")
-            return b""
-        pcm = _trim_silence(pcm, TTS_RATE)   # TTS 首尾各带几百毫秒静音（11-02 实测整句 2.35 秒）
+            with open(path, "rb") as f:
+                pcm = f.read()       # 文件里是裁过静音、没重采样的 24 kHz PCM，不同采样率的设备共用
+        except OSError:
+            pcm = b""
+        if not pcm:
+            import aiohttp
+            body = {"model": self.greeting_tts_model, "voice": self.voice, "input": text,
+                    "response_format": "pcm", "instructions": "自然、亲切、简短地应一声。"}
+            # 后台预取，超时放宽到 30 s：11-04 Tokyo 实测同样的请求有时 19 s 才回（"好。"19.0 s、2.0 s，"我在。"1.1 s），
+            # 6 s 超时会让重启后缓存还空的那批会话一直没有应答。播放那边最多只等 2.5 s，取得慢不耽误
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
+                    async with s.post(self.tts_url, json=body, headers={"Authorization": f"Bearer {self.api_key}"}) as r:
+                        if r.status != 200:
+                            self.logger.bind(tag=TAG).warning(f"{what} TTS 失败 HTTP {r.status}")
+                            return b""
+                        pcm = await r.read()
+            except Exception as e:  # noqa: BLE001
+                self.logger.bind(tag=TAG).warning(f"{what} TTS 失败 {type(e).__name__}")
+                return b""
+            pcm = _trim_silence(pcm, TTS_RATE)   # TTS 首尾各带几百毫秒静音（11-02 实测整句 2.35 秒）
+            if pcm:
+                self._save_phrase(path, pcm, what)
         if self.speaker.sample_rate != TTS_RATE:
             pcm = Resampler(TTS_RATE, self.speaker.sample_rate).process(pcm)
         _GREETING_CACHE[key] = pcm
@@ -684,7 +714,7 @@ class S2SProvider(S2SProviderBase):
         choice = a.get("choice")
         return (None if choice in (None, "none") else str(choice)), a.get("confidence")
 
-    async def _responses_call(self, items: list, tools: list, force: str | None = None) -> dict:
+    async def _responses_call(self, items: list, tools: list, force: str | None = None, one_call: bool = False) -> dict:
         import aiohttp
         # 工具显式 strict: false。不写时 Responses 会尽量把 schema 规整成严格模式，可选参数全变必填，小模型只好硬填：
         # HA intent 的 floor 填空串、device_class / domain 猜成 switch，HA 按猜出来的条件匹配不上设备；强制填参和自选都这样（11-03 空跑）。
@@ -692,8 +722,10 @@ class S2SProvider(S2SProviderBase):
         tools = [dict(t, strict=False) for t in tools]
         body = {"model": self.tool_model, "instructions": self._dispatch_instructions(), "input": items,
                 "tools": tools, "tool_choice": {"type": "function", "name": force} if force else "auto", "store": False}
+        if one_call:
+            body["parallel_tool_calls"] = False
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
-            async with s.post(self.tool_url, json=body, headers={"Authorization": f"Bearer {self.api_key}"}) as r:
+            async with s.post(self.tool_url, json=body, headers={"Authorization": f"Bearer {self.tool_api_key}"}) as r:
                 if r.status != 200:
                     raise RuntimeError(f"HTTP {r.status}")
                 return await r.json()
@@ -801,6 +833,12 @@ class S2SProvider(S2SProviderBase):
         return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}",
                      arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False)) for n, e in enumerate(targets)], None
 
+    def _will_fan_out(self, said: str, recent: str, asked: bool) -> bool:
+        """这句选了灯的话 _fan_out_all 会接手（展开或回问），小模型只要给出动作。"""
+        if not (asked or ha_names.says_all(said)):
+            return False
+        return any(ha_names.all_at_place(self.conn.prompt, said, recent, "light.", self._ha_entries, asked))
+
     async def _client_delegation(self, did: str) -> None:
         """Live 把一件事委托出来（没有请求正文）：用最近几句对话拼出请求，小模型选工具、ToolRunner 执行，结果交回 Live 转述。"""
         t0 = time.time()
@@ -828,11 +866,14 @@ class S2SProvider(S2SProviderBase):
             sure = ((asked_all or ha_names.says_all(last))
                     and bool(ha_names.all_at_place(self.conn.prompt, last, recent, "light.", self._ha_entries, asked_all)[0]))
             first = await self._decide_first(ctx, items, tools, sure) if self.tool_picker == "decisions" else None
+            # 小模型自己选工具时第一轮只要一个调用：Haiku 会把一处的灯一盏盏写全（十盏约 1100 token、3.5 s），写完还是被展开替换或者被回问拦下（11-05 空跑）
+            one_call = self.tool_picker != "decisions" and self._will_fan_out(last, recent, asked_all)
             for i in range(max(1, self.tool_rounds)):
                 if i == 0 and first:
                     calls, out = first, []
                 else:
-                    resp = await self._responses_call(items, tools)
+                    resp = await (self._responses_call(items, tools, one_call=True) if one_call and i == 0
+                                  else self._responses_call(items, tools))
                     out = resp.get("output") or []
                     calls = [o for o in out if o.get("type") == "function_call"]
                 text = "".join(c.get("text", "") for o in out if o.get("type") == "message"
