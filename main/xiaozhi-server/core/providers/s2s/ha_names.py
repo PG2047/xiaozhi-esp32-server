@@ -15,6 +15,8 @@ HA 的意图工具（MCP 里叫"平台__Hass意图"，如 intent__HassTurnOn、f
 
 用户明说要控制一类时（"把甲地的窗帘都关上"），小模型一幅一轮会用完轮数、只填区域会多控或者找不到，所以范围照名单定，每台一个调用（all_named）。
 
+智能设备列表里的设备（灯，走 hass_set_state）也过一道地点守卫（listed_place_conflict）：地点从列表的"位置"一栏认。
+
 名字、区域都来自 HA，这里不写任何地名。只读：只调 GetLiveContext。
 """
 from __future__ import annotations
@@ -332,6 +334,35 @@ def name_rivals(utterance: str, recent: str, tool_name: str, args: dict, entries
 _EXCEPT_WORDS = re.compile(r"除|别|不|留|算了|吗")
 
 
+def _device_rows(prompt: str) -> list[list[str]]:
+    """提示词的智能设备列表：每行 [位置, 设备名, entity_id]。"""
+    return [p for p in ([x.strip() for x in line.split(",")] for line in (prompt or "").splitlines())
+            if len(p) == 3 and re.fullmatch(r"\w+\.\w+", p[2])]
+
+
+def listed_place_conflict(prompt: str, said: str, entity_id: str, entries: list[dict]) -> str | None:
+    """hass_set_state 的地点守卫（place_conflict 管 HA 意图，这里管智能设备列表里的设备）：用户这句话（said）提到了地点、这台设备的位置却在
+    别处，返回交给小模型 / Live 的说明（不执行）；没问题返回 None。11-05 模拟："把甲地的灯都关了""把乙地的灯也都关了"，第一轮展开乙地的灯都对，
+    第二轮小模型又把甲地的灯调了一遍（答复里说"之前说关了，其实没真的去关"：调度只看得到这次委托的工具记录，看不到上一次的）。
+
+    said 只给最后一句：上一句常落在委托标记之后（交回之后 Live 才开口），把它也算上，上一句的地点就放行了。
+    拿不准都放行：这句没提地点（"都关了吧"看前一句）；有排除、否定、提问的词（"除了甲地，把灯都关了"，提到的地点正好不是要控制的）；
+    设备不在列表里；位置里认不出地点。"""
+    if _EXCEPT_WORDS.search(said or ""):
+        return None
+    tokens = area_tokens(entries)
+    places = mentioned_areas(said, tokens)
+    if not places:
+        return None
+    row = next((p for p in _device_rows(prompt) if p[2] == entity_id), None)
+    at = mentioned_areas(row[0], tokens) if row else set()
+    if not at or at & places:
+        return None
+    where = "、".join(sorted(places))
+    return (f"没有执行，这不是出错：用户这句说的是{where}，这台设备在{row[0]}，这句没有要控制它，不用重做，也不用提它。"
+            f"只说{where}的结果；{where}还没控制的话接着控制，或者问清是哪一台。")
+
+
 def all_at_place(prompt: str, said: str, recent: str, entity_id: str, entries: list[dict],
                  asked: bool = False) -> tuple[list[str], str | None]:
     """"把甲地的灯全关了"要控制哪些设备，返回 (设备, 交给 Live 的回问)。设备是提示词的智能设备列表（每行"位置,设备名,entity_id"）里，
@@ -343,8 +374,7 @@ def all_at_place(prompt: str, said: str, recent: str, entity_id: str, entries: l
     哪句都没有地点（"把灯全关了"）、这类设备又不止在一处：不替用户把几处房子的都控制了，先回问。asked 表示上一次委托问过：这次答了地点
     就控制那一处，答"都关"才控制全部，没答上来（"嗯""第一个"，或者转写还没到）再问一遍。11-04 模拟：问完用户只说"嗯"，小模型一轮就把
     三处的 10 盏灯都调了，所以这里连小模型一轮出好几个调用的也拦。"""
-    rows = [p for p in ([x.strip() for x in line.split(",")] for line in (prompt or "").splitlines())
-            if len(p) == 3 and re.fullmatch(r"\w+\.\w+", p[2])]
+    rows = _device_rows(prompt)
     if _EXCEPT_WORDS.search(said or "") or says_device_word(said, [{"names": [p[1]]} for p in rows]):
         return [], None
     same = [p for p in rows if p[2].split(".")[0] == entity_id.split(".")[0]]

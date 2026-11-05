@@ -334,6 +334,45 @@ def test_all_at_place_after_asking_where():
         assert targets == [] and question.startswith("没有执行"), said
 
 
+def test_device_rows_only_takes_lines_ending_in_an_entity_id():
+    prompt = "你是小智，丁地,戊地,己地都有\n甲地书房, 书房灯, light.a1\n两栏,light.a2\n四栏,一,二,light.a3\n"
+    assert H._device_rows(prompt) == [["甲地书房", "书房灯", "light.a1"]]
+    assert H._device_rows("") == [] and H._device_rows(None) == []
+
+
+def _listed_conflict(said: str, entity_id: str = "light.a1", prompt: str = _LIGHTS, es: list | None = None) -> str | None:
+    return H.listed_place_conflict(prompt, said, entity_id, entries() if es is None else es)
+
+
+def test_listed_place_conflict_blocks_a_device_elsewhere():
+    text = _listed_conflict("把老家的灯也都关了")
+    assert text.startswith("没有执行") and "乙地老家" in text and "甲地书房" in text
+    # 位置写法不统一也认得出（"甲地1号"）；别的类也算（音箱）；反过来也一样；地点的别名也算
+    assert _listed_conflict("把老家的灯也都关了", "light.a2")
+    assert _listed_conflict("把老家的都关了", "media_player.a3")
+    assert _listed_conflict("把甲地的灯也都关了", "light.b1")
+    assert _listed_conflict("乙地的灯也都关了", "light.a1")
+
+
+def test_listed_place_conflict_lets_through_the_place_said_and_unsure_cases():
+    # 就在说的地方，或者这句提到了两处
+    for said, entity in (("把甲地的灯都关了", "light.a1"), ("把甲地的灯都关了", "light.a2"), ("把老家的灯都关了", "light.b1"),
+                         ("把甲地和老家的灯都关了", "light.a1"), ("把甲地和老家的灯都关了", "light.b1")):
+        assert _listed_conflict(said, entity) is None, said
+    # 这句没提地点（"都关了吧"看前一句），还没听到这一句
+    for said in ("都关了吧", "把它打开", "把灯关了", "", None):
+        assert _listed_conflict(said) is None, said
+    # 排除、否定、提问：提到的地点可能正好不是要控制的
+    for said in ("除了老家，把灯都关了", "老家的灯留着，别的都关了", "老家的不用关", "别管老家", "老家的灯算了", "老家的灯都关了吗"):
+        assert _listed_conflict(said) is None, said
+    # 设备不在列表里；位置里认不出地点（"丙地"不是 HA 的区域）；列表或名单为空
+    assert _listed_conflict("把老家的灯关了", "light.unknown") is None
+    assert _listed_conflict("把老家的灯关了", "") is None
+    assert _listed_conflict("把老家的灯关了", "light.c1") is None
+    assert _listed_conflict("把老家的灯关了", prompt="你是小智") is None
+    assert _listed_conflict("把老家的灯关了", es=[]) is None
+
+
 def test_name_rivals_lets_through_clear_words_all_words_and_other_calls():
     for said, name in (("把戊地卧室的遮光窗帘拉上", "戊地1号卧室布帘"), ("把客厅纱帘关上", "戊地1号客厅纱帘"),
                        ("打开大净化器", "大净化器"), ("打开戊地的甲牌风扇", "戊地甲牌风扇"), ("打开己地的风扇", "己地甲牌净化风扇"),

@@ -695,6 +695,8 @@ class S2SProvider(S2SProviderBase):
         # HA 意图工具的填法规则 + 智能设备列表以外的设备名单（decisions 和小模型都看；Live 主模型的指令里没有）
         ha = ha_names.dispatch_text(self._tool_list(), self._ha_entries, self.ha_names_domains) if self.ha_names else ""
         return (f"{self._instructions()}\n\n你现在是小智的工具调度：根据对话里用户最后一句话决定调用哪个工具。"
+                # 11-05 模拟："把甲地的灯都关了""把乙地的灯也都关了"，小模型看不到上一次委托的工具记录，以为上文没真做，把甲地的灯又调了一遍，还"更正"说没关成
+                "对话记录里只有说过的话，看不到之前的工具记录：小智上文说已经做了的事都做过了，不要重做，也不要更正，除非用户最后一句要求。"
                 "日期、农历、时间、天气、家里设备的状态和控制、本机音量这类实时信息必须调用工具，不要凭记忆回答。"
                 # 11-03 夜对比：没有这一句时 gpt-4.1-mini 4/4 把"停一下"当成告别去调 handle_exit_intent
                 "“停一下”“等一下”“别说了”只是让小智先停下，不是结束对话，不要调用 handle_exit_intent；只有用户明确告别（再见、拜拜、没事了）才结束对话。"
@@ -837,6 +839,20 @@ class S2SProvider(S2SProviderBase):
         self.logger.bind(tag=TAG).info(f"Live 设备歧义拦下 {name} {call.get('arguments')}：{blocked}")
         return blocked
 
+    def _check_set_state(self, call: dict, last: str) -> str | None:
+        """hass_set_state 执行前：用户这句话（last）说了地点、这台设备却在别处时，返回交给小模型 / Live 的说明、不执行（见 ha_names.listed_place_conflict）。
+        每一轮都查：跨房子发生在第一轮展开之后，第二轮小模型把上文那一处的灯又调了一遍。"""
+        try:
+            args = json.loads(call.get("arguments") or "{}")
+        except ValueError:
+            return None
+        if not isinstance(args, dict):
+            return None
+        blocked = ha_names.listed_place_conflict(self.conn.prompt, last, str(args.get("entity_id") or ""), self._ha_entries)
+        if blocked:
+            self.logger.bind(tag=TAG).info(f"Live 地点守卫拦下 hass_set_state {args.get('entity_id')}：{blocked}")
+        return blocked
+
     def _fan_out_intent(self, calls: list, said: str, recent: str) -> list:
         """"把甲地的窗帘都关上"走 HA 意图：小模型有时一幅一轮，默认 3 轮用完还没关完；有时漏了几幅还说都关了；有时只填区域，用户没点的那种
         也动了（"把甲地的纱帘都关上"连布帘一起关），或者 device_class 填错一幅都找不到（11-04 模拟）。和灯一样：工具和动作用小模型填的，
@@ -950,8 +966,8 @@ class S2SProvider(S2SProviderBase):
                 outputs = []
                 for call in calls:
                     used.append(call.get("name"))
-                    blocked = ask or (self._check_ha_call(call, intents, "\n".join(said), recent, asked)
-                                      if call.get("name") in intents else None)
+                    blocked = ask or (self._check_ha_call(call, intents, "\n".join(said), recent, asked) if call.get("name") in intents
+                                      else self._check_set_state(call, last) if call.get("name") == "hass_set_state" else None)
                     result = blocked or await self.tools.run(call.get("name") or "", call.get("arguments") or "{}")
                     outputs.append(result)
                     ran.append(f"已调用 {call.get('name')}（参数 {call.get('arguments') or '{}'}），结果：{result[:self.direct_max_chars]}")
