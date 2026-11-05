@@ -55,6 +55,7 @@ UNFINISHED = "工具调用到这里停了，不会接着做，可能还有没做
 # 喊停那句里不算"别的话"的词：口头的"一下 / 一点 / 下来"、称呼、客气话和语气词（见 _has_more），长的在前
 _STOP_FILLERS = ("好不好", "可以吗", "一下", "一点", "下来", "好吗", "行吗", "好的", "谢谢", "那个", "先", "你", "我", "好",
                  "吧", "啊", "呀", "呢", "嗯", "哦", "噢", "喔", "唉", "诶", "欸", "哎", "嘛", "啦", "了", "吗")
+_BYE_FILLER = re.compile(r"[，,。.！!？?、\s]|小智|好的|好吧|好嘞|好|嗯|哦|噢|那就|那|就|吧|啦|了|呀|啊")   # 告别句里不算别的话的部分（见 _only_goodbye）
 _CLAUSE_END = re.compile(r"[。！？!?….，,、；;：:]+")   # 判断告别时切出回复的最后一小句
 THINK_TOOL = "think_deeper"     # 小模型用它把要查、要想的问题交给思考模型（见 _think）
 THINK_INSTRUCTIONS = ("你是语音助手小智的思考后台，你的答复会由小智念给用户听。用中文，两三句话说结论和关键数字，总共不超过一百字，不要 Markdown、链接和来源编号。"
@@ -1265,9 +1266,22 @@ class S2SProvider(S2SProviderBase):
             self.spawn(self.speaker.end())
         await self._flush_input_text()
 
+    def _only_goodbye(self, said: str) -> bool:
+        """用户这句话只是告别（"拜拜""嗯，再见""小智，再见吧"），不是在说别的事时提到这个词（"再见用英语怎么说"）。"""
+        if not any(w in said for w in self.goodbye_words):
+            return False
+        rest = _BYE_FILLER.sub("", said)
+        for w in sorted(self.goodbye_words, key=len, reverse=True):
+            rest = rest.replace(w, "")
+        return not rest
+
     def _is_goodbye(self, assistant_txt: str) -> bool:
         if not self.close_on_goodbye or not assistant_txt:
             return False
+        # 11-05 真机：用户说拜拜时模型正在念，这段可能只是"…拜拜，下次再聊。"，也可能没有告别词，或者告别词被切到下一段（"好，下""次见！"）。
+        # 用户这句只是告别就够了，不用再看模型怎么说
+        if self._only_goodbye("".join(self.in_text).strip() or self.last_user_text):
+            return True
         said = (self.last_user_text + "".join(self.in_text))
         if not any(w in said for w in self.goodbye_words):
             return False

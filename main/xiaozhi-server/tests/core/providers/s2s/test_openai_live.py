@@ -692,13 +692,32 @@ def test_goodbye_merged_into_a_long_reply_closes(user, reply):
 
 @pytest.mark.parametrize("user,reply", [
     ("嗯", "故事讲到这里就结束了,他们挥挥手各自回家。大家一起说,再见!"),     # 用户没告别
-    ("拜拜", "拜拜是告别的话,和再见差不多。今天农历九月廿六,还想知道别的吗?"),     # 最后一句里没有告别词
-    ("拜拜", "今天农历九月廿六,宜祭祀、出行。从前的人分开的时候都会说再见然后挥手走很远很远的路"),     # 最后一句太长，只是提到
-    ("拜拜", "今天宜祭祀、出行、结婚、宴会、嫁娶、求医疗病。忌修置产室、开渠、穿井、破屋坏垣、苫盖等。"),     # 回复里没有告别词，等空闲关闭
-    ("拜拜", "这个词很常用,大家分开的时候都会说再见或者拜拜,你还想知道别的吗"),     # 告别词在前面的小句里，最后一小句不是告别
+    ("拜拜是什么意思", "拜拜是告别的话,和再见差不多。今天农历九月廿六,还想知道别的吗?"),     # 最后一句里没有告别词
+    ("拜拜是什么意思", "今天农历九月廿六,宜祭祀、出行。从前的人分开的时候都会说再见然后挥手走很远很远的路"),     # 最后一句太长，只是提到
+    ("拜拜是什么意思", "今天宜祭祀、出行、结婚、宴会、嫁娶、求医疗病。忌修置产室、开渠、穿井、破屋坏垣、苫盖等。"),     # 回复里没有告别词
+    ("拜拜和再见有什么区别", "这个词很常用,大家分开的时候都会说再见或者拜拜,你还想知道别的吗"),     # 告别词在前面的小句里，最后一小句不是告别
 ])
 def test_long_reply_without_a_goodbye_at_the_end_stays_open(user, reply):
     assert not _closes_when_user_speaks_during_reply(user, reply)
+
+
+@pytest.mark.parametrize("reply", [    # 11-04、11-05 日志的原句：用户这句只是告别，模型怎么说都结束
+    "从前有只小猫,它每天都会去找森林里的老橡树聊天,老橡树就会慢悠悠地跟它讲昨天拜拜,下次再聊。",
+    "今天宜祭祀、出行、结婚、宴会、嫁娶、求医疗病。忌修置产室、开渠、穿井、破屋坏垣、苫盖等。",
+    "纯电保险稍贵、残值偏低。好,下",
+])
+def test_user_only_saying_goodbye_closes_whatever_the_reply_says(reply):
+    assert _closes_when_user_speaks_during_reply("拜拜", reply)
+
+
+@pytest.mark.parametrize("said,only", [
+    ("拜拜", True), ("拜拜。", True), ("嗯，再见", True), ("小智，再见吧", True), ("好的拜拜", True), ("那就下次聊吧", True), ("拜拜拜拜", True),
+    ("再见用英语怎么说", False), ("拜拜是什么意思", False), ("跟他说再见", False), ("你好小智", False), ("", False), ("好的", False),
+])
+def test_only_goodbye(said, only):
+    async def sc(lv, conn, p):
+        assert p._only_goodbye(said) is only
+    run(sc)
 
 
 def test_short_reply_is_judged_as_a_whole():
