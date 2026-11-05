@@ -512,6 +512,13 @@ def test_outside_kind_answer():
     assert H.outside_kind_answer("灯和窗帘", True) is None and H.outside_kind_answer("灯和窗帘", False) is None
     for said in ("全部", "都关了吧", "所有设备", "", None):
         assert H.outside_kind_answer(said, True) is None and H.outside_kind_answer(said, False) is None, said
+    # 不要了：什么都不动
+    for said in ("算了", "不用了", "不用", "不要了", "那就算了吧", "先不关了", "别关了", "别动了。", "算了，"):
+        assert H.outside_kind_answer(said, True).startswith(H.NOT_AN_ERROR), said
+        assert H.outside_kind_answer(said, False).startswith(H.NOT_AN_ERROR), said
+    # 这些不是不要了
+    for said in ("只关灯，别的不用", "不用关灯，关窗帘"):
+        assert not (H.outside_kind_answer(said, True) or "").endswith("不用再调用。"), said
 
 
 def test_lights_except_goes_by_the_list():

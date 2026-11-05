@@ -1941,6 +1941,9 @@ def test_answer_with_a_kind_only_controls_that_kind():
     curtain = _intent_call("c8", tool=off, name="客厅纱帘")
     rec = _after_first_call(["除了老家外，别的都关了", "只关灯"], [_text_reply("灯关了。")], first=curtain, tool=off, props=props)
     assert rec["calls"] == [] and rec["auto"] == [1] and rec["commentary"] == "灯关了。"
+    # 答"不用了"：小模型还是调了，不执行
+    rec = _after_first_call(["除了老家外，别的都关了", "不用了"], [_text_reply("好的，没有动。")], first=_light_call("light.a1"))
+    assert rec["calls"] == [] and rec["commentary"] == "好的，没有动。"
     # 不是答问题的时候不管
     rec = _after_first_call("把灯关了", [], first=_light_call("light.a1"))
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"]

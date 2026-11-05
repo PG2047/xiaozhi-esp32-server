@@ -445,9 +445,14 @@ def still_kept_out(said: str, asked: Iterable[str], prompt: str, entries: list[d
     return set(asked)
 
 
+_CALL_OFF = re.compile(r"(?:那|就|那就|先)*(?:算了|不用了?|不要了?|别[关开动]了?|不[关开动]了?)[吧啊呀了哦，,。！!]*")
+
+
 def outside_kind_answer(said: str, is_light: bool) -> str | None:
-    """问过"别处控制哪一类"，这句答了哪一类：答"只关灯"别的设备不动，答"窗帘"灯不动，返回写给小模型的说明；答全部、没点类别都放行。
-    11-05 模拟：答"窗帘"时第一轮关窗帘，第二轮小模型把别处的灯也关了。"""
+    """问过"别处控制哪一类"，这句答了哪一类：答"只关灯"别的设备不动，答"窗帘"灯不动，答"算了"都不动，返回写给小模型的说明；答全部、没点类别都放行。
+    11-05 模拟：答"窗帘"时第一轮关窗帘，第二轮小模型把别处的灯也关了；答"不用了"16 次 2 次把别处的灯都关了。"""
+    if _CALL_OFF.fullmatch((said or "").strip()):
+        return f"{NOT_AN_ERROR}用户说“{said}”，不控制了，所以没有控制这个设备。告诉用户没有动就好，不用再调用。"
     kinds = set(_KIND_WORDS.findall(said or ""))
     if not kinds or ("灯" in kinds if is_light else kinds - {"灯"}):
         return None
