@@ -28,7 +28,6 @@ import json
 import os
 import re
 import time
-import wave
 
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
@@ -46,9 +45,10 @@ TAG = __name__
 LIVE_RATE = 16000       # 上下行都用 16 kHz（Live 支持 16 k / 24 k）
 WAKE_TRIGGER = "嘿，你好呀"
 TTS_RATE = 24000        # 固定应答文件的格式：24 kHz 16-bit 单声道，不同采样率的设备各自从它重采样
-PHRASE_PEAK = 20000     # MeloTTS 的声音很轻（11-05 "我在。"峰值 2820，满量程 32767），不放大的话比 Live 的声音轻很多
+PHRASE_PEAK = 20000     # 固定应答统一放大到这个峰值（满量程 32767）：11-05 Edge 云希"好。"只有约 12400，MeloTTS 更轻
+PHRASE_TTS_TIMEOUT_S = 30   # 后台预取，播放那边最多只等 2.5 s，取得慢不耽误；太短会让重启后缓存还空的那批会话一直没有应答
 CONTEXT_CHUNK_CHARS = 400   # session.thinking.append 每条 content 上限 500 token，中文按 400 字切
-_GREETING_CACHE: dict[tuple, bytes] = {}   # (voice, 文本, 设备采样率) → PCM，进程内共用：只有第一次唤醒要等 TTS
+_GREETING_CACHE: dict[tuple, bytes] = {}   # (音色, 文本, 设备采样率) → PCM，进程内共用：只有第一次唤醒要等 TTS
 _HA_CACHE: dict = {"t": 0.0, "entries": []}  # GetLiveContext 解析出的设备表，进程内各连接共用（见 _load_ha_names）；只按一个 HA 缓存
 # 调用没走完（轮数用完、中途出错）时交给 Live 的话的开头，后面跟每个调用的结果
 UNFINISHED = "工具调用到这里停了，不会接着做，可能还有没做的。下面是已经调用的，照实告诉用户做了哪些，不要说都做完了，也不要说还在继续：\n"
@@ -75,12 +75,21 @@ def _louder(pcm: bytes, peak: int = PHRASE_PEAK) -> bytes:
     return audioop.mul(pcm, 2, peak / top) if 0 < top < peak else pcm
 
 
-def _melotts_pcm(data) -> tuple[bytes, int]:
-    """Workers AI MeloTTS 的回复 {"result": {"audio": base64 的 WAV}} → (PCM, 采样率)。结构不对就抛异常。"""
-    with wave.open(io.BytesIO(base64.b64decode(data["result"]["audio"])), "rb") as w:
-        if w.getnchannels() != 1 or w.getsampwidth() != 2:
-            raise ValueError("不是 16 位单声道")
-        return w.readframes(w.getnframes()), w.getframerate()
+def _decode_mp3(mp3: bytes) -> bytes:
+    """MP3 → TTS_RATE 的 16 位单声道 PCM。要 ffmpeg，server 镜像里有。"""
+    from pydub import AudioSegment
+    seg = AudioSegment.from_file(io.BytesIO(mp3), format="mp3")
+    return seg.set_channels(1).set_sample_width(2).set_frame_rate(TTS_RATE).raw_data
+
+
+async def _edge_pcm(text: str, voice: str) -> bytes:
+    """Edge TTS 合成一句（微软的接口，不用 key，级联的 EdgeTTS 也用它），转成 PCM。没声音、不通时抛异常。"""
+    import edge_tts
+    mp3 = b""
+    async for chunk in edge_tts.Communicate(text, voice=voice).stream():
+        if chunk["type"] == "audio":
+            mp3 += chunk["data"]
+    return await asyncio.to_thread(_decode_mp3, mp3)
 
 
 class S2SProvider(S2SProviderBase):
@@ -97,11 +106,8 @@ class S2SProvider(S2SProviderBase):
         # 唤醒应答：Live 没法让模型先开口（XVF3800 走"服务端收唤醒词音频"的路径，固件也不播提示音），
         # 所以合成一句（默认"我在。"）缓存起来，唤醒时直接播。空串关掉
         self.wake_greeting_text = str(c.get("wake_greeting_text", "我在。") or "").strip()
-        # 固定应答的 TTS 走 Cloudflare Workers AI（11-05：OpenAI 那把 key 只给 Live 连接用）。
-        # tts_url 是 .../accounts/<id>/ai/run，后面接模型名。没配 tts_url 或 tts_api_key 就不合成，只读文件，没有文件就不播
-        self.greeting_tts_model = str(c.get("greeting_tts_model") or "@cf/myshell-ai/melotts")
-        self.tts_url = str(c.get("tts_url") or "").rstrip("/")
-        self.tts_api_key = str(c.get("tts_api_key") or "")
+        # 固定应答用 Edge TTS（11-05：OpenAI 那把 key 只给 Live 连接用）。音色和 Live 不一样
+        self.greeting_tts_voice = str(c.get("greeting_tts_voice") or "zh-CN-YunxiNeural")
         # 固定应答（"我在。""好。"）只合成一次：存在这个目录下，以后读文件，重启也不再调 TTS
         self.phrase_dir = str(c.get("phrase_dir") or "data/live_phrases")
         self._greeting_task = None
@@ -423,9 +429,9 @@ class S2SProvider(S2SProviderBase):
         return await self._tts_pcm(self.stop_ack_text, "停下应答")
 
     def _phrase_path(self, text: str) -> str:
-        """固定应答的文件名：音色 + 模型和文本的摘要，改了其中一样就是另一个文件、重新合成。"""
-        digest = hashlib.sha256(f"{self.greeting_tts_model}\n{text}".encode()).hexdigest()[:16]
-        return os.path.join(self.phrase_dir, f"{self.voice}-{digest}.pcm")
+        """固定应答的文件名：音色 + 文本的摘要，改了其中一样就是另一个文件、重新合成。"""
+        digest = hashlib.sha256(text.encode()).hexdigest()[:16]
+        return os.path.join(self.phrase_dir, f"{self.greeting_tts_voice}-{digest}.pcm")
 
     def _save_phrase(self, path: str, pcm: bytes, what: str) -> None:
         """存不下只记一条日志：这次会话照样能播，下次重启再合成。"""
@@ -439,7 +445,7 @@ class S2SProvider(S2SProviderBase):
             self.logger.bind(tag=TAG).warning(f"{what} 存文件失败 {type(e).__name__}")
 
     async def _tts_pcm(self, text: str, what: str) -> bytes:
-        key = (self.voice, text, self.speaker.sample_rate)
+        key = (self.greeting_tts_voice, text, self.speaker.sample_rate)
         if key in _GREETING_CACHE:
             return _GREETING_CACHE[key]
         path = self._phrase_path(text)
@@ -449,27 +455,16 @@ class S2SProvider(S2SProviderBase):
         except OSError:
             pcm = b""
         if not pcm:
-            if not self.tts_url or not self.tts_api_key:
-                self.logger.bind(tag=TAG).warning(f"{what} 没有文件，也没配 tts_url、tts_api_key，这句不播")
-                return b""
-            import aiohttp
-            # 后台预取，超时放宽到 30 s：重启后缓存还空的那批会话不能因为一次慢请求就一直没有应答。播放那边最多只等 2.5 s，取得慢不耽误
             try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
-                    async with s.post(f"{self.tts_url}/{self.greeting_tts_model}", json={"prompt": text, "lang": "zh"},
-                                      headers={"Authorization": f"Bearer {self.tts_api_key}"}) as r:
-                        if r.status != 200:
-                            self.logger.bind(tag=TAG).warning(f"{what} TTS 失败 HTTP {r.status}")
-                            return b""
-                        raw, rate = _melotts_pcm(await r.json(content_type=None))
-            except Exception as e:  # noqa: BLE001  网络错误、超时、回的结构不对
+                raw = await asyncio.wait_for(_edge_pcm(text, self.greeting_tts_voice), PHRASE_TTS_TIMEOUT_S)
+            except Exception as e:  # noqa: BLE001  网络错误、超时、解码失败
                 self.logger.bind(tag=TAG).warning(f"{what} TTS 失败 {type(e).__name__}")
                 return b""
-            if rate != TTS_RATE:
-                raw = Resampler(rate, TTS_RATE).process(raw)
             pcm = _trim_silence(_louder(raw), TTS_RATE)   # TTS 首尾带静音，唤醒后要马上出声
-            if pcm:
-                self._save_phrase(path, pcm, what)
+            if not pcm:
+                self.logger.bind(tag=TAG).warning(f"{what} TTS 没有声音")
+                return b""
+            self._save_phrase(path, pcm, what)
         if self.speaker.sample_rate != TTS_RATE:
             pcm = Resampler(TTS_RATE, self.speaker.sample_rate).process(pcm)
         _GREETING_CACHE[key] = pcm
