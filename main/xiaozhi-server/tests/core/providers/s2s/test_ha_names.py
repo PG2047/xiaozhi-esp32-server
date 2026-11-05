@@ -362,6 +362,11 @@ def test_listed_place_conflict_lets_through_the_place_said_and_unsure_cases():
     # 这句没提地点（"都关了吧"看前一句），还没听到这一句
     for said in ("都关了吧", "把它打开", "把灯关了", "", None):
         assert _listed_conflict(said) is None, said
+    # 地点只看带动作的小句：说老家的是天气；一个带动作的小句都没有才看整句
+    assert _listed_conflict("老家今天多少度，顺便把书房灯关了") is None
+    assert _listed_conflict("先把书房灯关了，老家今天多少度") is None
+    assert _listed_conflict("老家今天多少度，顺便把老家的灯关了") and _listed_conflict("书房灯关了，再把老家的灯关了")
+    assert _listed_conflict("那老家的呢") and _listed_conflict("老家的")
     # 排除、否定、提问：提到的地点可能正好不是要控制的
     for said in ("除了老家，把灯都关了", "老家的灯留着，别的都关了", "老家的不用关", "别管老家", "老家的灯算了", "老家的灯都关了吗"):
         assert _listed_conflict(said) is None, said

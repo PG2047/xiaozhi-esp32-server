@@ -345,13 +345,14 @@ def listed_place_conflict(prompt: str, said: str, entity_id: str, entries: list[
     别处，返回交给小模型 / Live 的说明（不执行）；没问题返回 None。11-05 模拟："把甲地的灯都关了""把乙地的灯也都关了"，第一轮展开乙地的灯都对，
     第二轮小模型又把甲地的灯调了一遍（答复里说"之前说关了，其实没真的去关"：调度只看得到这次委托的工具记录，看不到上一次的）。
 
-    said 只给最后一句：上一句常落在委托标记之后（交回之后 Live 才开口），把它也算上，上一句的地点就放行了。
-    拿不准都放行：这句没提地点（"都关了吧"看前一句）；有排除、否定、提问的词（"除了甲地，把灯都关了"，提到的地点正好不是要控制的）；
+    said 只给最后一句：上一句常落在委托标记之后（交回之后 Live 才开口），把它也算上，上一句的地点就放行了。地点只看带动作的小句：
+    "乙地今天多少度，顺便把书房灯关了"说乙地的是天气；一个带动作的小句都没有（"那乙地的呢"）才看整句。
+    拿不准都放行：要控制的那句没提地点（"都关了吧"看前一句）；有排除、否定、提问的词（"除了甲地，把灯都关了"，提到的地点正好不是要控制的）；
     设备不在列表里；位置里认不出地点。"""
     if _EXCEPT_WORDS.search(said or ""):
         return None
     tokens = area_tokens(entries)
-    places = mentioned_areas(said, tokens)
+    places = mentioned_areas("，".join(c for c in _CLAUSE.split(said or "") if _COMMAND_WORDS.search(c)) or said, tokens)
     if not places:
         return None
     row = next((p for p in _device_rows(prompt) if p[2] == entity_id), None)

@@ -1844,6 +1844,9 @@ def test_place_of_an_earlier_sentence_does_not_block_this_one():
     assert "没有执行" not in rec["commentary"]
     rec = _after_first_call("除了老家，把灯都关了", [])
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"] and "没有执行" not in rec["commentary"]
+    # 说老家的是天气，要控制的是书房灯
+    rec = _after_first_call("老家今天多少度，顺便把书房灯关了", [])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"] and "没有执行" not in rec["commentary"]
     # 问过哪一处，答了之后第二轮还想调别处的：一样拦下
     rec = _after_first_call(["把灯全关了", "甲地的"], [[_light_call("light.b1", "c8"), _light_call("light.a1", "c9")], _text_reply("甲地的灯都关了。")])
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3", "light.a1"]
