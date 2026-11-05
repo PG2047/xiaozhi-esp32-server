@@ -17,6 +17,7 @@ HA 的意图工具（MCP 里叫"平台__Hass意图"，如 intent__HassTurnOn、f
 用户说了"都"却没说地点、几处都有这类设备（"把净化器都关了"），先问是哪一处，答了之后范围照名单定（where_named）。
 
 智能设备列表里的设备（灯，走 hass_set_state）也过一道地点守卫（listed_place_conflict）：地点从列表的"位置"一栏认。
+用户明说不动的地点（"除了甲地""甲地的不用"，excluded_places），两道地点守卫都反过来看：那里的设备不执行。
 
 名字、区域都来自 HA，这里不写任何地名。只读：只调 GetLiveContext。
 """
@@ -181,6 +182,34 @@ def mentioned_areas(text: str, tokens: dict[str, set[str]]) -> set[str]:
     return {k for k, toks in tokens.items() if any(x.replace(" ", "") and x.replace(" ", "") in t for x in toks)}
 
 
+# 这种说明是写给小模型看的（"别处还没控制的话接着控制"）：它接着调用或者总结，不直接念给用户
+NOT_AN_ERROR = "没有执行，这不是出错："
+# 用户明说不动的地点。前置（"除了甲地""除开甲地和乙地"）到小句结束或"都 / 别的 / 其他 / 把 / 以外"为止；
+# 后置（"甲地的不用""甲地的灯不用关""甲地除外"）；前面带否定（"别关甲地的灯""不用管甲地"）。"要不把甲地的灯关了""要不要""用不用"是在提议，不算
+_EXCLUDE_HEAD = re.compile(r"除(?:了|开|去)?(.*?)(?=[，,。；;！!？?\n]|都|全|其他|其它|别的|把|将|以外|之外|外|$)")
+_EXCLUDE_FILLER = re.compile(r"[的灯和跟与及、]|那边|这边|那里|这里|家里")
+_EXCLUDE_AFTER = r"(?:的|那边|这边|那里|这里|家里)*(?:灯|设备)?(?:都|全|也|就|先)*(?:不用|不要|别(?!的)|不关|不开|不动|不管|留着|留下|算了|除外)"
+_EXCLUDE_BEFORE = r"(?:(?<![要用])不(?:要|用|包括|含)?|先?别|留着|留下)(?:把|将|去|再)?(?:关|开|动|管|碰|拉|调)*(?:掉|上)?"
+
+
+def excluded_places(said: str, tokens: dict[str, set[str]]) -> set[str]:
+    """用户这句话明说不动的地点。11-05 模拟："除了甲地，把灯都关了"第一轮都对，第二轮小模型多关了甲地一盏（同批 8/124）；反过来 HA 意图的地点守卫
+    把"甲地"当成要控制的地方，别处的调用全拦了。认不准就不算：前置的排除中间只能是地点和"的灯"这类词（"除了甲地书房灯"排除的是一盏灯，
+    "除了关甲地的灯"是另一回事），"甲地的灯留一盏""甲地的别的灯"都不算。"""
+    t = norm(said).replace(" ", "")
+    words = {w.replace(" ", ""): a for a, ws in tokens.items() for w in ws if w.replace(" ", "")}
+    if not t or not words:
+        return set()
+    out: set[str] = set()
+    for m in _EXCLUDE_HEAD.finditer(t):
+        if not _EXCLUDE_FILLER.sub("", _without_places(m.group(1), tokens)):
+            out |= mentioned_areas(m.group(1), tokens)
+    alt = "|".join(map(re.escape, sorted(words, key=len, reverse=True)))
+    for m in re.finditer(f"({alt}){_EXCLUDE_AFTER}|{_EXCLUDE_BEFORE}({alt})", t):
+        out.add(words[m.group(1) or m.group(2)])
+    return out
+
+
 def _as_list(v: Any) -> list:
     return v if isinstance(v, list) else [v]
 
@@ -205,11 +234,16 @@ def matched(tool_name: str, args: dict, entries: Iterable[dict]) -> list[dict]:
 
 def place_conflict(utterance: str, tool_name: str, args: dict, entries: list[dict]) -> str | None:
     """用户这句话提到了某个区域、这次调用却会命中别的区域的设备：返回交给 Live 的说明（不执行）；没问题返回 None。
+    用户明说不动的地点不算提到：命中那里的设备不执行；只说了不动哪里时（"除了甲地，把净化器都关了"）别处都放行。
     没提地点、HA 本来就匹配不上、命中的设备没分区域，都放行。"""
-    said = mentioned_areas(utterance, area_tokens(entries))
-    if not said:
-        return None
-    off = [e for e in matched(tool_name, args, entries) if e["areas"] and e["areas"][0] not in said]
+    tokens = area_tokens(entries)
+    excluded = excluded_places(utterance, tokens)
+    said = mentioned_areas(utterance, tokens) - excluded
+    hits = [e for e in matched(tool_name, args, entries) if e["areas"]]
+    kept = sorted({e["areas"][0] for e in hits} & excluded)
+    if kept:
+        return f"{NOT_AN_ERROR}地点检查发现用户说了不动{'、'.join(kept)}，这次调用会动到那里的设备，所以没有控制。说别处的结果就好；别处还没控制的话接着控制。"
+    off = [e for e in hits if said and e["areas"][0] not in said]
     if not off:
         return None
     where = "、".join(sorted({e["areas"][0] for e in off}))
@@ -347,21 +381,25 @@ def listed_place_conflict(prompt: str, said: str, entity_id: str, entries: list[
     第二轮小模型又把甲地的灯调了一遍（答复里说"之前说关了，其实没真的去关"：调度只看得到这次委托的工具记录，看不到上一次的）。
 
     said 只给最后一句：上一句常落在委托标记之后（交回之后 Live 才开口），把它也算上，上一句的地点就放行了。地点只看带动作的小句：
-    "乙地今天多少度，顺便把书房灯关了"说乙地的是天气；一个带动作的小句都没有（"那乙地的呢"）才看整句。
-    拿不准都放行：要控制的那句没提地点（"都关了吧"看前一句）；有排除、否定、提问的词（"除了甲地，把灯都关了"，提到的地点正好不是要控制的）；
+    "乙地今天多少度，顺便把书房灯关了"说乙地的是天气；一个带动作的小句都没有（"那乙地的呢"）才看整句。用户明说不动的地点（excluded_places）反过来：
+    这台设备在那里就不执行，别处放行。
+    拿不准都放行：要控制的那句没提地点（"都关了吧"看前一句）；认不出是不动哪里的排除、否定、提问（"甲地的灯留一盏""甲地的灯都关了吗"）；
     设备不在列表里；位置里认不出地点。"""
-    if _EXCEPT_WORDS.search(said or ""):
-        return None
     tokens = area_tokens(entries)
-    places = mentioned_areas("，".join(c for c in _CLAUSE.split(said or "") if _COMMAND_WORDS.search(c)) or said, tokens)
-    if not places:
+    excluded = excluded_places(said, tokens)
+    if not excluded and _EXCEPT_WORDS.search(said or ""):
         return None
+    places = mentioned_areas("，".join(c for c in _CLAUSE.split(said or "") if _COMMAND_WORDS.search(c)) or said, tokens) - excluded
     row = next((p for p in _device_rows(prompt) if p[2] == entity_id), None)
     at = mentioned_areas(row[0], tokens) if row else set()
-    if not at or at & places:
+    if at & excluded:
+        # 只说事实：11-05 模拟里写"不要控制它，也不用提它"时，用户的话被网关遮蔽的句子，小模型两次把这段当成可疑的指令告诉用户
+        return (f"{NOT_AN_ERROR}地点检查发现用户说了不动{'、'.join(sorted(at & excluded))}，这台设备在{row[0]}，所以没有控制它。"
+                "说别处的结果就好；别处还没控制的话接着控制。")
+    if not at or not places or at & places:
         return None
     where = "、".join(sorted(places))
-    return (f"没有执行，这不是出错：用户这句说的是{where}，这台设备在{row[0]}，这句没有要控制它，不用重做，也不用提它。"
+    return (f"{NOT_AN_ERROR}用户这句说的是{where}，这台设备在{row[0]}，这句没有要控制它，不用重做，也不用提它。"
             f"只说{where}的结果；{where}还没控制的话接着控制，或者问清是哪一台。")
 
 
