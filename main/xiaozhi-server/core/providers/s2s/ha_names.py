@@ -733,7 +733,8 @@ def partial_names(prompt: str, said: str, entries: list[dict], asked: str = "") 
 
     认的说法：完整的名字、房间 + 灯（"客厅灯"）、单说房间（"书房和客厅的灯"）、灯名字的片段（"台灯""筒灯"）。至少两处；只说一处时要说了"都"（"把客厅的灯都关了"），
     没说"都"小模型自己会问。定是哪一处见 _settle：说了的地点、完整名字的设备、一处能对上所有说法。定不了（两处都对得上、片段不在一处、说了地点那里没有）就不跨房子猜，
-    返回回问。上一次委托问过（asked 是问的那句话）时，这次答了地点就是那一处的，答"都关"就是这几个说法对得上的全部，点了设备照小模型的，没答上来再问。
+    返回回问。上一次委托问过（asked 是问的那句话）时，这次答了地点就是那一处的，答"都关"就是这几个说法对得上的全部，点了设备照小模型的，没答上来（或者说了别的事）
+    返回回问，要不要问由调用方看小模型选了什么。
 
     拿不准都返回 ([], None, False)，照旧执行小模型填的：有排除、否定、提问的词（"除了书房灯""卧室灯不用关""……关了吗"）；设备名前后还有不是动作的话
     （"卧室大灯""客厅的窗帘""我在客厅""客厅太暗了""把客厅灯调到和书房灯一样亮"）；这几台不同类又是同一个动作。名单没取到时认不出地点，房间也认不出。"""
@@ -746,7 +747,9 @@ def partial_names(prompt: str, said: str, entries: list[dict], asked: str = "") 
     if _EXCEPT_WORDS.search(_POLITE_ASK.sub("", text)):
         return [], None, False
     if answering:
-        if found or says_device_word(text, [{"names": [p[1]]} for p in rows]):
+        # 点了设备（"就卧室灯吧"）、说的是别的设备（"把甲地的窗帘都关上"）或者一处所有的灯（"把甲地的灯全关了"）：是新的一句，不算在答
+        if (found or says_device_word(text, [{"names": [p[1]]} for p in rows]) or _KIND_WORDS.search(text.replace("灯", ""))
+                or names_listed_device(text, entries) or ("灯" in text and says_all(text))):
             return [], None, False
         found, pieces = _mentions(_squash(asked).replace("里灯", "灯"), words)
     if not found or all("灯" not in m["word"] and not m["exact"] for m in found):

@@ -2672,11 +2672,16 @@ def test_answer_after_asking_which_place_controls_those_lights():
     # "都关"说的是这几盏，不是所有的灯（不走全部的回问）
     rec = _partial([said, "都关"], [_text_reply("都关了。")])
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a2", "light.b2", "light.b1", "light.a4"]
-    # 没答上来：再问，什么都不执行，接着答地点还能接上
-    rec = _partial([said, "嗯"])
-    assert rec["calls"] == [] and "没有执行" in rec["commentary"]
-    rec = _partial([said, "嗯", "甲地的"], [_text_reply("都关了。")])
+    # 没答上来：小模型自己问了，什么都不执行，接着答地点还能接上；它又选了灯：不执行，把回问交给 Live
+    rec = _partial([said, "嗯"], [_text_reply("是哪一处？")])
+    assert rec["calls"] == [] and rec["commentary"] == "是哪一处？"
+    rec = _partial([said, "嗯", "甲地的"], [_text_reply("是哪一处？"), _text_reply("都关了。")])
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a2", "light.a4"]
+    two = [_light_call("light.a2", "c0"), _light_call("light.b2", "c1")]
+    rec = _partial([said, "第一个"], [two, _text_reply("是哪一处？")])
+    assert rec["calls"] == [] and rec["auto"] == [0, 2] and rec["commentary"] == "是哪一处？"
+    rec = _partial([said, "第一个"], [[_light_call("light.a2")]])
+    assert rec["calls"] == [] and "问用户要控制哪一处" in rec["commentary"]
     # 点了设备：照小模型填的执行一个
     rec = _partial([said, "书房灯"], [[_light_call("light.a1")]])
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"] and "没有执行" not in rec["commentary"]
@@ -2691,6 +2696,30 @@ def test_answer_counts_even_when_the_small_model_asked_by_itself():
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a2", "light.a4"]
 
 
+def test_something_else_after_asking_which_place():
+    """回问之后说了别的事：照小模型选的执行，不再问，也不再等答复。"""
+    said = "把客厅和卧室的灯关了"
+    clock = {"type": "function_call", "call_id": "c5", "name": "llm__GetDateTime", "arguments": "{}"}
+    rec = _partial([said, "现在几点了"], [[clock]])
+    assert "没有执行" not in rec["commentary"] and rec["commentary"].startswith("已调用 llm__GetDateTime")
+    assert rec["forced"] == [True]                                  # 只有问的那一句强制填参
+    rec = _partial([said, "现在几点了", "甲地的"], [[clock], [_light_call("light.a2")]])
+    assert [c.get("entity_id") for c in rec["calls"]] == [None, "light.a2"]
+    # 说的是别的设备：不动灯，走别的路
+    curtain = {"type": "function_call", "call_id": "c6", "name": "cover__HassTurnOff", "arguments": json.dumps({"name": "甲地窗帘"})}
+    rec = _partial([said, "把甲地的窗帘都关上"], [[curtain]])
+    assert [c.get("name") for c in rec["calls"]] == ["甲地窗帘"] and "没有执行" not in rec["commentary"]
+    # "把甲地的灯全关了"：不是这几盏，走全部（小模型选了灯，全部展开）
+    rec = _partial([said, "把甲地的灯全关了"], [[_light_call("light.a1")], _text_reply("都关了。")])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3", "light.a4"]
+
+
+def test_read_first_keeps_the_question():
+    """强制填参没填出来，小模型先查了一盏：不直接交回；它选了灯就回问。"""
+    rec = _partial("把客厅和卧室的灯关了", [[_get_call("light.a2", "c0")], [_light_call("light.a2", "c1")]], first=[])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a2"] and "问用户要控制哪一处" in rec["commentary"]
+
+
 def test_asking_which_place_only_counts_for_the_next_delegation():
     rec = _partial(["把客厅和卧室的灯关了", "书房灯", "甲地的"], [[_light_call("light.a1")], [_light_call("light.a1")]])
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a1"]
@@ -2700,7 +2729,7 @@ def test_asking_again_keeps_the_sentence_being_asked_about():
     """换了句话又定不了：答的是新的这句。没答上来再问一遍时还记着原来那句。"""
     rec = _partial(["把客厅灯和卧室灯关了", "把卧室灯和客厅灯打开", "老家"], [_text_reply("都开了。")])
     assert [c["entity_id"] for c in rec["calls"]] == ["light.b1", "light.b2"]
-    rec = _partial(["把卧室灯和客厅灯关了", "嗯", "老家"], [_text_reply("都关了。")])
+    rec = _partial(["把卧室灯和客厅灯关了", "嗯", "老家"], [_text_reply("是哪一处？"), _text_reply("都关了。")])
     assert [c["entity_id"] for c in rec["calls"]] == ["light.b1", "light.b2"]
 
 

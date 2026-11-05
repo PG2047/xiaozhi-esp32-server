@@ -778,9 +778,13 @@ def test_partial_names_answer_after_asking():
     assert _partial_ask("老家", prompt="甲地客厅,主灯,light.x1\n甲地书房,书房灯,light.x3\n", asked="把书房灯和客厅灯关了")
     for said in ("嗯", "第一个", "", None):
         assert _partial_ask(said, asked="把客厅和卧室的灯关了"), said
-    # 点了设备：照小模型的；不要了：不展开
-    for said in ("就卧室灯吧", "书房灯", "厨房的", "就书房那个", "不用了", "算了"):
+    # 点了设备、说的是别的设备或者一处所有的灯：照小模型的，走别的路；不要了：不展开
+    for said in ("就卧室灯吧", "书房灯", "厨房的", "就书房那个", "不用了", "算了", "把甲地的窗帘都关上", "把老家的风扇打开", "把甲地的灯全关了"):
         assert answer(said) == ([], None, False), said
+    # "甲地的灯"是在答
+    assert answer("甲地的灯") == (["light.a2", "light.a8"], None, False)
+    # 说了别的事：这里还是回问，要不要问由调用方看小模型选了什么
+    assert _partial_ask("现在几点了", asked="把客厅和卧室的灯关了")
     # 问的那句动作不同、只说了一处
     assert answer("老家", "把客厅灯关了，再把卧室灯打开") == (["light.b2", "light.b1"], None, True)
     assert answer("甲地的", "把客厅的灯都关了") == (["light.a2"], None, False)

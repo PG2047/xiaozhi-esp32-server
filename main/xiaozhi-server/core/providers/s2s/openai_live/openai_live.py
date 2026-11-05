@@ -1013,16 +1013,18 @@ class S2SProvider(S2SProviderBase):
                     and not ha_names.names_listed_device(last, self._ha_entries, self.ha_names_domains))
             # 不完整的名字（"把书房和客厅的灯关了"）：只有 only 这几台能动，定不了是哪一处就回问（见 ha_names.partial_names）
             only, question, differ = ha_names.partial_names(self.conn.prompt, last, self._ha_entries, asked_named)
+            # 这句自己定不了（不是答回问没答上来）。没答上来可能是说了别的事（"现在几点了"），要看小模型选了什么
+            own = bool(question) and bool(ha_names.partial_names(self.conn.prompt, last, self._ha_entries)[1])
             if question:
                 # 小模型可能自己就问了（没有调用），下一次委托照样算在答。没答上来再问时还记着原来那句，这句自己又定不了（换了句话）时记这句
-                self._named_asked = last if ha_names.partial_names(self.conn.prompt, last, self._ha_entries)[1] else asked_named
+                self._named_asked = last if own else asked_named
             if differ:
                 # 每台动作不同，套不了同一个动作，小模型自己一台台做：告诉它定下来的是哪几台（"客厅灯"它自己填可能填到另一处）
                 items[0]["content"] += f"\n（这句话点到的设备是{self._named_list(only)}。按用户对每一台说的动作各调用一次，别的设备不要动。）"
             first = await self._decide_first(ctx, items, tools, sure) if self.tool_picker == "decisions" else None
             # 定下来了或者要回问，小模型只要给出动作：自选时它可能先查状态，短结果直接交回灯没动；可能把地名认丢了反问（11-05 模拟）
             set_state = next((t for t in tools if t.get("name") == "hass_set_state"), None)
-            if not first and set_state and (question or (only and not differ)):
+            if not first and set_state and (own or (only and not differ)):
                 resp = await self._responses_call(items, [set_state], force="hass_set_state", one_call=True)
                 first = [o for o in resp.get("output") or [] if o.get("type") == "function_call"] or None
             # 小模型自己选工具时第一轮只要一个调用：Haiku 会把一处的灯一盏盏写全（十盏约 1100 token、3.5 s），写完还是被展开替换或者被回问拦下（11-05 空跑）
@@ -1044,13 +1046,16 @@ class S2SProvider(S2SProviderBase):
                     break
                 if i == 0:
                     # 刚回问过"客厅和卧室的灯是哪一处"时答"都关"：说的是那几盏，不是所有的灯
-                    calls, ask = (calls, None) if asked_named else self._fan_out_all(calls, last, recent, asked_all)
+                    calls, ask = (calls, None) if asked_named and (only or question) else self._fan_out_all(calls, last, recent, asked_all)
                     if not ask:
                         calls, ask = self._fan_out_where(calls, last, recent, asked_where)
                 # 第一个控制灯的那一轮才算（强制填参失败时小模型自选，可能先查状态）
-                if partial_left and not ask and any(c.get("name") == "hass_set_state" or (question and c.get("name") in intents) for c in calls):
+                if partial_left and not ask and any(c.get("name") == "hass_set_state" or (own and c.get("name") in intents) for c in calls):
                     partial_left = False
                     calls, ask = self._fan_out_partial(calls, only, question, differ)
+                elif partial_left and not own and question:
+                    # 回问之后说了别的事，小模型选了别的工具：不再等答复
+                    partial_left, self._named_asked = False, ""
                 outputs = []
                 for call in calls:
                     used.append(call.get("name"))
@@ -1065,7 +1070,8 @@ class S2SProvider(S2SProviderBase):
                     items.append({"type": "function_call_output", "call_id": call.get("call_id"), "output": result})
                 # 地点守卫的说明是写给小模型看的：它接着调用或者总结，不念给用户。11-05 模拟：第一轮都对，第二轮小模型常多调一盏别处的
                 # （"把灯都关了，除了甲地"6 次 5 次），都走到这里。写给 Live 的问句（"问用户要控制哪一类"）照旧直接交回
-                if len(calls) == 1 and len(outputs[0]) <= self.direct_max_chars and len(only) < 2 and not (blocked or "").startswith(ha_names.NOT_AN_ERROR):
+                if (len(calls) == 1 and len(outputs[0]) <= self.direct_max_chars and len(only) < 2 and not (partial_left and own)
+                        and not (blocked or "").startswith(ha_names.NOT_AN_ERROR)):
                     # 短结果直接交给 Live 转述，省一轮小模型。带上调用了什么、参数是什么：
                     # 设音量这类工具只回"成功"，光给结果 Live 只会说"好了"（11-03 R26），带上参数它会说"调到六十了"。
                     # 前几轮做过的也带上，不然 Live 只知道最后这一个
