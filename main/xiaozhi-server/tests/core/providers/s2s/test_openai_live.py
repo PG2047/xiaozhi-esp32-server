@@ -1867,6 +1867,29 @@ def test_place_of_the_previous_sentence_does_not_let_an_intent_through():
     assert [c["name"] for c in rec["calls"]] == ["除醛净化器"]
 
 
+def test_lights_of_an_excluded_place_are_not_controlled():
+    """"除了老家，把灯都关了"：第一轮甲地的都对，第二轮小模型多关了老家一盏，不执行；一轮里混着的也只拦老家那个。"""
+    three = [_light_call(f"light.a{n}", f"c{n}") for n in (1, 2, 3)]
+    rec = _after_first_call("除了老家，把灯都关了", [[_light_call("light.b1", "c8")]], first=three)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3"]
+    assert "没有执行" in rec["commentary"] and "不动乙地老家" in rec["commentary"]
+    rec = _after_first_call("把灯都关了，甲地的不用", [_text_reply("老家的灯关了。")], first=[_light_call("light.b1", "c0"), _light_call("light.a1", "c1")])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.b1"] and rec["commentary"] == "老家的灯关了。"
+
+
+def test_intents_read_an_excluded_place_the_other_way_round():
+    """HA 意图：只说了不动哪里时别处放行（之前全拦了，说没关成），那里的不执行。上一句也在 said 里时还是只看这句。"""
+    off = "intent__HassTurnOff"
+    props = {"name": {"type": "string"}, "area": {"type": "string"}}
+    fan, purifier = _intent_call(tool=off, name="乙地风扇"), _intent_call(tool=off, name="除醛净化器")
+    rec = _after_first_call("除了甲地，把净化器和风扇都关了", [], first=fan, tool=off, props=props)
+    assert rec["calls"] == [{"name": "乙地风扇"}] and "没有执行" not in rec["commentary"]
+    rec = _after_first_call("除了甲地，把净化器和风扇都关了", [], first=purifier, tool=off, props=props)
+    assert rec["calls"] == [] and "不动甲地楼下1号" in rec["commentary"]
+    rec = _after_first_call(["把甲地的净化器关了", "把风扇都关了，甲地的不用"], [], first=purifier, tool=off, props=props)
+    assert rec["calls"] == [{"name": "除醛净化器"}] and "不动甲地楼下1号" in rec["commentary"]
+
+
 def test_reading_state_of_another_place_is_not_blocked():
     """只读的 hass_get_state 不管。"""
     query = {"type": "function_call", "call_id": "c0", "name": "hass_get_state", "arguments": json.dumps({"entity_id": "light.a1"})}

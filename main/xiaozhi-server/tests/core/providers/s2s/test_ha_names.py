@@ -378,6 +378,73 @@ def test_listed_place_conflict_lets_through_the_place_said_and_unsure_cases():
     assert _listed_conflict("把老家的灯关了", es=[]) is None
 
 
+_HERE, _HOME = "甲地楼下1号", "乙地老家"
+
+
+def _excluded(said: str | None) -> set[str]:
+    return H.excluded_places(said, H.area_tokens(entries()))
+
+
+def test_excluded_places_recognises_the_usual_ways_of_saying_it():
+    for said in ("除了甲地，把灯都关了", "除了甲地都关了", "除甲地外都关了", "除了甲地以外的灯都关了", "除开甲地，别的都关了", "除去甲地，其他的都关了",
+                 "除了甲地的灯，别的都关了", "除了甲地那边，都关了", "除了甲地把灯都关了", "把灯都关了，除了甲地",
+                 "把灯都关了，甲地的不用", "把灯都关了，甲地不用", "把灯都关了甲地的不用", "甲地的灯不用关，别的都关了", "甲地的灯都不用关了", "甲地的先不用",
+                 "甲地的留着", "甲地的灯留着", "甲地除外", "甲地的算了", "甲地别动", "甲地的先别关", "甲地的灯不关",
+                 "别关甲地的灯", "不要关甲地的灯", "不关甲地的", "不用管甲地", "先别动甲地的", "别把甲地的灯都关了", "不要把甲地的灯都关了", "留着甲地的灯", "不包括甲地", "不含甲地"):
+        assert _excluded(said) == {_HERE}, said
+    assert _excluded("除了甲地和老家，把灯都关了") == {_HERE, _HOME}
+    assert _excluded("把甲地的灯都关了，老家的不用") == {_HOME}
+    assert _excluded("除了甲地，老家的也不用") == {_HERE, _HOME}
+    # 上次委托以来的几句话：换行也是小句的边界
+    assert _excluded("除了甲地\n都关了吧") == {_HERE}
+
+
+def test_excluded_places_leaves_everything_else_alone():
+    for said in ("把灯都关了", "把甲地的灯都关了", "把甲地和老家的灯都关了", "那老家的呢",
+                 "除了甲地书房灯，把灯都关了", "除了书房灯，把甲地的灯都关了", "把甲地的灯都打开，除了台灯",     # 排除的是一盏灯
+                 "把除醛净化器关了", "把甲地的除醛净化器关了", "甲地除醛净化器关了",                              # 设备名里的"除"
+                 "除了关甲地的灯，还要把老家的灯打开",                                                            # "除了"后面不是地点
+                 "要不把甲地的灯关了", "要不要把甲地的灯关了", "用不用把甲地的灯关了", "能不能把甲地的灯关了", "不如把甲地的灯关了",     # 在提议
+                 "甲地的灯不亮，把老家的灯关了", "甲地的灯都关了吗", "甲地的别的灯都关了", "甲地的灯留一盏，都关了", "", None):
+        assert _excluded(said) == set(), said
+    for said in ("除了甲地，把灯都关了", "甲地的不用", "别关甲地的灯"):     # 没取到名单
+        assert H.excluded_places(said, {}) == set(), said
+
+
+def test_listed_place_conflict_reads_an_excluded_place_the_other_way_round():
+    text = _listed_conflict("除了老家，把灯都关了", "light.b1")
+    assert text.startswith("没有执行") and "不动乙地老家" in text and "老家卧室" in text
+    assert _listed_conflict("除了老家，把灯都关了", "light.a1") is None
+    # 句子后半截才说不动哪里；不动的地方带动作词
+    assert _listed_conflict("把灯都关了，甲地的不用", "light.a1") and _listed_conflict("把灯都关了，甲地的不用", "light.a2")
+    assert _listed_conflict("把灯都关了，甲地的不用", "light.b1") is None
+    assert _listed_conflict("甲地的灯不用关，别的都关了", "light.a1") and _listed_conflict("甲地的灯不用关，别的都关了", "light.b1") is None
+    # 说了要控制的和不动的：两边都看；认不出地点的设备放行
+    assert _listed_conflict("把老家的灯都关了，甲地的不用", "light.a1") and _listed_conflict("把老家的灯都关了，甲地的不用", "light.b1") is None
+    assert _listed_conflict("把老家的灯都关了，甲地的不用", "light.c1") is None
+    assert _listed_conflict("除了老家，把灯都关了", "light.unknown") is None and _listed_conflict("除了老家，把灯都关了", "light.c1") is None
+    # 认不出是不动哪里的：还是放行
+    assert _listed_conflict("除了老家卧室灯，把灯都关了", "light.b1") is None
+    assert _listed_conflict("老家的灯留一盏，都关了", "light.a1") is None and _listed_conflict("老家的灯留一盏，都关了", "light.b1") is None
+
+
+def test_place_conflict_reads_an_excluded_place_the_other_way_round():
+    es, off = entries(), "intent__HassTurnOff"
+    # 只说了不动哪里：别处放行（之前"甲地"被当成要控制的地方，别处的调用全拦了），那里的不执行
+    assert H.place_conflict("除了甲地，把净化器都关了", off, {"name": "乙地风扇"}, es) is None
+    msg = H.place_conflict("除了甲地，把净化器都关了", off, {"name": "除醛净化器"}, es)
+    assert msg.startswith("没有执行") and "不动甲地楼下1号" in msg
+    # 只填类别、会一起动到不动的那里：不执行；填了别处的区域放行
+    assert H.place_conflict("把风扇都关了，甲地的不用", off, {"domain": ["fan"]}, es)
+    assert H.place_conflict("把风扇都关了，甲地的不用", off, {"area": "乙地", "domain": ["fan"]}, es) is None
+    # 说了要控制的和不动的
+    assert H.place_conflict("把乙地的风扇关了，甲地的不用", off, {"name": "除醛净化器"}, es)
+    assert H.place_conflict("把乙地的风扇关了，甲地的不用", off, {"name": "乙地风扇"}, es) is None
+    # 排除的是一台设备：认不出是不动哪里，甲地还算提到过，和以前一样
+    assert H.place_conflict("除了甲地除醛净化器，把乙地的都关了", off, {"name": "除醛净化器"}, es) is None
+    assert H.place_conflict("除了甲地除醛净化器，把乙地的都关了", off, {"name": "乙地风扇"}, es) is None
+
+
 def test_name_rivals_lets_through_clear_words_all_words_and_other_calls():
     for said, name in (("把戊地卧室的遮光窗帘拉上", "戊地1号卧室布帘"), ("把客厅纱帘关上", "戊地1号客厅纱帘"),
                        ("打开大净化器", "大净化器"), ("打开戊地的甲牌风扇", "戊地甲牌风扇"), ("打开己地的风扇", "己地甲牌净化风扇"),
