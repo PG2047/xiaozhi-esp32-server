@@ -17,8 +17,8 @@ from websockets.asyncio.server import serve
 from config.logger import setup_logging
 from core.handle.abortHandle import handleAbortMessage
 from core.providers.s2s.openai_realtime.openai_realtime import WAKE_TRIGGER, S2SProvider
-from core.utils.dialogue import Dialogue
-from core.utils.s2s import attach_s2s, s2s_selected
+from core.utils.dialogue import Dialogue, Message
+from core.utils.s2s import attach_s2s, record_cascade_session, s2s_selected
 from plugins_func.register import Action, ActionResponse
 
 # conftest 在 mock 模式把 asyncio.sleep 换成了不让出事件循环的空函数；上游节拍器和本测试的等待都要真睡。
@@ -624,3 +624,76 @@ def test_close_writes_status_ledger(tmp_path, monkeypatch):
     row = json.loads((tmp_path / "sessions.jsonl").read_text(encoding="utf-8"))
     assert row["device"] == "微雪" and row["brain"] == "openai_realtime" and row["model"] == "gpt-realtime-2.1"
     assert row["stats"]["turns"] == 4 and row["duration_s"] >= 0
+
+
+def _cascade_ledger_conn(conn, tmp_path, s2s=None):
+    conn.config["log"] = {"status_dir": str(tmp_path)}
+    conn.config["selected_module"].update(S2S=s2s or "", LLM="MainLLM")
+    conn.config["LLM"] = {"MainLLM": {"model_name": "group/test"}}
+    conn.device_name = "微雪"
+    conn.first_activity_time = (time.time() - 30) * 1000
+    for role, content in (("system", "提示词"), ("user", "问一"), ("assistant", "答一"), ("user", "问二"),
+                          ("assistant", None), ("assistant", "答二")):
+        conn.dialogue.put(Message(role=role, content=content))
+
+
+def _ledger_rows(tmp_path):
+    path = tmp_path / "sessions.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+
+
+def test_real_open_failure_writes_one_cascade_row_marked_as_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["app.py"])
+
+    async def sc(rt, conn, url):
+        _cascade_ledger_conn(conn, tmp_path, s2s="OpenAIRealtime")
+        conn.config["S2S"] = {"OpenAIRealtime": {"type": "openai_realtime", "url": url, "connect_timeout_s": 1,
+                                                 "model_name": "gpt-realtime-2.1"}}   # 没配 api_key：线上 S3 现在就是这样
+        got = await asyncio.get_running_loop().run_in_executor(None, attach_s2s, conn)
+        assert got is None and conn._s2s_failed is True
+        await _real_sleep(0.05)                     # provider.close() 排在事件循环上
+        assert _ledger_rows(tmp_path) == []         # 打开失败的 provider 不写台账
+        record_cascade_session(conn)
+        record_cascade_session(conn)                # close() 可能走多次
+    run_scenario(sc)
+    rows = _ledger_rows(tmp_path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["brain"] == "cascade" and row["fallback_from"] == "openai_realtime" and row["model"] == "group/test"
+    assert row["device"] == "微雪" and 29 < row["duration_s"] < 40          # 是连接时长，不是打开失败那一瞬
+    assert row["stats"] == {"replies": 2, "input_utts": 2}
+    assert "segments" not in row["stats"] and "turns" not in row["stats"]   # 余额探针靠这两个键判断 key 能用
+
+
+def test_device_on_cascade_writes_a_row_without_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["app.py"])
+
+    async def sc(rt, conn, url):
+        _cascade_ledger_conn(conn, tmp_path)
+        record_cascade_session(conn)
+    run_scenario(sc)
+    row = _ledger_rows(tmp_path)[0]
+    assert row["brain"] == "cascade" and "fallback_from" not in row
+
+
+def test_cascade_row_skipped_while_s2s_runs_or_never_attached(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["app.py"])
+
+    async def sc(rt, conn, url):
+        _cascade_ledger_conn(conn, tmp_path, s2s="OpenAIRealtime")
+        record_cascade_session(conn)                # 选了 S2S 但还没建成就断开：这条连接没有对话
+        conn._s2s_failed = True
+        conn.s2s = object()                         # provider 在跑：由 provider 记
+        record_cascade_session(conn)
+    run_scenario(sc)
+    assert _ledger_rows(tmp_path) == []
+
+
+def test_cascade_row_not_written_by_probe_process(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["-"])
+
+    async def sc(rt, conn, url):
+        _cascade_ledger_conn(conn, tmp_path)
+        record_cascade_session(conn)
+    run_scenario(sc)
+    assert _ledger_rows(tmp_path) == []

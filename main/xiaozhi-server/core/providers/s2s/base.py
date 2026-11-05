@@ -194,8 +194,8 @@ class S2SProviderBase(ABC):
 
     def record_session(self, model: str, stats: dict) -> None:
         """会话结束写一行状态页台账（core/utils/status_ledger.py）。没配 log.status_dir 或不是 server 主进程就什么都不做。"""
-        if not is_server_process():
-            return
+        if not is_server_process() or getattr(self.conn, "_s2s_failed", False):
+            return             # 打开失败的 provider 没有会话；这条连接回退级联，由 record_cascade_session 记一行
         status_dir = ((getattr(self.conn, "config", None) or {}).get("log") or {}).get("status_dir")
         append_session(status_dir, device=getattr(self.conn, "device_name", None), brain=self.config.get("type"),
                        model=model, started_at=self.started_at, stats=stats)

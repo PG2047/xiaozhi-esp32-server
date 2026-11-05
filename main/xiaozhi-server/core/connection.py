@@ -23,7 +23,7 @@ from core.utils.util import (
 )
 from typing import Dict, Any
 from collections import deque
-from core.utils.s2s import attach_s2s, drain_early_audio, drain_pending_to_cascade, s2s_buffer_early_audio
+from core.utils.s2s import attach_s2s, drain_early_audio, drain_pending_to_cascade, record_cascade_session, s2s_buffer_early_audio
 from core.utils.device_overrides import apply_device_overrides
 from core.utils.modules_initialize import (
     initialize_modules,
@@ -1668,6 +1668,7 @@ class ConnectionHandler:
                 await self.asr.close()
             if self.s2s is not None:
                 await self.s2s.close()  # 关掉上游语音会话，不然设备断开后会话还挂着计费
+            record_cascade_session(self)
 
             # 最后关闭线程池（避免阻塞）
             if self.executor:
