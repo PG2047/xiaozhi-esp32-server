@@ -582,3 +582,163 @@ def test_names_listed_device_ignores_places_and_words_lights_have_too():
     # 名单里不收的（传感器）不算
     es.append({"names": ["窗台温度"], "domain": "sensor", "areas": [], "device_class": "temperature"})
     assert not H.names_listed_device("窗台温度都多少了", es)
+
+
+# 甲地、老家都有客厅和卧室，厨房只有老家有
+_HOUSES = ("下面是我家智能设备列表（位置，设备名，entity_id），可以通过homeassistant控制\n"
+           "甲地书房,书房灯,light.a1\n甲地客厅,客厅大灯,light.a2\n甲地1号,台灯,light.a3\n甲地1号,甲牌台灯,light.a4\n甲地1号,音箱,media_player.a5\n"
+           "甲地1号,灯,light.a6\n甲地1号,台灯带,light.a7\n老家卧室,卧室灯,light.b1\n老家客厅,客厅吸顶灯,light.b2\n丙地,Pro灯,light.c1\n"
+           "甲地卧室,卧室顶灯,light.a8\n老家厨房,烟机灯,light.b4\n")
+
+
+def _partial(said: str, es: list | None = None, prompt: str = _HOUSES) -> list[str]:
+    """动作相同的句子（或者不管的）：返回设备，不回问。"""
+    targets, question, differ = H.partial_names(prompt, said, entries() if es is None else es)
+    assert question is None and not differ, said
+    return targets
+
+
+def _partial_differ(said: str, prompt: str = _HOUSES) -> list[str]:
+    """每台动作不同的句子：返回设备。"""
+    targets, question, differ = H.partial_names(prompt, said, entries())
+    assert question is None and differ, said
+    return targets
+
+
+def _partial_ask(said: str, prompt: str = _HOUSES, asked: str = "") -> str:
+    """定不了是哪一处的句子：不控制设备，返回回问。"""
+    targets, question, differ = H.partial_names(prompt, said, entries(), asked)
+    assert targets == [] and question and question.startswith("没有执行") and not differ, said
+    return question
+
+
+def test_partial_names_take_the_place_from_the_same_sentence():
+    """"客厅灯""书房和客厅的灯"不是完整的名字，两处都有客厅：同一句里完整名字的设备在哪一处就是哪一处。"""
+    for said in ("把书房灯和客厅灯关了", "把书房灯和客厅的灯关了", "把书房和客厅的灯关了", "把书房的灯和客厅的灯关了", "书房、客厅的灯都关了",
+                 "帮我关一下书房和客厅的灯", "把书房灯和客厅里的灯关了", "能不能把书房和客厅的灯关了", "把书房灯关了，客厅的也关了", "把书房灯关了，客厅灯也关了",
+                 "把书房灯和客厅灯关了，我要睡了", "我要睡了，关掉书房和客厅的灯", "把书房灯和客厅灯关了，把窗帘拉上", "把书房和客厅的灯调到百分之三十",
+                 "可以把书房和客厅的灯关了吗", "把书房和客厅的灯关了好吗", "把书房灯和客厅灯关一下好不好", "把书房和客厅的灯亮度调到五十", "把书房和客厅的灯调暗一点儿",
+                 "把书房和客厅的灯开开", "把书房客厅的灯关了"):
+        assert _partial(said) == ["light.a1", "light.a2"], said
+    assert _partial("把客厅灯和书房灯打开") == ["light.a2", "light.a1"]
+    assert _partial("把客厅和书房的灯打开") == ["light.a2", "light.a1"]
+    assert _partial("把书房客厅卧室的灯都关了") == ["light.a1", "light.a2", "light.a8"]
+    # 完整的名字定地点：老家的灯带着客厅去老家；"卧室灯"这样的名字别处也可能这么叫，也跟着走
+    assert _partial("把客厅灯和卧室吸顶灯关了", prompt=_HOUSES + "老家卧室,卧室吸顶灯,light.b5\n") == ["light.b2", "light.b5"]
+    assert _partial("把卧室灯和客厅大灯关了") == ["light.a8", "light.a2"]
+    # 片段只有一处对得上所有说法：厨房只有老家有
+    assert _partial("把客厅和厨房的灯关了") == ["light.b2", "light.b4"]
+    # 灯名字的片段：说了地点就在那里找；"台灯"有完整名字就是它，不算"甲牌台灯"
+    assert _partial("把大灯和书房灯关了") == ["light.a2", "light.a1"]
+    assert _partial("把吸顶灯和厨房灯关了") == ["light.b2", "light.b4"]
+    assert _partial("把书房灯和台灯关了") == ["light.a1", "light.a3"]
+    # 同一个房间里不是灯的设备不算
+    assert _partial("把书房灯和客厅灯关了", prompt=_HOUSES + "甲地客厅,音箱,media_player.a9\n") == ["light.a1", "light.a2"]
+    # 名字重名，同一句里分不开：问
+    assert _partial_ask("把书房灯和客厅灯关了", prompt=_HOUSES + "老家书房,书房灯,light.b3\n")
+
+
+def test_partial_names_with_the_place_said():
+    for said in ("把老家的客厅和卧室的灯关了", "把老家的客厅灯和卧室灯关了", "把客厅和卧室的灯关了，老家的", "把老家客厅和老家卧室的灯关了"):
+        assert _partial(said) == ["light.b2", "light.b1"], said
+    assert _partial("把甲地的客厅灯和卧室灯关了") == ["light.a2", "light.a8"]
+    # 各说各的地点
+    assert _partial("把甲地的客厅灯和老家的客厅灯关了") == ["light.a2", "light.b2"]
+    assert _partial("把书房灯和老家的客厅灯关了") == ["light.a1", "light.b2"]
+
+
+def test_partial_names_leave_full_names_to_the_small_model():
+    """都是完整的名字、查询：小模型自己做得对，这里不管。"""
+    for said in ("把书房灯和客厅大灯关了", "把书房灯、客厅大灯和甲牌台灯都关了", "把书房灯和甲牌台灯关了", "把甲地的书房灯和老家的客厅吸顶灯关了", "把老家的客厅吸顶灯和烟机灯关了",
+                 "把书房灯关了，再把客厅大灯打开", "书房灯和客厅大灯开着吗", "书房灯和客厅灯开着吗", "客厅和卧室的灯开着吗", "书房和客厅的灯都关了吗"):
+        assert _partial(said) == [], said
+
+
+def test_partial_names_place_said_for_only_one_full_name():
+    """都是完整的名字，地点只说在后一台前面：地点守卫只看这句说了老家，会把书房灯拦下，所以这里定下来。"""
+    assert _partial("把书房灯和老家的客厅吸顶灯关了") == ["light.a1", "light.b2"]
+    assert _partial_differ("把书房灯关了，再把老家的客厅吸顶灯打开") == ["light.a1", "light.b2"]
+
+
+def test_partial_names_one_word_needs_all_words():
+    """只说一处：说了"都"、几处都有才回问（小模型会一次控制几处）；没说"都"小模型自己会问；只有一处的不管；同一处几盏都算。"""
+    for said in ("把客厅的灯都关了", "把客厅灯全关了", "把客厅的灯全部打开"):
+        assert "问用户要控制哪一处" in _partial_ask(said), said
+    for said in ("把客厅灯关了", "把客厅的灯关了", "都这么晚了，把客厅灯关了", "把书房的灯都关了", "把书房灯关了", "把甲地客厅的灯都关了", "把灯都关了", "把甲地的灯都关了"):
+        assert _partial(said) == [], said
+    assert _partial("把吸顶灯都关了", prompt=_HOUSES + "老家卧室,卧室吸顶灯,light.b5\n") == ["light.b2", "light.b5"]
+
+
+def test_partial_names_ask_when_the_place_cannot_be_settled():
+    # 两处都对得上，同一句里没有别的线索：不能跨房子猜
+    for said in ("把客厅和卧室的灯关了", "把客厅灯和卧室灯关了", "把卧室灯和客厅灯都关了", "把客厅的灯和卧室的灯打开", "把客厅灯关了，再把卧室灯打开"):
+        msg = _partial_ask(said)
+        assert "甲地楼下1号" in msg and "乙地老家" in msg and "问用户要控制哪一处，还是都控制" in msg, said
+    # 片段不跨房子：完整的名字可以不在一处，片段只认同一处
+    for said in ("把书房灯和厨房灯关了", "把书房和厨房的灯关了", "把甲牌台灯和厨房灯关了"):
+        msg = _partial_ask(said)
+        assert "甲地楼下1号" in msg and "乙地老家" in msg, said
+    # 说的地点没有这台：不能关到别处去
+    for said in ("把老家的书房灯和客厅灯关了", "把老家的卧室灯和客厅大灯关了", "把甲地的厨房灯和书房灯关了"):
+        assert _partial_ask(said), said
+    # 两处都对得上时，不能各取一盏完整名字对得上的
+    swap = "甲地卧室,卧室灯,light.x1\n老家卧室,卧室顶灯,light.x2\n老家客厅,客厅灯,light.x3\n甲地客厅,客厅主灯,light.x4\n"
+    assert _partial_ask("把卧室灯和客厅灯关了", prompt=swap)
+    # 同一处有好几盏对得上，也不替用户挑
+    many = "甲地客厅,主灯,light.x1\n甲地客厅,射灯,light.x2\n甲地书房,书房灯,light.x3\n"
+    assert "主灯、射灯" in _partial_ask("把书房灯和客厅灯关了", prompt=many)
+
+
+def test_partial_names_answer_after_asking():
+    def answer(said: str, asked: str = "把客厅和卧室的灯关了"):
+        return H.partial_names(_HOUSES, said, entries(), asked)
+
+    assert answer("甲地的") == (["light.a2", "light.a8"], None, False)
+    assert answer("老家") == (["light.b2", "light.b1"], None, False)
+    assert answer("甲地的客厅灯和卧室灯") == (["light.a2", "light.a8"], None, False)    # 自己说全了
+    assert answer("都关") == (["light.a2", "light.b2", "light.b1", "light.a8"], None, False)
+    assert answer("两边都关了吧") == (["light.a2", "light.b2", "light.b1", "light.a8"], None, False)
+    # 答的地方只有其中一盏：控制那一盏；一盏都没有、没答上来（或者转写还没到）、那里还是有好几盏对得上：再问
+    assert answer("甲地的", "把书房灯和厨房灯关了") == (["light.a1"], None, False)
+    assert answer("甲地", "把台灯和客厅灯关了") == (["light.a3", "light.a2"], None, False)     # 那里有完整名字的就是它
+    many = _HOUSES + "老家客厅,客厅筒灯,light.b6\n"
+    assert H.partial_names(many, "老家", entries(), "把客厅和卧室的灯关了")[1].startswith("没有执行")
+    assert H.partial_names(many, "甲地", entries(), "把客厅和卧室的灯关了")[0] == ["light.a2", "light.a8"]
+    assert "light.b6" in H.partial_names(many, "都关", entries(), "把客厅和卧室的灯关了")[0]
+    assert _partial_ask("老家", prompt="甲地客厅,主灯,light.x1\n甲地书房,书房灯,light.x3\n", asked="把书房灯和客厅灯关了")
+    for said in ("嗯", "第一个", "", None):
+        assert _partial_ask(said, asked="把客厅和卧室的灯关了"), said
+    # 点了设备：照小模型的；不要了：不展开
+    for said in ("就卧室灯吧", "书房灯", "厨房的", "就书房那个", "不用了", "算了"):
+        assert answer(said) == ([], None, False), said
+    # 问的那句动作不同、只说了一处
+    assert answer("老家", "把客厅灯关了，再把卧室灯打开") == (["light.b2", "light.b1"], None, True)
+    assert answer("甲地的", "把客厅的灯都关了") == (["light.a2"], None, False)
+    assert answer("都关", "把客厅的灯都关了") == (["light.a2", "light.b2"], None, False)
+
+
+def test_partial_names_words_that_do_not_count():
+    """房间词在别的话里（"我在客厅"）、说的是别的设备（"客厅的窗帘"）、前面还有别的词（"卧室大灯""小台灯"）、有否定、没说动作：不管，也不回问。"""
+    for said in ("我在客厅，把书房灯关了", "客厅太暗了，开一下书房灯", "到客厅了，把书房灯关了", "回客厅之前把书房灯关了", "把书房灯和客厅的窗帘关了",
+                 "把书房和客厅的窗帘关了", "把书房灯和窗帘关了", "把书房和客厅关了", "把卧室大灯和书房灯关了", "把小台灯和书房灯关了",
+                 "除了书房灯，把客厅灯关了", "把书房灯和客厅灯关了，卧室灯不用关", "不要关书房灯，把客厅灯关了", "把书房灯和客厅灯关了吗",
+                 "把书房灯和客厅灯修一下", "把卧室客厅的窗帘关了", "把书房灯和卧室客厅的窗帘关了", "书房灯和客厅灯", "书房灯太亮了，把客厅灯关了",
+                 "把客厅灯调到和书房灯一样亮", "书房灯开着，把客厅灯关了", "", None):
+        assert _partial(said) == [], said
+
+
+def test_partial_names_flag_different_actions():
+    for said in ("把书房灯关了，再把客厅灯打开", "书房灯开，客厅灯关", "打开书房灯，关掉客厅灯", "开书房灯关客厅灯", "把书房灯关了，打开客厅灯", "把书房灯关了再打开客厅灯",
+                 "把书房灯调亮，客厅灯调暗", "把书房灯调到三十，客厅灯调到五十", "把书房灯调大一点，客厅灯调小一点"):
+        assert _partial_differ(said) == ["light.a1", "light.a2"], said
+    # 同一个动作说两遍不算
+    assert _partial("把书房灯调到三十，客厅灯也调到三十") == ["light.a1", "light.a2"]
+    # 不同类可以：每台的动作各填各的；同一个动作不同类不管（brightness_value 不能发给音箱）
+    assert _partial_differ("把客厅灯打开，音箱关了") == ["light.a2", "media_player.a5"]
+    assert _partial("把客厅灯和音箱关了") == []
+
+
+def test_partial_names_without_the_lists():
+    # 名单没取到认不出地点，房间也认不出，"客厅灯"不算；提示词里没有设备列表就不管
+    assert _partial("把书房灯和客厅灯关了", es=[]) == []
+    assert _partial("把书房灯和客厅灯关了", prompt="你是小智") == []

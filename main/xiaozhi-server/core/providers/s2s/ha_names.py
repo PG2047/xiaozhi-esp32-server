@@ -556,3 +556,206 @@ def names_listed_device(said: str, entries: list[dict], domains: Iterable[str] =
     text = _without_places(said, area_tokens(entries))
     lights = set().union(*(_name_parts(e) for e in entries if e["domain"] == "light"))
     return any(w in text for e in entries if e["domain"] in set(domains) for w in _name_parts(e) - lights)
+
+
+# ---------- 不完整的说法（"把书房和客厅的灯关了"） ----------
+# 设备名之间和前后不算动作的字：连接词、语气词，以及"关掉 / 关闭 / 关上""打开"和"关""开"的差别。问句在这之前已经排除了，走到这里的"吗"是客气的问法
+_NOT_ACTION = re.compile(r"[\s，,、。；;！!：:]|以及|还有|一起|全部|全都|统统|所有|然后|接着|麻烦|一下|那个|这个"
+                         r"|和|跟|与|及|同|并|把|将|给|帮|请|你|我|也|都|全|再|先|还|了|吧|啊|呀|哦|嘛|呗|哈|呢|啦|咯|喽|儿|掉|闭|上|打"
+                         r"|好不好|行不行|可以吗|好吗|行吗|吗")
+# 客气的问法：这里的"不""吗"不是否定，也不是在问状态
+_POLITE_ASK = re.compile(r"能不能|可不可以|行不行|好不好|好吗|行吗|(?:能|可以).*吗")
+# 去掉 _NOT_ACTION 之后，一段话整个是这些才算动作。"太亮""开着""一样亮"不算：这时设备只是被提到，不一定要控制
+_ACTION = re.compile(r"开+|关|灭|熄灭|点亮|[亮暗](?:一?点|一些|些)?"
+                     r"|(?:亮度|色温|颜色)?(?:(?:调|开|换|变|设置?)[到成为至].+|调[亮暗高低大小](?:一?点|一些|些)?)")
+# 单说房间（没带"灯"）后面接这些才算点到：别的话（"客厅太暗了""客厅的窗帘"）里的房间不算
+_AFTER_ROOM = re.compile(r"$|[和跟与及同、，,；;。！!也都全一再还并以]|关|开|打|调|灭|熄|亮|暗")
+
+
+def _squash(text: Any) -> str:
+    """比设备名用：转小写、去空格和"的"（"书房的灯"也算"书房灯"）。"""
+    return norm(text).replace(" ", "").replace("的", "")
+
+
+def _spots(rows: list[list[str]], tokens: dict[str, set[str]]) -> list[dict]:
+    """设备列表的每一行拆成 {id, name, house, room}：house 是位置里带的地点词属于哪个区域，room 是位置去掉地点词之后剩下的。
+    认不出 house 的（名单没取到，或者位置只写了房间）都算同一处。"""
+    out = []
+    for pos, name, entity in rows:
+        where = _squash(pos)
+        house = next((a for a, ws in tokens.items() if any(_squash(w) in where for w in ws)), "")
+        room = where
+        for w in sorted(map(_squash, tokens.get(house, ())), key=len, reverse=True):
+            room = room.replace(w, "") if w else room
+        out.append({"id": entity, "name": _squash(name), "house": house, "room": room})
+    return out
+
+
+def _lamp_words(spots: list[dict]) -> dict[str, dict]:
+    """用户点一台设备可能的说法 → {rows: 对得上的设备, exact: 名字就是这个的设备, room: 是房间的说法}：完整的名字；房间 + 灯（"客厅灯"，这时"卧室灯"这样的
+    完整名字也可能是别处的卧室）；灯的名字的片段（"台灯""筒灯"）；单说房间。"""
+    words: dict[str, dict] = {}
+
+    def add(word: str, spot: dict, exact: bool = False, room: bool = False) -> None:
+        w = words.setdefault(word, {"rows": [], "exact": [], "room": False})
+        if spot not in w["rows"]:
+            w["rows"].append(spot)
+        if exact:
+            w["exact"].append(spot)
+        w["room"] = w["room"] or room
+
+    for s in spots:
+        name, lamp = s["name"], "灯" in s["name"] or s["id"].startswith("light.")
+        if len(name) >= 2:
+            add(name, s, True)
+        if lamp and len(s["room"]) >= 2:
+            add(s["room"] + "灯", s, room=True)
+            add(s["room"], s, room=True)
+        for i, j in ((i, j) for i in range(len(name)) for j in range(i + 2, len(name) + 1)):
+            if "灯" in name[i:j]:
+                add(name[i:j], s)
+    return words
+
+
+def _mentions(text: str, words: dict[str, dict]) -> tuple[list[dict], list[str]]:
+    """按说的先后找这句话点到的设备，返回 (每一处 {word, rows, exact}, 去掉这些之后剩下的几段话)。长的说法优先（"客厅大灯"不算"客厅"）。"""
+    if not words:
+        return [], [text]
+    found, pieces, at = [], [], 0
+    pattern = re.compile("|".join(map(re.escape, sorted(words, key=len, reverse=True))))
+    for m in pattern.finditer(text):
+        w = words[m.group()]
+        # 单说房间：后面要接连接词、动作，或者紧跟下一个房间（"书房客厅的灯"）；"卧室大灯"的"卧室"不算
+        after = pattern.match(text, m.end())
+        if "灯" not in m.group() and not w["exact"] and not (_AFTER_ROOM.match(text, m.end()) or (after and words[after.group()]["room"])):
+            continue
+        found.append(dict(w, word=m.group()))
+        pieces.append(text[at:m.start()])
+        at = m.end()
+    return found, pieces + [text[at:]]
+
+
+def _ask_place(found: list[dict]) -> str:
+    """定不了是哪一处：交给 Live 的回问。"""
+    said = "、".join(dict.fromkeys(m["word"] for m in found))
+    spots = list({s["id"]: s for m in found for s in m["rows"]}.values())
+    houses = "、".join(dict.fromkeys(s["house"] for s in spots if s["house"]))
+    return (f"没有执行：用户说的{said}定不了是哪一处，对得上的设备" + (f"在{houses}" if houses else "") +
+            f"（{'、'.join(s['name'] for s in spots[:6])}）。问用户要控制哪一处，还是都控制。")
+
+
+def _settle(found: list[dict], bound: list[set[str]]) -> list[str] | None:
+    """每一处点到的设备定到一台。bound 是这一处前面说的地点；没说地点的，看同一句里完整名字的设备或说了的地点在哪一处；
+    都没有的，看有没有一处能对上所有说法（"书房和客厅的灯"，书房只有一处）。定不了返回 None，不跨房子猜。
+    完整的名字各算各的，可以不在一处（"书房灯和乙地的门灯"），片段只认这同一处。"""
+    rows = [[s for s in m["rows"] if not b or s["house"] in b] for m, b in zip(found, bound)]
+    if not all(rows):
+        return None
+    sure = [m["rows"] == m["exact"] for m in found]
+    anchors = set().union(*bound, *({r[0]["house"]} for r, ok in zip(rows, sure) if ok))
+    if not anchors:
+        anchors = set.intersection(*({s["house"] for s in r} for r in rows))
+        if len(anchors) != 1:
+            return None
+    out = []
+    for m, r, ok in zip(found, rows, sure):
+        r = r if ok else [s for s in r if s["house"] in anchors]
+        if len(r) > 1:
+            r = [s for s in r if s in m["exact"]] or r
+        if len(r) != 1:
+            return None
+        out.append(r[0]["id"])
+    return out
+
+
+def _action_words(pieces: list[str]) -> list[str] | None:
+    """设备名前后这几段话里的动作；有不是动作的话返回 None。第一个设备之前只看最近的一小句，最后一个设备之后只看紧跟着的一小句：
+    "我要睡了，关掉书房灯和客厅灯""把书房灯和客厅灯关了，把窗帘也拉上"多出来的那句不是在说这几台。"""
+    out = []
+    for n, piece in enumerate(pieces):
+        parts = re.split(r"[，,。；;！!：:]", piece)
+        if n == 0:
+            parts = parts[-1:]
+        elif n == len(pieces) - 1:
+            parts = next((parts[i:i + 1] for i, x in enumerate(parts) if _NOT_ACTION.sub("", x)), [])
+        for part in parts:
+            for x in re.split(r"了|再|然后|接着", part):
+                w = _NOT_ACTION.sub("", x)
+                if w and not _ACTION.fullmatch(w):
+                    return None
+                if w:
+                    out.append(w)
+    return out
+
+
+def partial_names(prompt: str, said: str, entries: list[dict], asked: str = "") -> tuple[list[str], str | None, bool]:
+    """"把书房灯和客厅灯关了""把书房和客厅的灯关了"：说的不是设备列表里的完整名字，返回 (要控制的设备, 交给 Live 的回问, 每台动作不同)。
+    都是完整名字的句子小模型自己做得对（11-05 模拟点名两盏 30/30，地点只说在其中一台前面的除外），查询也对（12/12，只读，两处都查也不要紧），这里不管。不完整的说法它会出错，同一批模拟：
+    先做有把握的那盏，短结果直接交回，另一盏没做还说做完了（"把书房灯和客厅灯关了"0/3）；两处都有客厅时一起控制（"把客厅和卧室的灯关了"3/3 一次四盏）。
+
+    认的说法：完整的名字、房间 + 灯（"客厅灯"）、单说房间（"书房和客厅的灯"）、灯名字的片段（"台灯""筒灯"）。至少两处；只说一处时要说了"都"（"把客厅的灯都关了"），
+    没说"都"小模型自己会问。定是哪一处见 _settle：说了的地点、完整名字的设备、一处能对上所有说法。定不了（两处都对得上、片段不在一处、说了地点那里没有）就不跨房子猜，
+    返回回问。上一次委托问过（asked 是问的那句话）时，这次答了地点就是那一处的，答"都关"就是这几个说法对得上的全部，点了设备照小模型的，没答上来再问。
+
+    拿不准都返回 ([], None, False)，照旧执行小模型填的：有排除、否定、提问的词（"除了书房灯""卧室灯不用关""……关了吗"）；设备名前后还有不是动作的话
+    （"卧室大灯""客厅的窗帘""我在客厅""客厅太暗了""把客厅灯调到和书房灯一样亮"）；这几台不同类又是同一个动作。名单没取到时认不出地点，房间也认不出。"""
+    text = said or ""
+    rows = _device_rows(prompt)
+    tokens = area_tokens(entries)
+    words = _lamp_words(_spots(rows, tokens))
+    found, pieces = _mentions(_squash(text).replace("里灯", "灯"), words)
+    answering = bool(asked) and len(found) < 2
+    if _EXCEPT_WORDS.search(_POLITE_ASK.sub("", text)):
+        return [], None, False
+    if answering:
+        if found or says_device_word(text, [{"names": [p[1]]} for p in rows]):
+            return [], None, False
+        found, pieces = _mentions(_squash(asked).replace("里灯", "灯"), words)
+    if not found or all("灯" not in m["word"] and not m["exact"] for m in found):
+        return [], None, False
+    if len(found) == 1 and not says_all(_BA.split(asked if answering else text)[-1]):
+        return [], None, False
+    bound, last = [], set()
+    for m, piece in zip(found, pieces):
+        last = mentioned_areas(piece, tokens) or last         # 去掉设备名再找，设备名里带的地点词不算用户说了地点
+        bound.append(last)
+    bound = [b or mentioned_areas(pieces[-1], tokens) for b in bound]   # 地点说在最后的（"……关了，甲地的"）
+    # 都是完整的名字不管，除非地点只说在其中一台前面（"把书房灯和乙地的门灯关了"）：listed_place_conflict 只看这句说了乙地，会把书房灯拦下
+    if all(m["rows"] == m["exact"] for m in found) and (all(bound) or not any(bound)):
+        return [], None, False
+    # 地点和位置也不算动作（"把甲地的客厅灯和甲地卧室的灯关了"）
+    drop = sorted(({_squash(w) for a in set().union(*bound) for w in tokens[a]} | {_squash(p[0]) for p in rows}) - {""}, key=len, reverse=True)
+    pieces = [re.sub("|".join(map(re.escape, drop)) or "$^", "", x) for x in pieces]
+    if pieces[0].endswith(("把", "将")):
+        pieces[0] = ""
+    acts = _action_words(pieces)
+    if acts is None or not (acts or asked):     # 有不是动作的话，或者一个动作都没说（答回问的话可以没有："甲地的客厅灯和卧室灯"）
+        return [], None, False
+    differ = len(set(acts)) >= 2
+    if answering:
+        answered = mentioned_areas(text, tokens)
+        if not answered and not says_all(text):
+            return [], _ask_place(found), False
+        targets = []
+        for m in found:
+            r = [s for s in m["rows"] if s["house"] in answered] if answered else m["rows"]
+            r = ([s for s in r if s in m["exact"]] or r) if answered else r
+            if answered and len(r) > 1:         # 答了地点，那里还是有好几盏对得上：不替用户挑
+                return [], _ask_place(found), False
+            targets += [s["id"] for s in r]
+        if not targets:
+            return [], _ask_place(found), False
+        return list(dict.fromkeys(targets)), None, differ
+    if len(found) == 1:                         # 说了"都"：那一处对得上的全算，几处都有就问
+        r = [s for s in found[0]["rows"] if not bound[0] or s["house"] in bound[0]]
+        if len({s["house"] for s in r}) > 1:
+            return [], _ask_place(found), False
+        settled = [s["id"] for s in r]
+    else:
+        settled = _settle(found, bound)
+        if settled is None:
+            return [], _ask_place(found), False
+    targets = list(dict.fromkeys(settled))
+    if len(targets) < 2 or (not differ and len({t.split(".")[0] for t in targets}) != 1):
+        return [], None, False
+    return targets, None, differ
