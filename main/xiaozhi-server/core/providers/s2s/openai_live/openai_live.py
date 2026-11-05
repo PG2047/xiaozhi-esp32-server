@@ -354,6 +354,12 @@ class S2SProvider(S2SProviderBase):
                         return ws
                     if "error" in str(ev.get("type")):
                         code = (ev.get("error") or {}).get("code")
+                        # 只开 Live 权限的 key 先收到 missing_scope（没有 api.responses.write，历史压缩关闭），接着照常
+                        # session.started（11-05 实测）。会话只有几分钟用不到压缩，不值得给 key 加 Responses 权限。
+                        # 真缺 Live 权限时等不到 session.started，这里超时，open() 照样失败
+                        if code == "missing_scope":
+                            self.logger.bind(tag=TAG).info("Live 历史压缩没开（key 没有 api.responses.write），只带最近的对话")
+                            continue
                         raise RuntimeError(f"first event {ev.get('type')} {code or ''}".strip())
             except BaseException:
                 self.spawn(ws.close())
@@ -691,6 +697,8 @@ class S2SProvider(S2SProviderBase):
         # HA 意图工具的填法规则 + 智能设备列表以外的设备名单（decisions 和小模型都看；Live 主模型的指令里没有）
         ha = ha_names.dispatch_text(self._tool_list(), self._ha_entries, self.ha_names_domains) if self.ha_names else ""
         return (f"{self._instructions()}\n\n你现在是小智的工具调度：根据对话里用户最后一句话决定调用哪个工具。"
+                # 11-05 模拟："把甲地的灯都关了""把乙地的灯也都关了"，小模型看不到上一次委托的工具记录，以为上文没真做，把甲地的灯又调了一遍，还"更正"说没关成
+                "对话记录里只有说过的话，看不到之前的工具记录：小智上文说已经做了的事都做过了，不要重做，也不要更正，除非用户最后一句要求。"
                 "日期、农历、时间、天气、家里设备的状态和控制、本机音量这类实时信息必须调用工具，不要凭记忆回答。"
                 # 11-03 夜对比：没有这一句时 gpt-4.1-mini 4/4 把"停一下"当成告别去调 handle_exit_intent
                 "“停一下”“等一下”“别说了”只是让小智先停下，不是结束对话，不要调用 handle_exit_intent；只有用户明确告别（再见、拜拜、没事了）才结束对话。"
@@ -779,10 +787,11 @@ class S2SProvider(S2SProviderBase):
         return calls or None
 
     def _check_ha_call(self, call: dict, intents: dict, utterance: str, recent: str | None = None,
-                       asked: set[str] | frozenset[str] = frozenset()) -> str | None:
+                       asked: set[str] | frozenset[str] = frozenset(), last: str = "") -> str | None:
         """HA 意图调用执行前：domain 误填成 device_class 的挪过去（改写 call 里的参数，后面记进对话的也是改后的）；
         用户说的地点和会命中的设备不在一处、或者没说清是哪一台 / 哪一类时，返回交给 Live 的说明、不执行。
-        utterance 是上次委托之后用户说的话，recent 是小模型手边的那几句（默认同 utterance），asked 是上一次委托回问时列的设备。"""
+        utterance 是上次委托之后用户说的话，recent 是小模型手边的那几句（默认同 utterance），asked 是上一次委托回问时列的设备，
+        last 是用户最后一句话。"""
         name = call.get("name") or ""
         try:
             args = json.loads(call.get("arguments") or "{}")
@@ -795,7 +804,10 @@ class S2SProvider(S2SProviderBase):
             self.logger.bind(tag=TAG).info(f"Live HA 参数整理 {name}：domain {args.get('domain')} → "
                                            f"domain {tidy.get('domain')} / device_class {tidy.get('device_class')}")
             call["arguments"] = json.dumps(tidy, ensure_ascii=False)
-        blocked = ha_names.place_conflict(utterance, name, tidy, self._ha_entries)
+        # 这句说了地点就只看这句：上一句常落在委托标记之后（交回之后 Live 才开口），它的地点不能放过这句没说的地方
+        # （11-05 模拟：上文"把甲地的窗帘都关上"，这句"把乙地的风扇也都关了"，又把甲地的窗帘关了一遍）
+        said_here = ha_names.mentioned_areas(last, ha_names.area_tokens(self._ha_entries))
+        blocked = ha_names.place_conflict(last if said_here else utterance, name, tidy, self._ha_entries)
         if blocked:
             self.logger.bind(tag=TAG).info(f"Live 地点守卫拦下 {name}：{blocked}")
             return blocked
@@ -831,6 +843,20 @@ class S2SProvider(S2SProviderBase):
         self._ha_asked = names
         blocked = ha_names.ask_which(group)
         self.logger.bind(tag=TAG).info(f"Live 设备歧义拦下 {name} {call.get('arguments')}：{blocked}")
+        return blocked
+
+    def _check_set_state(self, call: dict, last: str) -> str | None:
+        """hass_set_state 执行前：用户这句话（last）说了地点、这台设备却在别处时，返回交给小模型 / Live 的说明、不执行（见 ha_names.listed_place_conflict）。
+        每一轮都查：跨房子发生在第一轮展开之后，第二轮小模型把上文那一处的灯又调了一遍。"""
+        try:
+            args = json.loads(call.get("arguments") or "{}")
+        except ValueError:
+            return None
+        if not isinstance(args, dict):
+            return None
+        blocked = ha_names.listed_place_conflict(self.conn.prompt, last, str(args.get("entity_id") or ""), self._ha_entries)
+        if blocked:
+            self.logger.bind(tag=TAG).info(f"Live 地点守卫拦下 hass_set_state {args.get('entity_id')}：{blocked}")
         return blocked
 
     def _fan_out_intent(self, calls: list, said: str, recent: str) -> list:
@@ -978,8 +1004,9 @@ class S2SProvider(S2SProviderBase):
                 outputs = []
                 for call in calls:
                     used.append(call.get("name"))
-                    blocked = ask or (self._check_ha_call(call, intents, "\n".join(said), recent, asked)
-                                      if call.get("name") in intents and not call.get("scoped") else None)
+                    blocked = ask or (self._check_ha_call(call, intents, "\n".join(said), recent, asked, last)
+                                      if call.get("name") in intents and not call.get("scoped")
+                                      else self._check_set_state(call, last) if call.get("name") == "hass_set_state" else None)
                     result = blocked or await self.tools.run(call.get("name") or "", call.get("arguments") or "{}")
                     outputs.append(result)
                     ran.append(f"已调用 {call.get('name')}（参数 {call.get('arguments') or '{}'}），结果：{result[:self.direct_max_chars]}")

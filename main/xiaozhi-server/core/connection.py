@@ -23,7 +23,7 @@ from core.utils.util import (
 )
 from typing import Dict, Any
 from collections import deque
-from core.utils.s2s import attach_s2s, drain_early_audio, s2s_buffer_early_audio
+from core.utils.s2s import attach_s2s, drain_early_audio, drain_pending_to_cascade, s2s_buffer_early_audio
 from core.utils.device_overrides import apply_device_overrides
 from core.utils.modules_initialize import (
     initialize_modules,
@@ -675,6 +675,8 @@ class ConnectionHandler:
             self._inject_tool_call_fewshot()
             if self.s2s is not None:
                 self.s2s.after_components_ready()  # 把增强后的提示词与工具清单同步给上游会话
+            elif getattr(self, "_s2s_failed", False):
+                asyncio.run_coroutine_threadsafe(drain_pending_to_cascade(self), self.loop)
 
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"实例化组件失败: {e}")

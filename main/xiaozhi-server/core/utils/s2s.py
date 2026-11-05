@@ -22,7 +22,9 @@ def create_instance(class_name, *args, **kwargs):
 
 
 def s2s_selected(conn) -> bool:
-    """这条连接是否选了 S2S（provider 可能还没建成）。"""
+    """这条连接是否走 S2S（provider 可能还没建成）。打开失败就不算了：之后走级联，转写的文字要交给大模型。"""
+    if getattr(conn, "_s2s_failed", False):
+        return False
     return bool((conn.config.get("selected_module") or {}).get("S2S"))
 
 
@@ -44,6 +46,17 @@ async def drain_pending_texts(conn) -> None:
     texts, pending[:] = list(pending), []
     for t in texts:
         await conn.s2s.on_text(t)
+
+
+async def drain_pending_to_cascade(conn) -> None:
+    """S2S 打开失败：之前记下的文字（唤醒词那句常比失败早到）交给级联，不然唤醒后没有回应。"""
+    from core.handle.receiveAudioHandle import startToChat   # 那个模块 import 了本文件
+    pending = getattr(conn, "_s2s_pending_texts", None)
+    if not pending:
+        return
+    texts, pending[:] = list(pending), []
+    for t in texts:
+        await startToChat(conn, t)
 
 
 EARLY_AUDIO_MAX = 60   # 约 3.6 秒（60 ms 一包）
@@ -86,7 +99,10 @@ def attach_s2s(conn):
     整段限时 connect_timeout_s + 1 秒；任何失败都返回 None 并记一条警告，连接照常走级联，设备无感。
     """
     try:
-        return _attach_s2s(conn)
+        provider = _attach_s2s(conn)
+        if provider is None and s2s_selected(conn):
+            conn._s2s_failed = True    # 选了但没建成：之后的文字走级联（见 s2s_selected）
+        return provider
     finally:
         conn._s2s_attach_done = True   # 之后的音频直达 provider（或走级联），不再攒
 
