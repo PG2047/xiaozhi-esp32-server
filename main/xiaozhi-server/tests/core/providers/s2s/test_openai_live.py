@@ -1897,6 +1897,107 @@ def test_intents_read_an_excluded_place_the_other_way_round():
     assert rec["calls"] == [{"name": "除醛净化器"}] and rec["commentary"] == "甲地没动，要关哪一台？"
 
 
+def test_except_without_a_kind_asks_and_runs_nothing():
+    """"除了老家外，别的都关了"：没说别处控制哪一类，这次委托的调用都不执行，问句直接交给 Live。带设备词的照常控制。"""
+    rec = _after_first_call("除了老家外，别的都关了", [])
+    assert rec["calls"] == [] and rec["auto"] == []
+    assert "没有执行" in rec["commentary"] and "只控制灯" in rec["commentary"] and "不动乙地老家" in rec["commentary"]
+    rec = _after_first_call("除了老家外，别的都关了", [_text_reply("只关灯还是全部？")], first=[_light_call("light.a1", "c0"), _light_call("light.a2", "c1")])
+    assert rec["calls"] == [] and rec["commentary"] == "只关灯还是全部？"
+    rec = _after_first_call("除了老家，把灯都关了", [_text_reply("都关了。")], first=[_light_call("light.a1", "c0"), _light_call("light.a2", "c1")])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2"] and rec["commentary"] == "都关了。"
+
+
+def test_answer_to_the_kind_question_goes_by_the_list_and_keeps_the_place_out():
+    """答"只关灯""全部"：灯照设备列表控制，老家的不算；小模型第二轮再调老家的也拦下。"""
+    for said in ("只关灯", "灯", "全部", "都关了吧"):
+        rec = _after_first_call(["除了老家外，别的都关了", said], [_text_reply("甲地的灯都关了。")])
+        assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3"], said
+        assert rec["commentary"] == "甲地的灯都关了。", said
+    # 第一个调用填到老家也一样；答复之后第二轮再调老家：不执行，说明交给小模型
+    rec = _after_first_call(["除了老家外，别的都关了", "只关灯"], [[_light_call("light.b1", "c8")], _text_reply("好了。")], first=_light_call("light.b1"))
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3"] and rec["commentary"] == "好了。" and rec["auto"] == [3, 4]
+
+
+def test_kind_question_is_asked_again_only_when_not_answered():
+    """没答上来再问一遍，不动的地点还记着；答了就接得上。隔了一次别的委托就不算了。"""
+    rec = _after_first_call(["除了老家外，别的都关了", "嗯"], [])
+    assert rec["calls"] == [] and "只控制灯" in rec["commentary"]
+    rec = _after_first_call(["除了老家外，别的都关了", "嗯", "只关灯"], [_text_reply("好了。")])
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3"]
+    # 答复又说了地点、点了设备：是新的一句，照小模型填的，不动的地点不再算
+    rec = _after_first_call(["除了老家外，别的都关了", "把卧室灯关了"], [], first=_light_call("light.b1"))
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.b1"] and "没有执行" not in rec["commentary"].split("\n")[-1]
+    rec = _after_first_call(["除了老家外，别的都关了", "把卧室灯关了", "把书房灯关了"], [], first=_light_call("light.a1"))
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a1"]
+
+
+def test_answer_with_a_kind_only_controls_that_kind():
+    """答"窗帘"：小模型第二轮又调灯，不执行。答"只关灯"：又调别的设备，也不执行。范围不能悄悄变大。"""
+    off = "intent__HassTurnOff"
+    props = {"name": {"type": "string"}, "area": {"type": "string"}, "entity_id": {"type": "string"}, "state": {"type": "object"}}
+    rec = _after_first_call(["除了老家外，别的都关了", "窗帘"], [_text_reply("窗帘关了。")], first=_light_call("light.a1"))
+    assert rec["calls"] == [] and rec["auto"] == [1] and rec["commentary"] == "窗帘关了。"
+    curtain = _intent_call("c8", tool=off, name="客厅纱帘")
+    rec = _after_first_call(["除了老家外，别的都关了", "只关灯"], [_text_reply("灯关了。")], first=curtain, tool=off, props=props)
+    assert rec["calls"] == [] and rec["auto"] == [1] and rec["commentary"] == "灯关了。"
+    # 不是答问题的时候不管
+    rec = _after_first_call("把灯关了", [], first=_light_call("light.a1"))
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1"]
+
+
+_INTENT_TOOLS = [{"type": "function", "name": "intent__HassTurnOff", "description": "关设备",
+                  "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "area": {"type": "string"}}}},
+                 {"type": "function", "name": "homeassistant__GetLiveContext", "description": "查状态",
+                  "parameters": {"type": "object", "properties": {"name": {"type": "string"}}}}]
+
+
+def test_kept_out_place_holds_even_if_the_previous_sentence_is_not_in_said():
+    """Live 先开口时上一句落在委托标记之前，这次委托只看得到答复。不动的地点靠记下来的，灯和 HA 意图都要算。"""
+    rec = _after_except("只关灯", [[_light_call("light.a1")], [_light_call("light.b1", "c8")], _text_reply("好了。")])
+    assert [a["entity_id"] for _, a in rec["calls"]] == ["light.a1", "light.a2", "light.a3"] and rec["commentary"] == "好了。"
+    off = "intent__HassTurnOff"
+    purifier = _intent_call("c0", tool=off, name="除醛净化器")       # 在甲地
+    rec = _after_except("净化器", [[purifier], _text_reply("甲地没动。")], keep_out="甲地楼下1号", tools=_INTENT_TOOLS)
+    assert rec["calls"] == [] and rec["commentary"] == "甲地没动。"
+
+
+def test_queries_are_not_touched_by_the_kind_question():
+    """查询不是控制：不回问，答了哪一类也不拦。"""
+    live = _intent_call("c0", tool="homeassistant__GetLiveContext", name="净化器")
+    rec = _after_except("只关灯", [[live], _text_reply("好。")], tools=_INTENT_TOOLS)
+    assert [n for n, _ in rec["calls"]] == ["homeassistant__GetLiveContext"]
+    query = {"type": "function_call", "call_id": "c0", "name": "hass_get_state", "arguments": json.dumps({"entity_id": "light.a1"})}
+    rec = _after_first_call("除了老家外，别的都关了", [], first=query, tool="hass_get_state")
+    assert rec["calls"] == [{"entity_id": "light.a1"}] and "只控制灯" not in rec["commentary"]
+
+
+def test_answer_all_runs_area_calls_without_asking_again():
+    """答"全部"：只填区域的调用也放行，不再问哪一类（回问时记下了这一批）。"""
+    off = "intent__HassTurnOff"
+    area = _intent_call(tool=off, area="甲地楼下1号")
+    props = {"name": {"type": "string"}, "area": {"type": "string"}}
+    rec = _after_first_call(["除了老家外，别的都关了", "全部"], [], first=area, tool=off, props=props)
+    assert rec["calls"] == [{"area": "甲地楼下1号"}] and "哪一类" not in rec["commentary"].rsplit("\n", 1)[-1]
+
+
+def test_answer_all_keeps_different_actions():
+    """小模型一轮写了不同的动作：不展开，照它填的。"""
+    two = [_light_call("light.a1", "c0"), _light_call("light.a2", "c1", "turn_on")]
+    rec = _after_first_call(["除了老家外，别的都关了", "都关了吧"], [_text_reply("好。")], first=two)
+    assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2"]
+
+
+def test_answer_with_another_kind_keeps_the_place_out_for_intents():
+    """答"净化器"：小模型控制甲地的被拦（甲地不动），别处的不再问哪一台。"""
+    off = "intent__HassTurnOff"
+    props = {"name": {"type": "string"}, "area": {"type": "string"}, "domain": {"type": "array"}}
+    fan, purifier = _intent_call("c8", tool=off, name="乙地风扇"), _intent_call(tool=off, name="除醛净化器")
+    rec = _after_first_call(["除了甲地外，别的都关了", "净化器和风扇"], [[fan]], first=purifier, tool=off, props=props)
+    assert rec["calls"] == [{"name": "乙地风扇"}] and rec["auto"] == [1]
+    assert "只控制灯" not in rec["commentary"] and "乙地风扇" in rec["commentary"]
+
+
 def test_questions_for_live_still_go_straight_back():
     """写给 Live 的问句（问哪一处、哪一类）照旧直接交回，不多走一轮小模型；第二轮才问的也一样。说明是写给小模型的才接着问它。"""
     rec = _after_first_call("把灯全关了", [])
@@ -2424,17 +2525,54 @@ def _one_call_flags(said: str, asked: bool = False, picker: str = "model") -> li
     return seen
 
 
+def _after_except(said: str, rounds: list, keep_out: str = "乙地老家", tools: list | None = None) -> dict:
+    """上一次委托问过"别处控制哪一类"（不动 keep_out），这句答 said，上一句不在这次委托看得到的"用户说的话"里（Live 先开口，它落在委托标记之前）。
+    小模型按 rounds 依次回。返回每一轮的 one_call、执行的调用（名字 + 参数）、交回 Live 的话。"""
+    from tests.core.providers.s2s.test_ha_names import entries
+    rec = {"one_call": []}
+
+    async def sc(lv, conn, p):
+        pending = list(rounds)
+
+        async def fake(items, tools, force=None, one_call=False):
+            rec["one_call"].append(one_call)
+            return {"output": pending.pop(0)}
+        p._responses_call = fake
+        p._tool_list = lambda: tools_list
+        p._ha_entries = entries()
+        p._except_asked = {keep_out}
+        conn.prompt = _LIGHTS_PROMPT
+        await lv.emit({"type": "session.input_transcript.delta", "delta": said})
+        await _real_sleep(0.05)
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "e1", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        rec["commentary"] = [m for m in lv.received if m["type"] == "session.commentary.append"][-1]["content"]
+        rec["calls"] = [(c["name"], json.loads(c["arguments"])) for c in conn.func_handler.calls]
+    tools_list = tools or [{"type": "function", "name": "hass_set_state", "description": "设置设备状态",
+                            "parameters": {"type": "object", "properties": {"entity_id": {"type": "string"}, "state": {"type": "object"}}}}]
+    _run_client(sc, tool_picker="model", tool_url="http://x", tool_model="m", tool_api_key="k")
+    return rec
+
+
+def _one_call_flags_after_except(said: str) -> list:
+    return _after_except(said, [[_light_call("light.a1")], _text_reply("好了。")])["one_call"]
+
+
 def test_first_round_asks_for_one_call_when_the_server_will_fan_out():
     """"把甲地的灯都关了"服务端展开、"把灯全关了"服务端回问，小模型只要给出动作；结果交回总结的那一轮不限。"""
     assert _one_call_flags("把甲地的灯都关了") == [True, False]
     assert _one_call_flags("把灯全关了") == [True]
     assert _one_call_flags("甲地", asked=True) == [True, False]
+    assert _one_call_flags("除了老家都关了") == [True]                 # 排除句没说哪一类：服务端回问
+    assert _one_call_flags_after_except("嗯") == [True]                # 没答上来：再问一遍
+    assert _one_call_flags_after_except("只关灯") == [False, False]    # 答了：小模型第一轮不限，灯照列表展开后再总结
+    assert _one_call_flags_after_except("都关了吧") == [False, False]  # 答全部也不限：别处的设备不止灯
 
 
 def test_first_round_leaves_parallel_calls_alone_when_the_server_will_not_fan_out():
     """点了设备、有排除、没说"都"：服务端不接手，小模型一轮出多个调用才控制得全。"""
     assert _one_call_flags("把书房灯和小台灯都关了") == [False]
-    assert _one_call_flags("除了老家都关了") == [False]
+    assert _one_call_flags("除了老家，把灯都关了") == [False]
     assert _one_call_flags("把书房灯关了") == [False]
     assert _one_call_flags("把甲地的灯关了") == [False]     # 没说"都"，服务端不展开，小模型自己写全才控制得到
 

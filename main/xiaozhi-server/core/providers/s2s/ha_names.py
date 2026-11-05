@@ -18,6 +18,7 @@ HA 的意图工具（MCP 里叫"平台__Hass意图"，如 intent__HassTurnOn、f
 
 智能设备列表里的设备（灯，走 hass_set_state）也过一道地点守卫（listed_place_conflict）：地点从列表的"位置"一栏认。
 用户明说不动的地点（"除了甲地""甲地的不用"，excluded_places），两道地点守卫都反过来看：那里的设备不执行。
+只说了不动哪里、没说别处控制哪一类（"除了甲地外，别的都关了"），先问（except_kind_question），答了之后不动的地点还算数。
 
 名字、区域都来自 HA，这里不写任何地名。只读：只调 GetLiveContext。
 """
@@ -232,12 +233,12 @@ def matched(tool_name: str, args: dict, entries: Iterable[dict]) -> list[dict]:
     return cands
 
 
-def place_conflict(utterance: str, tool_name: str, args: dict, entries: list[dict]) -> str | None:
+def place_conflict(utterance: str, tool_name: str, args: dict, entries: list[dict], keep_out: Iterable[str] = ()) -> str | None:
     """用户这句话提到了某个区域、这次调用却会命中别的区域的设备：返回交给 Live 的说明（不执行）；没问题返回 None。
     用户明说不动的地点不算提到：命中那里的设备不执行；只说了不动哪里时（"除了甲地，把净化器都关了"）别处都放行。
-    没提地点、HA 本来就匹配不上、命中的设备没分区域，都放行。"""
+    keep_out 是上一句说过不动的地点（见 except_kind_question）。没提地点、HA 本来就匹配不上、命中的设备没分区域，都放行。"""
     tokens = area_tokens(entries)
-    excluded = excluded_places(utterance, tokens)
+    excluded = excluded_places(utterance, tokens) | set(keep_out)
     said = mentioned_areas(utterance, tokens) - excluded
     hits = [e for e in matched(tool_name, args, entries) if e["areas"]]
     kept = sorted({e["areas"][0] for e in hits} & excluded)
@@ -375,7 +376,7 @@ def _device_rows(prompt: str) -> list[list[str]]:
             if len(p) == 3 and re.fullmatch(r"\w+\.\w+", p[2])]
 
 
-def listed_place_conflict(prompt: str, said: str, entity_id: str, entries: list[dict]) -> str | None:
+def listed_place_conflict(prompt: str, said: str, entity_id: str, entries: list[dict], keep_out: Iterable[str] = ()) -> str | None:
     """hass_set_state 的地点守卫（place_conflict 管 HA 意图，这里管智能设备列表里的设备）：用户这句话（said）提到了地点、这台设备的位置却在
     别处，返回交给小模型 / Live 的说明（不执行）；没问题返回 None。11-05 模拟："把甲地的灯都关了""把乙地的灯也都关了"，第一轮展开乙地的灯都对，
     第二轮小模型又把甲地的灯调了一遍（答复里说"之前说关了，其实没真的去关"：调度只看得到这次委托的工具记录，看不到上一次的）。
@@ -386,7 +387,7 @@ def listed_place_conflict(prompt: str, said: str, entity_id: str, entries: list[
     拿不准都放行：要控制的那句没提地点（"都关了吧"看前一句）；认不出是不动哪里的排除、否定、提问（"甲地的灯留一盏""甲地的灯都关了吗"）；
     设备不在列表里；位置里认不出地点。"""
     tokens = area_tokens(entries)
-    excluded = excluded_places(said, tokens)
+    excluded = excluded_places(said, tokens) | set(keep_out)
     if not excluded and _EXCEPT_WORDS.search(said or ""):
         return None
     places = mentioned_areas("，".join(c for c in _CLAUSE.split(said or "") if _COMMAND_WORDS.search(c)) or said, tokens) - excluded
@@ -401,6 +402,62 @@ def listed_place_conflict(prompt: str, said: str, entity_id: str, entries: list[
     where = "、".join(sorted(places))
     return (f"{NOT_AN_ERROR}用户这句说的是{where}，这台设备在{row[0]}，这句没有要控制它，不用重做，也不用提它。"
             f"只说{where}的结果；{where}还没控制的话接着控制，或者问清是哪一台。")
+
+
+_ELSE_WORDS = re.compile(r"别的|其他|其它|其余")
+
+
+def _says_a_kind(text: str, entries: list[dict]) -> bool:
+    """这句话点了哪一类或者具体设备（灯、净化器、设备、书房灯）。text 已去掉地点。只看灯和名单里的设备：场景的别名里有"打开"，不能把动作当成设备。"""
+    devices = [e for e in entries if e["domain"] in {"light", *DEFAULT_DOMAINS}]
+    return bool(_KIND_WORDS.search(text)) or "设备" in text or says_device_word(text, devices)
+
+
+def except_kind_question(said: str, asked: Iterable[str], entries: list[dict]) -> tuple[str | None, set[str]]:
+    """"除了甲地外，别的都关了"：说了不动哪里，没说别处要控制哪一类。小模型会把它理解成所有设备，连净化器、加湿器开关一起关
+    （11-05 模拟 6 次 5 次）。范围不明先问，和没说地点一样（#41、#48）。返回 (交给 Live 的回问, 不动的地点)，不用问时返回 (None, set())。
+
+    带设备词的不问（"除了甲地，把灯都关了"）；也说了要控制哪里的不问（"把乙地的都关了，甲地的不用"）；提问、说状态、光是不让动的不问
+    （"除了甲地都关了吗""除了甲地都关着呢""别把甲地的都关了"）。asked 是上一次委托问过时不动的地点：这句答了就不再问，没答上来（"嗯""第一个"，
+    或者转写还没到）再问一遍。"""
+    said, asked = said or "", set(asked)
+    tokens = area_tokens(entries)
+    text = _without_places(said, tokens)
+    if asked:
+        answered = says_all(said) or mentioned_areas(said, tokens) or _says_a_kind(text, entries) or _EXCEPT_WORDS.search(said)
+        excluded = set() if answered else asked
+    else:
+        excluded = excluded_places(said, tokens)
+        control = "，".join(c for c in _CLAUSE.split(said) if _COMMAND_WORDS.search(c)) or said
+        if (mentioned_areas(control, tokens) - excluded or not (says_all(said) or _ELSE_WORDS.search(said)) or not sounds_like_command(said)
+                or "吗" in said or _says_a_kind(text, entries) or (re.match(r"(?:先)?(?:别|不要|不用)", said) and not _CLAUSE.search(said))):
+            excluded = set()
+    if not excluded:
+        return None, set()
+    return f"没有执行：用户说了不动{'、'.join(sorted(excluded))}，没说别处要控制哪一类设备。问用户别处只控制灯，还是所有设备都控制。", excluded
+
+
+def still_kept_out(said: str, asked: Iterable[str], prompt: str, entries: list[dict]) -> set[str]:
+    """上一次委托问过"别处控制哪一类"，这句还算不算在答：算的话上一句不动的地点这次还不动。这句又说了地点、点了设备列表里的一盏（"把书房灯关了"）是新的一句。"""
+    tokens = area_tokens(entries)
+    if mentioned_areas(said, tokens) or says_device_word(_without_places(said, tokens), [{"names": [p[1]]} for p in _device_rows(prompt)]):
+        return set()
+    return set(asked)
+
+
+def outside_kind_answer(said: str, is_light: bool) -> str | None:
+    """问过"别处控制哪一类"，这句答了哪一类：答"只关灯"别的设备不动，答"窗帘"灯不动，返回写给小模型的说明；答全部、没点类别都放行。
+    11-05 模拟：答"窗帘"时第一轮关窗帘，第二轮小模型把别处的灯也关了。"""
+    kinds = set(_KIND_WORDS.findall(said or ""))
+    if not kinds or ("灯" in kinds if is_light else kinds - {"灯"}):
+        return None
+    return f"{NOT_AN_ERROR}用户答的是“{said}”，不包括这个设备，所以没有控制它。只说用户答的这一类的结果；这一类还没控制的话接着控制。"
+
+
+def lights_except(prompt: str, entity_id: str, entries: list[dict], keep_out: Iterable[str]) -> list[str]:
+    """答了"只关灯""全部"之后控制哪些：设备列表里和 entity_id 同类、不在 keep_out 的。范围照列表，不靠小模型写全。"""
+    tokens, keep_out = area_tokens(entries), set(keep_out)
+    return [p[2] for p in _device_rows(prompt) if p[2].split(".")[0] == entity_id.split(".")[0] and not mentioned_areas(p[0], tokens) & keep_out]
 
 
 def all_at_place(prompt: str, said: str, recent: str, entity_id: str, entries: list[dict],
@@ -424,7 +481,7 @@ def all_at_place(prompt: str, said: str, recent: str, entity_id: str, entries: l
         words = {w.replace(" ", "") for a in places for w in tokens[a]}
         return [p[2] for p in same if any(w in norm(p[0]).replace(" ", "") for w in words)]
 
-    places = next(filter(None, (mentioned_areas(t, tokens) for t in reversed((recent or "").split("\n")))), set())
+    places = next(filter(None, (mentioned_areas(t, tokens) - excluded_places(t, tokens) for t in reversed((recent or "").split("\n")))), set())
     if places:
         return located(places), None
     where = [a for a in tokens if located([a])]
@@ -522,7 +579,7 @@ def all_named(said: str, recent: str, tool_name: str, entries: list[dict], domai
     if not _COMMAND_WORDS.search(said) and says_device_word(_without_places(said, tokens), devices):
         return []
     lines = (recent or "").split("\n")
-    places = next(filter(None, (mentioned_areas(t, tokens) for t in reversed(lines))), set())
+    places = next(filter(None, (mentioned_areas(t, tokens) - excluded_places(t, tokens) for t in reversed(lines))), set())
     text = next((t for t in (_without_places(x, tokens) for x in reversed(lines)) if says_device_word(t, devices)), "")
     words, hits = _named_by(text, [e for e in devices if not places or (e["areas"] and e["areas"][0] in places)])
     if not words or len({e["domain"] for e in hits}) != 1 or not _only_these_words(text, words):
