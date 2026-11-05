@@ -9,11 +9,14 @@ import json
 
 import numpy as np
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 from websockets.asyncio.server import serve
 
 from tests.core.providers.s2s.test_openai_realtime import (  # noqa: F401  复用夹具（也带上 _restore_sleep 与 Opus 跳过标记）
     FakeConn, _real_sleep, _restore_sleep, pytestmark, wait_until,
 )
+from core.providers.s2s.openai_live import openai_live as live_mod
 from core.providers.s2s.openai_live.openai_live import S2SProvider
 
 
@@ -1076,7 +1079,7 @@ def _ha_client(scenario, **over):
 
 async def _delegate(lv, p, said: str | None, call: dict, did: str) -> str:
     """said=None：委托时这句转写还没到（in_text 是空的）。"""
-    async def fake(items, tools):
+    async def fake(items, tools, one_call=False):
         return {"output": [dict(call, type="function_call", call_id="c1")]}
     p._responses_call = fake
     if said is not None:
@@ -1255,7 +1258,7 @@ async def _answer_with_a_light(lv, p, conn, said: str, did: str) -> list[str]:
     """问过"哪一类"之后用户答 said，小模型填了一盏灯，拿到结果后说一句话。返回这次执行的灯。"""
     before = len(conn.func_handler.calls)
 
-    async def fake(items, tools):
+    async def fake(items, tools, one_call=False):
         if any(i.get("type") == "function_call_output" for i in items):
             return {"output": [{"type": "message", "content": [{"type": "output_text", "text": "好了。"}]}]}
         return {"output": [_light_call("light.a1")]}
@@ -1730,3 +1733,203 @@ def test_no_fan_out_for_other_tools():
     """别的工具（同样是短结果）照旧：说了"都"也是一个调用、直接交回。"""
     rec = _after_first_call("甲地都几点了", [], first=_light_call("light.a1", name="llm__GetDateTime"), tool="llm__GetDateTime")
     assert len(rec["calls"]) == 1 and rec["auto"] == [] and rec["commentary"].startswith("已调用 llm__GetDateTime")
+
+
+# ---------- 工具链路走别家网关（tool_api_key）、固定应答存文件 ----------
+async def _http_recorder(reply, status=200):
+    """假的 HTTP 上游：记下每次请求的 Authorization，回 reply（dict 回 JSON，bytes 原样回）。"""
+    seen = []
+
+    async def handler(request):
+        seen.append(request.headers.get("Authorization"))
+        if isinstance(reply, dict):
+            return web.json_response(reply, status=status)
+        return web.Response(body=reply, status=status)
+    app = web.Application()
+    app.router.add_post("/{tail:.*}", handler)
+    srv = TestServer(app)
+    await srv.start_server()
+    return srv, seen
+
+
+def _plain_provider(**over):
+    conn = FakeConn(asyncio.get_running_loop())
+    return S2SProvider({"api_key": "k", "echo_gate": False, "wake_greeting_text": "", **over}, conn)
+
+
+def test_responses_call_uses_tool_api_key_and_defaults_to_api_key():
+    async def go():
+        srv, seen = await _http_recorder({"output": []})
+        try:
+            url = str(srv.make_url("/v1/responses"))
+            await _plain_provider(tool_url=url, tool_api_key="gw")._responses_call([{"role": "user", "content": "x"}], [])
+            await _plain_provider(tool_url=url)._responses_call([{"role": "user", "content": "x"}], [])
+            await _plain_provider(tool_url=url, tool_api_key="")._responses_call([{"role": "user", "content": "x"}], [])
+        finally:
+            await srv.close()
+        assert seen == ["Bearer gw", "Bearer k", "Bearer k"]
+    asyncio.run(go())
+
+
+def _capture_body(calls):
+    """假的 aiohttp 客户端不好写，直接开上游：记下请求体。"""
+    async def start():
+        async def handler(request):
+            calls.append(await request.json())
+            return web.json_response({"output": []})
+        app = web.Application()
+        app.router.add_post("/{tail:.*}", handler)
+        srv = TestServer(app)
+        await srv.start_server()
+        return srv
+    return start
+
+
+def test_responses_call_limits_parallel_calls_only_when_asked():
+    async def go():
+        bodies = []
+        srv = await _capture_body(bodies)()
+        try:
+            p = _plain_provider(tool_url=str(srv.make_url("/v1/responses")))
+            await p._responses_call([{"role": "user", "content": "x"}], [], one_call=True)
+            await p._responses_call([{"role": "user", "content": "x"}], [])
+        finally:
+            await srv.close()
+        assert bodies[0]["parallel_tool_calls"] is False and "parallel_tool_calls" not in bodies[1]
+    asyncio.run(go())
+
+
+def _one_call_flags(said: str, asked: bool = False, picker: str = "model") -> list:
+    """跑一次 client 委托，记下每一轮 _responses_call 的 one_call。第一轮调灯，还要第二轮时回一句话。"""
+    from tests.core.providers.s2s.test_ha_names import entries
+    seen = []
+
+    async def sc(lv, conn, p):
+        async def fake(items, tools, force=None, one_call=False):
+            seen.append(one_call)
+            return {"output": [_light_call("light.a1")] if len(seen) == 1 else _text_reply("都关了。")}
+
+        async def no_decisions(ctx, tools):
+            raise RuntimeError("decisions 不可用")
+        p._responses_call = fake
+        p._decisions_call = no_decisions
+        p._tool_list = lambda: [{"type": "function", "name": "hass_set_state", "description": "设置设备状态",
+                                 "parameters": {"type": "object", "properties": {"entity_id": {"type": "string"}, "state": {"type": "object"}}}}]
+        p._ha_entries = entries()
+        p._all_asked = asked
+        conn.prompt = _LIGHTS_PROMPT
+        await lv.emit({"type": "session.input_transcript.delta", "delta": said})
+        await _real_sleep(0.05)
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d1", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+    _run_client(sc, tool_picker=picker)
+    return seen
+
+
+def test_first_round_asks_for_one_call_when_the_server_will_fan_out():
+    """"把甲地的灯都关了"服务端展开、"把灯全关了"服务端回问，小模型只要给出动作；结果交回总结的那一轮不限。"""
+    assert _one_call_flags("把甲地的灯都关了") == [True, False]
+    assert _one_call_flags("把灯全关了") == [True]
+    assert _one_call_flags("甲地", asked=True) == [True, False]
+
+
+def test_first_round_leaves_parallel_calls_alone_when_the_server_will_not_fan_out():
+    """点了设备、有排除、没说"都"：服务端不接手，小模型一轮出多个调用才控制得全。"""
+    assert _one_call_flags("把书房灯和小台灯都关了") == [False]
+    assert _one_call_flags("除了甲地都关了") == [False]
+    assert _one_call_flags("把书房灯关了") == [False]
+    assert _one_call_flags("把甲地的灯关了") == [False]     # 没说"都"，服务端不展开，小模型自己写全才控制得到
+
+
+def test_time_goes_in_the_message_not_in_the_dispatch_instructions():
+    """调度指令里不能有会变的东西：每分钟变一次，上游的提示词缓存和网关的隐私遮蔽都算新文本，多等 2 s。时间放在用户消息里。"""
+    seen = []
+
+    async def sc(lv, conn, p):
+        async def fake(items, tools):
+            seen.append(items[0]["content"])
+            return {"output": _text_reply("好的。")}
+        p._responses_call = fake
+        assert "当前时间" not in p._dispatch_instructions()
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "现在几点了"})
+        await _real_sleep(0.05)
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d1", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+    _run_client(sc)
+    assert seen[0].startswith("当前时间：") and seen[0].endswith("现在几点了")
+
+
+def test_one_call_is_off_with_the_decisions_picker():
+    """新代码配旧模板（decisions + mini）行为不变：退回小模型那一次不限调用数。"""
+    assert _one_call_flags("把甲地的灯都关了", picker="decisions") == [False, False]
+
+
+PHRASE_PCM = (np.ones(2400, np.int16) * 3000).tobytes()   # 100 ms @24k，够响，不会被当静音裁掉
+
+
+def test_fixed_phrase_is_synthesized_once_and_read_from_file(tmp_path, monkeypatch):
+    """合成一次存文件：清掉进程内缓存（相当于重启）再要，读文件、不调 TTS；换一句才再合成。"""
+    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+
+    async def go():
+        srv, seen = await _http_recorder(PHRASE_PCM)
+        try:
+            over = dict(tts_url=str(srv.make_url("/v1/audio/speech")), phrase_dir=str(tmp_path / "phrases"))
+            first = await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答")
+            assert first and len(seen) == 1
+            live_mod._GREETING_CACHE.clear()
+            assert await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答") == first and len(seen) == 1
+            await _plain_provider(**over)._tts_pcm("好。", "停下应答")
+            assert len(seen) == 2 and len(list((tmp_path / "phrases").iterdir())) == 2
+        finally:
+            await srv.close()
+    asyncio.run(go())
+
+
+def test_fixed_phrase_file_keeps_24k_and_each_rate_resamples_from_it(tmp_path, monkeypatch):
+    """文件里是没重采样的 24 kHz：16 kHz 的设备先合成，24 kHz 的设备读到的长度也对。"""
+    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+
+    async def go():
+        srv, seen = await _http_recorder(PHRASE_PCM)
+        try:
+            over = dict(tts_url=str(srv.make_url("/v1/audio/speech")), phrase_dir=str(tmp_path))
+            low = _plain_provider(**over)
+            low.speaker.sample_rate = 16000
+            assert len(await low._tts_pcm("我在。", "唤醒应答")) < len(PHRASE_PCM)
+            high = _plain_provider(**over)
+            high.speaker.sample_rate = 24000
+            assert await high._tts_pcm("我在。", "唤醒应答") == PHRASE_PCM and len(seen) == 1
+        finally:
+            await srv.close()
+    asyncio.run(go())
+
+
+def test_fixed_phrase_tts_failure_saves_nothing_and_retries_next_time(tmp_path, monkeypatch):
+    """余额用完时 TTS 回 429：不存文件、不进缓存，充值后下一次唤醒自己补上。"""
+    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+
+    async def go():
+        srv, seen = await _http_recorder({"error": {"code": "credit_balance_exhausted"}}, status=429)
+        try:
+            over = dict(tts_url=str(srv.make_url("/v1/audio/speech")), phrase_dir=str(tmp_path / "phrases"))
+            assert await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答") == b""
+            assert await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答") == b""
+            assert len(seen) == 2 and not (tmp_path / "phrases").exists()
+        finally:
+            await srv.close()
+    asyncio.run(go())
+
+
+def test_fixed_phrase_still_plays_when_the_file_cannot_be_written(tmp_path, monkeypatch):
+    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+    (tmp_path / "occupied").write_text("这是文件，建不了目录")
+
+    async def go():
+        srv, seen = await _http_recorder(PHRASE_PCM)
+        try:
+            p = _plain_provider(tts_url=str(srv.make_url("/v1/audio/speech")), phrase_dir=str(tmp_path / "occupied" / "phrases"))
+            assert await p._tts_pcm("我在。", "唤醒应答") and len(seen) == 1
+        finally:
+            await srv.close()
+    asyncio.run(go())
