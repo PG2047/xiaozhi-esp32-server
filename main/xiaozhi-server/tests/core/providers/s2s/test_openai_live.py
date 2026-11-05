@@ -1903,6 +1903,202 @@ def test_curtains_all_word_before_the_action_does_not_fan_out():
     assert [c["name"] for c in rec["calls"]] == [_CURTAINS[0]]
 
 
+_TURN_OFF = "intent__HassTurnOff"
+_FAN_HERE, _FAN_THERE = "戊地108甲牌净化风扇", "己地甲牌净化风扇"
+
+
+def _off_call(call_id: str = "c0", **args) -> dict:
+    return {"type": "function_call", "call_id": call_id, "name": _TURN_OFF, "arguments": json.dumps(args, ensure_ascii=False)}
+
+
+def _fans(said: str | list[str], auto_rounds: list, first: dict | list, conf: float = 0.95, **over) -> dict:
+    """同 _after_first_call，设备表是虚构的戊地、己地（见 test_ha_names._name_entries），工具是 HA 意图：两处都有风扇。"""
+    from tests.core.providers.s2s.test_ha_names import _name_entries
+    return _after_first_call(said, auto_rounds, first=first, tool=_TURN_OFF, conf=conf, es=_name_entries(),
+                             props={"name": {"type": "string"}, "area": {"type": "string"}, "domain": {"type": "array"}}, **over)
+
+
+def test_intent_all_words_without_a_place_ask_where_and_run_nothing():
+    """"把风扇都关了"：不管小模型填的是哪台、只填 domain，还是一轮写好几个调用，都不替用户控制两处房子的，回问交给 Live。"""
+    for first in (_off_call(name=_FAN_HERE), _off_call(domain=["fan"])):
+        rec = _fans("把风扇都关了", [], first)
+        assert rec["calls"] == [] and rec["auto"] == []
+        assert "没有执行" in rec["commentary"] and "戊地楼下1号、己地老家" in rec["commentary"] and "问用户要控制哪一处" in rec["commentary"]
+    two = [_off_call("c0", name=_FAN_HERE), _off_call("c1", name=_FAN_THERE)]
+    rec = _fans("把风扇都关了", [_text_reply("要关哪里的风扇？")], two)
+    assert rec["calls"] == [] and rec["commentary"] == "要关哪里的风扇？"
+    # 总结那一轮小模型又调了一次：这次委托里都不执行
+    rec = _fans("把风扇都关了", [[_off_call("c9", name=_FAN_THERE)], _text_reply("要关哪里的风扇？")], two)
+    assert rec["calls"] == []
+
+
+def test_intent_ask_where_also_when_the_model_picks_by_itself():
+    """线上 tool_picker 是 model：小模型自选的调用同样拦下。"""
+    rec = _fans("把风扇都关了", [[_off_call(domain=["fan"])]], _off_call(name=_FAN_HERE), conf=0.3)
+    assert rec["calls"] == [] and rec["auto"] == [0] and "没有执行" in rec["commentary"]
+
+
+def test_intent_answer_with_a_place_after_asking_controls_that_place():
+    """答了地点：不管小模型填的是什么（只填区域、名字 HA 找不到、填到别处），设备照名单，动作照它填的。"""
+    for first in (_off_call(area="戊地楼下1号", domain=["fan"]), _off_call(name="戊地风扇"), _off_call(name=_FAN_THERE), _off_call(domain=["fan"])):
+        rec = _fans(["把风扇都关了", "戊地的"], [], first)
+        assert rec["calls"] == [{"name": _FAN_HERE}] and "没有执行" not in rec["commentary"]
+    rec = _fans(["把风扇都关了", "戊地和己地"], [_text_reply("关好了。")], [_off_call("c0", name=_FAN_HERE), _off_call("c1", name=_FAN_THERE)])
+    assert [c["name"] for c in rec["calls"]] == [_FAN_HERE, _FAN_THERE] and rec["auto"][-1] == 2
+
+
+def test_intent_answer_keeps_the_filled_action():
+    speed = {"type": "function_call", "call_id": "c0", "name": "fan__HassFanSetSpeed", "arguments": json.dumps({"name": "戊地风扇", "percentage": 50})}
+    from tests.core.providers.s2s.test_ha_names import _name_entries
+    rec = _after_first_call(["把风扇都调到百分之五十", "戊地的"], [], first=speed, tool="fan__HassFanSetSpeed", es=_name_entries(),
+                            props={"name": {"type": "string"}, "percentage": {"type": "integer"}})
+    assert rec["calls"] == [{"percentage": 50, "name": _FAN_HERE}]
+
+
+def test_intent_answer_all_after_asking_controls_every_named_device():
+    for said in ("都关", "全部"):
+        rec = _fans(["把风扇都关了", said], [_text_reply("都关好了。")], _off_call(domain=["fan"]))
+        assert rec["calls"] == [{"name": _FAN_HERE}, {"name": _FAN_THERE}], said     # domain: fan 还会动净化器
+
+
+def test_intent_two_devices_at_the_answered_place_are_not_asked_which_one():
+    """答"戊地"没有"都"：同处两台不能被当成没说清是哪一台。"""
+    from tests.core.providers.s2s.test_ha_names import _name_entries
+    es = _name_entries() + [{"names": ["戊地小风扇"], "domain": "fan", "areas": _name_entries()[0]["areas"], "device_class": None}]
+    rec = _after_first_call(["把风扇都关了", "戊地的"], [_text_reply("关好了。")], first=_off_call(name=_FAN_HERE), tool=_TURN_OFF, es=es,
+                            props={"name": {"type": "string"}})
+    assert [c["name"] for c in rec["calls"]] == [_FAN_HERE, "戊地小风扇"] and rec["commentary"] == "关好了。"
+
+
+def test_intent_answer_after_live_spoke_first_is_not_asked_which_one():
+    """Live 先开口时第一句在委托之前就落进 history，答复轮的 said 只有"戊地的"，没有"都"：同处两台照样都控制，不被当成没说清是哪一台。"""
+    from tests.core.providers.s2s.test_ha_names import _name_entries
+    es = _name_entries() + [{"names": ["戊地小风扇"], "domain": "fan", "areas": _name_entries()[0]["areas"], "device_class": None}]
+
+    async def sc(lv, conn, p):
+        async def fake_dec(ctx, tools):
+            return _TURN_OFF, 0.95
+
+        async def fake_resp(items, tools, force=None):
+            return {"output": [_off_call(area="戊地楼下1号", domain=["fan"])]} if force else {"output": _text_reply("关好了。")}
+        p._decisions_call = fake_dec
+        p._responses_call = fake_resp
+        p._tool_list = lambda: [{"type": "function", "name": _TURN_OFF, "description": "关",
+                                 "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "area": {"type": "string"}}}}]
+        p._ha_entries = es
+        p._guard_mark = len(p.history)
+        for n, s in enumerate(["把风扇都关了", "戊地的"]):
+            await lv.emit({"type": "session.input_transcript.delta", "delta": s})
+            await _real_sleep(0.05)
+            await p._flush_input_text()
+            await lv.emit({"type": "session.delegation.created", "delegation": {"id": f"f{n}", "target": "client"}})
+            await wait_until(lambda: any(m["type"] == "session.commentary.append" and m["delegation_id"] == f"f{n}" for m in lv.received), what="commentary")
+            p.history.append(("assistant", "好的。"))
+        assert [json.loads(c["arguments"]) for c in conn.func_handler.calls] == [{"name": _FAN_HERE}, {"name": "戊地小风扇"}]
+    _run_client(sc, tool_picker="decisions")
+
+
+def test_intent_answer_with_mixed_tools_runs_what_the_model_filled():
+    """答复轮小模型还调了别的工具：一个动作展开不了，照它填的（地点守卫看着）。"""
+    other = {"type": "function_call", "call_id": "c1", "name": "llm__GetDateTime", "arguments": "{}"}
+    rec = _fans(["把风扇都关了", "戊地的"], [_text_reply("关好了。")], [_off_call("c0", name=_FAN_HERE), other])
+    assert rec["calls"] == [{"name": _FAN_HERE}, {}]
+
+
+def test_intent_vague_answer_is_asked_again_and_runs_nothing():
+    rec = _fans(["把风扇都关了", "嗯"], [], _off_call(domain=["fan"]))
+    assert rec["calls"] == [] and "问用户要控制哪一处" in rec["commentary"]
+    rec = _fans(["把风扇都关了", "第一个", "戊地的"], [], _off_call(domain=["fan"]))
+    assert rec["calls"] == [{"name": _FAN_HERE}]
+
+
+def test_intent_asking_where_only_counts_for_the_next_delegation():
+    """问完隔了一次别的委托，再说地点就不算答这个问题了：不展开，小模型填到别处还是地点守卫拦下。"""
+    rec = _fans(["把风扇都关了", "把大净化器关了", "戊地的"], [], _off_call(name=_FAN_THERE))
+    assert rec["calls"] == [{"name": _FAN_THERE}] and "己地老家" in rec["commentary"]
+
+
+def test_intent_new_sentence_after_asking_is_checked_as_usual():
+    """问的是风扇，这句说别的设备：不算在答，不展开成那一处的每一幅，只执行小模型填的。"""
+    rec = _fans(["把风扇都关了", "把戊地的窗帘拉开"], [], _off_call(name="戊地1号卧室布帘"))
+    assert rec["calls"] == [{"name": "戊地1号卧室布帘"}]
+
+
+def test_intent_answer_where_does_not_fan_out_the_lights():
+    """问的是风扇，答"戊地的"：灯那条路不算被问过。答复轮小模型选了灯，只控制它填的那一盏，不展开成戊地的每一盏。"""
+    from tests.core.providers.s2s.test_ha_names import _name_entries
+
+    async def sc(lv, conn, p):
+        picks = [(_TURN_OFF, _off_call(domain=["fan"])), ("hass_set_state", _light_call("light.a1"))]
+
+        async def fake_dec(ctx, tools):
+            return picks[0][0], 0.95
+
+        async def fake_resp(items, tools, force=None):
+            return {"output": [picks.pop(0)[1]]}
+        p._decisions_call = fake_dec
+        p._responses_call = fake_resp
+        p._tool_list = lambda: [{"type": "function", "name": n, "description": "控制",
+                                 "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "entity_id": {"type": "string"}}}}
+                                for n in (_TURN_OFF, "hass_set_state")]
+        p._ha_entries = _name_entries()
+        conn.prompt = "戊地书房,书房灯,light.a1\n戊地客厅,大灯,light.a2\n己地卧室,卧室灯,light.b1\n"
+        p._guard_mark = len(p.history)
+        for n, s in enumerate(["把风扇都关了", "戊地的"]):
+            await lv.emit({"type": "session.input_transcript.delta", "delta": s})
+            await _real_sleep(0.05)
+            await lv.emit({"type": "session.delegation.created", "delegation": {"id": f"w{n}", "target": "client"}})
+            await wait_until(lambda: any(m["type"] == "session.commentary.append" and m["delegation_id"] == f"w{n}" for m in lv.received), what="commentary")
+            await p._flush_input_text()
+            p.history.append(("assistant", "好的。"))
+        said = [m["content"] for m in lv.received if m["type"] == "session.commentary.append"]
+        assert "没有执行" in said[0]
+        assert [json.loads(c["arguments"]).get("entity_id") for c in conn.func_handler.calls] == ["light.a1"]
+    _run_client(sc, tool_picker="decisions")
+
+
+def test_intent_answer_where_with_low_confidence_light_is_not_trusted():
+    """切回 Decisions 时：问的是风扇，答"戊地的都关了"，低置信度选了 hass_set_state 也不信（信了就把戊地的灯都展开了），退回小模型自选。"""
+    from tests.core.providers.s2s.test_ha_names import _name_entries
+
+    async def sc(lv, conn, p):
+        picks = [(_TURN_OFF, 0.95), ("hass_set_state", 0.4)]
+        auto = []
+
+        async def fake_dec(ctx, tools):
+            return picks.pop(0)
+
+        async def fake_resp(items, tools, force=None):
+            if force:
+                return {"output": [_off_call(domain=["fan"]) if force == _TURN_OFF else _light_call("light.a1")]}
+            auto.append(True)
+            return {"output": _text_reply("要关什么？")}
+        p._decisions_call = fake_dec
+        p._responses_call = fake_resp
+        p._tool_list = lambda: [{"type": "function", "name": n, "description": "控制",
+                                 "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "entity_id": {"type": "string"}}}}
+                                for n in (_TURN_OFF, "hass_set_state")]
+        p._ha_entries = _name_entries()
+        conn.prompt = "戊地书房,书房灯,light.a1\n戊地客厅,大灯,light.a2\n己地卧室,卧室灯,light.b1\n"
+        p._guard_mark = len(p.history)
+        for n, s in enumerate(["把风扇都关了", "戊地的都关了"]):
+            await lv.emit({"type": "session.input_transcript.delta", "delta": s})
+            await _real_sleep(0.05)
+            await lv.emit({"type": "session.delegation.created", "delegation": {"id": f"t{n}", "target": "client"}})
+            await wait_until(lambda: any(m["type"] == "session.commentary.append" and m["delegation_id"] == f"t{n}" for m in lv.received), what="commentary")
+            await p._flush_input_text()
+            p.history.append(("assistant", "好的。"))
+        assert auto == [True] and conn.func_handler.calls == []
+    _run_client(sc, tool_picker="decisions")
+
+
+def test_intent_ask_where_off_with_ha_names_off_and_for_other_tools():
+    rec = _fans("把风扇都关了", [], _off_call(domain=["fan"]), ha_names=False)
+    assert rec["calls"] == [{"domain": ["fan"]}]
+    rec = _after_first_call("风扇都几点开的", [], first=_light_call("light.a1", name="llm__GetDateTime"), tool="llm__GetDateTime")
+    assert len(rec["calls"]) == 1 and "没有执行" not in rec["commentary"]
+
+
 def test_fan_out_only_in_the_first_round():
     """总结那一轮小模型又调了一次：照它填的执行，不再展开一遍。"""
     rec = _after_first_call("把甲地的灯都关了", [[_light_call("light.a2", "c9")]])

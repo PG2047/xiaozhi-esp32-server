@@ -147,6 +147,8 @@ class S2SProvider(S2SProviderBase):
         self._ha_kinds_prev: set[str] = set()    # 上一次委托问的那一批（判断用户这句是不是在答）
         self._ha_asked: set[str] = set()   # 上一次委托回问时列的设备
         self._all_asked = False            # 上一次委托问过"全部"是哪一处、哪一类（见 _fan_out_all）
+        # 上一次委托问过 HA 意图是哪一处（见 _fan_out_where）。和 _all_asked 分开：答"甲地的"时灯那条路读 _all_asked，会把甲地的灯都展开了
+        self._where_asked = False
         self.history: list[tuple[str, str]] = []
         self._session_sig = None
         self._calls: dict[str, asyncio.Task] = {}   # call_id → 执行中的工具
@@ -863,6 +865,34 @@ class S2SProvider(S2SProviderBase):
         return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}",
                      arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False)) for n, e in enumerate(targets)], None
 
+    def _fan_out_where(self, calls: list, said: str, recent: str, asked: bool) -> tuple[list, str | None]:
+        """"把净化器都关了"走 HA 意图：小模型不问，直接控制几处房子的。没说地点时第二个返回值是交给 Live 的回问，这次委托的调用都不执行；
+        答了之后工具和动作用小模型填的，设备照名单（见 ha_names.where_named），每台一个调用。said 是用户最后一句话，asked 是上一次委托问过。"""
+        intents = ha_names.device_intents(self._tool_list()) if self.ha_names and self._ha_entries else {}
+        tool = next((c.get("name") for c in calls if c.get("name") in intents), None)
+        if not tool:
+            return calls, None
+        names, question = ha_names.where_named(said, recent, tool, self._ha_entries, self.ha_names_domains, asked)
+        if question:
+            self._where_asked = True
+            self.logger.bind(tag=TAG).info(f"Live 全部回问 {tool}：{question}")
+            return calls, question
+        if not names or any(c.get("name") != tool for c in calls):
+            return calls, None
+        try:
+            filled = [json.loads(c.get("arguments") or "{}") for c in calls]
+        except ValueError:
+            return calls, None
+        if not all(isinstance(a, dict) for a in filled):
+            return calls, None
+        actions = [{k: v for k, v in a.items() if k not in ha_names.TARGET_ARGS} for a in filled]
+        if any(a != actions[0] for a in actions):
+            return calls, None
+        self.logger.bind(tag=TAG).info(f"Live 答了哪一处，展开 {tool}：{len(names)} 个设备")
+        # scoped：范围是用户的话和名单定的，不用再过 _check_ha_call（答"甲地"没有"都"，同处两台会被当成没说清是哪一台）
+        return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}", scoped=True,
+                     arguments=json.dumps(dict(actions[0], name=x), ensure_ascii=False)) for n, x in enumerate(names)], None
+
     def _will_fan_out(self, said: str, recent: str, asked: bool) -> bool:
         """这句选了灯的话 _fan_out_all 会接手（展开或回问），小模型只要给出动作。这时还不知道选的是不是灯，所以"把某地的窗帘都关了"也算：
         第一轮只出一个调用，HA 意图按区域一次就能控制全，没控制全的第二轮起不限（11-05 回归窗帘全部 48/48）。"""
@@ -889,6 +919,7 @@ class S2SProvider(S2SProviderBase):
         self._ha_kinds_prev, self._ha_kinds_asked = self._ha_kinds_asked, set()
         asked, self._ha_asked = self._ha_asked, set()
         asked_all, self._all_asked = self._all_asked, False
+        asked_where, self._where_asked = self._where_asked, False
         intents = ha_names.device_intents(tools) if self.ha_names and self._ha_entries else {}
         answer, used, raw, ask, ran = "", [], [], None, []
         # 只看最后一句：上一次委托时还没落进 history 的那句也会算进 said，它的"全关"不是这句的意思
@@ -898,7 +929,8 @@ class S2SProvider(S2SProviderBase):
             # 退回小模型自选会只填区域，HA 按区域控制的不只是灯（11-04 模拟："把乙地的灯全打开"填成 HassTurnOn {area}）。
             # 陈述句不算（"乙地的灯都坏了"低置信度选了 hass_set_state，信了就把那一处的灯都关了）；说的是窗帘这类设备也不算
             # （"把乙地的窗帘都关上，灯打开"强制填参把窗帘名字填进 entity_id）
-            sure = ((asked_all or (ha_names.says_all(last) and ha_names.sounds_like_command(last)))
+            # 问的是窗帘这类设备是哪一处也不算（答"乙地的都关了"，说的不是灯）
+            sure = (not asked_where and (asked_all or (ha_names.says_all(last) and ha_names.sounds_like_command(last)))
                     and bool(ha_names.all_at_place(self.conn.prompt, last, recent, "light.", self._ha_entries, asked_all)[0])
                     and not ha_names.names_listed_device(last, self._ha_entries, self.ha_names_domains))
             first = await self._decide_first(ctx, items, tools, sure) if self.tool_picker == "decisions" else None
@@ -919,11 +951,13 @@ class S2SProvider(S2SProviderBase):
                     break
                 if i == 0:
                     calls, ask = self._fan_out_all(calls, last, recent, asked_all)
+                    if not ask:
+                        calls, ask = self._fan_out_where(calls, last, recent, asked_where)
                 outputs = []
                 for call in calls:
                     used.append(call.get("name"))
                     blocked = ask or (self._check_ha_call(call, intents, "\n".join(said), recent, asked)
-                                      if call.get("name") in intents else None)
+                                      if call.get("name") in intents and not call.get("scoped") else None)
                     result = blocked or await self.tools.run(call.get("name") or "", call.get("arguments") or "{}")
                     outputs.append(result)
                     ran.append(f"已调用 {call.get('name')}（参数 {call.get('arguments') or '{}'}），结果：{result[:self.direct_max_chars]}")

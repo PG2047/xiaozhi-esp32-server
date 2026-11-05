@@ -349,6 +349,72 @@ def test_name_rivals_lets_through_clear_words_all_words_and_other_calls():
     assert H.name_rivals("关了", "关了", "intent__HassTurnOff", {"name": "卧室布帘"}, one) == []   # 这类设备只有一台
 
 
+def _where_named(said, recent=None, asked=False, tool="intent__HassTurnOff", es=None):
+    return H.where_named(said, said if recent is None else recent, tool, _name_entries() if es is None else es, asked=asked)
+
+
+def test_where_named_asks_when_the_devices_are_in_several_places():
+    for said in ("把风扇都关了", "把甲牌风扇全部打开", "所有风扇都关掉", "把风扇全关了", "把风扇都调到百分之五十", "帮我把风扇都关了吧", "风扇一起关了",
+                 "都这么晚了，把风扇都关了"):
+        names, question = _where_named(said)
+        assert names == [] and question.startswith("没有执行") and "戊地楼下1号、己地老家" in question and "一共 2 台" in question, said
+    # 设备词在前一句（"都关了吧"看前一句）；点到的不止一类
+    assert "一共 2 台" in _where_named("都关了吧", "风扇有几台\n都关了吧")[1]
+    assert "一共 6 台" in _where_named("把窗帘和风扇都关了")[1]
+    # 更早提过地点、这句点了设备：那个地点不算（小模型照样控制几处）
+    assert "一共 2 台" in _where_named("把风扇都关了", "戊地的灯开着吗\n把风扇都关了")[1]
+
+
+def test_where_named_not_asked():
+    for said in ("把戊地的风扇都关了", "把己地的风扇都打开", "把老家的风扇都打开", "把戊地和己地的风扇都关了",   # 说了地点
+                 "把窗帘都关上", "把净化器都关了", "把大净化器都关了", "把戊地甲牌风扇都关了",                 # 只在一处、只有一台（净化风扇不带"净化器"这个词）
+                 "把风扇关了", "都这么晚了，把风扇关了", "我都说了把风扇关了",                                  # 没说"都"，或者"都"不是说风扇的
+                 "把书房灯都关了", "把灯全关了", "都关了吧", "全部"):                                           # 没点到名单里的设备（灯有自己的回问）
+        assert _where_named(said) == ([], None), said
+    # 排除、否定、提问、说状态：不是这个问题
+    for said in ("除了戊地，把风扇都关了", "把风扇都关了，留一台", "别把风扇都关了", "不用把风扇都关了", "风扇都不关", "风扇都关了吗", "风扇是不是都关了",
+                 "风扇都关着呢", "风扇都好久没开了", "算了风扇都关了"):
+        assert _where_named(said) == ([], None), said
+    assert _where_named("都关了吧", "戊地的风扇有几台\n都关了吧") == ([], None)         # 设备词那一句说了地点
+    assert _where_named("戊地的都关了吧", "风扇有几台\n戊地的都关了吧") == ([], None)   # 这句说了地点
+    assert _where_named("把风扇都关了", es=[]) == ([], None)                             # 名单没取到
+
+
+def test_where_named_after_asking():
+    here, there = "戊地108甲牌净化风扇", "己地甲牌净化风扇"
+
+    def answer(said, first="把风扇都关了"):
+        return _where_named(said, f"{first}\n{said}", asked=True)
+    # 答了地点：那一处点到的设备，不管小模型填了什么
+    for said, want in (("戊地的", [here]), ("己地", [there]), ("老家的吧", [there]), ("戊地和己地", [here, there]), ("戊地的风扇", [here]),
+                       ("戊地的都关了吧", [here])):
+        assert answer(said) == (want, None), said
+    # 答了全部
+    for said in ("都关", "都关了吧", "全部", "全都关掉", "一起关了", "风扇都关了"):
+        assert answer(said) == ([here, there], None), said
+    # 只认名单点到的：净化器答戊地，只有带这个词的那一台
+    assert answer("戊地", "把净化器和风扇都关了") == ([here, "戊地108除醛净化器"], None)
+    # 答的地方没有这种设备：照小模型填的，地点守卫看着
+    other = [e for e in _name_entries() if e["names"][0] != there] + [{"names": ["己地窗帘"], "domain": "cover", "areas": ["己地老家"], "device_class": "curtain"}]
+    assert _where_named("己地", "把甲牌风扇都关了\n己地", asked=True, es=other) == ([], None)
+    # 不要了；说别的设备去了（没说"都"的是新的一句，说了"都"的按新的一句判断）
+    for said in ("算了", "不用了", "都不关", "把卧室布帘拉开", "把戊地的窗帘拉开", "把除醛净化器关了", "把戊地的窗帘都拉开"):
+        assert answer(said) == ([], None), said
+    assert answer("窗帘都关上", "把风扇都关了") == ([], None)                        # 窗帘只在一处，也不问，小模型自己填
+    assert answer("净化器和风扇都关了", "把风扇都关了")[0] == []                      # 多点了一类，是新的一句：两处都有，再问
+    assert "戊地楼下1号、己地老家" in answer("净化器和风扇都关了", "把风扇都关了")[1]
+    # 没答上来：再问；这一句的转写还没到也再问
+    for said in ("嗯", "第一个", "好的", "风扇", "把风扇打开"):
+        names, question = answer(said)
+        assert names == [] and question.startswith("没有执行"), said
+    assert _where_named("", "把风扇都关了", asked=True)[1].startswith("没有执行")
+    # 这个工具控制不了（fan__ 只找风扇；灯的工具找不到风扇）或者没有认得准的名字：照小模型填的
+    assert _where_named("戊地", "把风扇都关了\n戊地", asked=True, tool="light__HassLightSet") == ([], None)
+    assert _where_named("戊地", "把风扇都关了\n戊地", asked=True, tool="fan__HassFanSetSpeed") == ([here], None)
+    dup = [{"names": ["风扇"], "domain": "fan", "areas": ["甲"], "device_class": None}, {"names": ["风扇"], "domain": "fan", "areas": ["乙"], "device_class": None}]
+    assert H.where_named("都关", "把风扇都关了\n都关", "intent__HassTurnOff", dup, asked=True) == ([], None)
+
+
 def test_says_device_word_only_for_words_in_device_names():
     curtains = _name_entries()[:4]
     for text in ("客厅的", "把戊地的窗帘关上", "布帘"):
