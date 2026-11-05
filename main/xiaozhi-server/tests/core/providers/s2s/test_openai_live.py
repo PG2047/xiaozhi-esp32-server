@@ -2714,6 +2714,16 @@ def test_something_else_after_asking_which_place():
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3", "light.a4"]
 
 
+def test_ha_intents_are_asked_only_when_the_sentence_itself_cannot_be_settled():
+    """小模型选了 HA 意图（列表外的设备也走它）：这句自己定不了才回问；回问之后没答上来时它选了意图，是在说别的，照常走检查。"""
+    props = {"name": {"type": "string"}}
+    call = {"type": "function_call", "call_id": "c0", "name": "intent__HassTurnOff", "arguments": json.dumps({"name": "甲地风扇"})}
+    rec = _after_first_call("把客厅和卧室的灯关了", [[call]], tool="intent__HassTurnOff", props=props, prompt=_HOUSES_PROMPT, tool_picker="model")
+    assert rec["calls"] == [] and "问用户要控制哪一处" in rec["commentary"]
+    rec = _after_first_call(["把客厅和卧室的灯关了", "第一个"], [[call], [call]], tool="intent__HassTurnOff", props=props, prompt=_HOUSES_PROMPT, tool_picker="model")
+    assert [c.get("name") for c in rec["calls"]] == ["甲地风扇"]
+
+
 def test_read_first_keeps_the_question():
     """强制填参没填出来，小模型先查了一盏：不直接交回；它选了灯就回问。"""
     rec = _partial("把客厅和卧室的灯关了", [[_get_call("light.a2", "c0")], [_light_call("light.a2", "c1")]], first=[])
