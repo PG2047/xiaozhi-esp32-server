@@ -14,6 +14,7 @@ HA 的意图工具（MCP 里叫"平台__Hass意图"，如 intent__HassTurnOn、f
 用户说了"都"时区域歧义放行，但开关意图只填区域会动那一处所有类别的设备，所以类别歧义检查再问一次要哪一类。
 
 用户明说要控制一类时（"把甲地的窗帘都关上"），小模型一幅一轮会用完轮数、只填区域会多控或者找不到，所以范围照名单定，每台一个调用（all_named）。
+用户说了"都"却没说地点、几处都有这类设备（"把净化器都关了"），先问是哪一处，答了之后范围照名单定（where_named）。
 
 智能设备列表里的设备（灯，走 hass_set_state）也过一道地点守卫（listed_place_conflict）：地点从列表的"位置"一栏认。
 
@@ -393,7 +394,7 @@ def all_at_place(prompt: str, said: str, recent: str, entity_id: str, entries: l
         return located(where), None
     if asked and says_all(said):
         return [p[2] for p in same], None
-    return [], f"没有执行：用户没说是哪一处，{'、'.join(where)}都有这类设备，一共 {len(same)} 台。问用户要控制哪一处，还是全部。"
+    return [], _ask_where(where, len(same))
 
 
 def tidy_args(tool: dict, args: dict, entries: list[dict]) -> dict:
@@ -499,6 +500,55 @@ def hits_exactly(tool_name: str, args: dict, names: list[str], entries: list[dic
     want = [e for n in names for e in matched(tool_name, {"name": n}, entries)]
     hits = matched(tool_name, args, entries)
     return len(hits) == len(want) and all(e in want for e in hits)
+
+
+def _ask_where(where: list[str], count: int) -> str:
+    """交给 Live 的说明：没有执行，问用户要控制哪一处。"""
+    return f"没有执行：用户没说是哪一处，{'、'.join(where)}都有这类设备，一共 {count} 台。问用户要控制哪一处，还是全部。"
+
+
+def where_named(said: str, recent: str, tool_name: str, entries: list[dict], domains: Iterable[str] = DEFAULT_DOMAINS,
+                asked: bool = False) -> tuple[list[str], str | None]:
+    """"把净化器都关了"走 HA 意图：用户说了"都"（"把"前面的不算："都这么晚了，把净化器关了"），点到的设备不止在一处，话里又没说地点，
+    就不替用户把几处房子的都控制了，和灯一样先问，返回 ([], 交给 Live 的回问)。11-05 模拟：Haiku 不问，27 次里 23 次控制了几处房子，
+    "把风扇都打开"填 domain: fan 连净化器也开了。设备词取手边的话（recent，一行一句）里最近一句点了设备的，地点只看这一句和它后面的话：
+    更早提过地点不算（"乙地今天多少度""把风扇都打开"，小模型照样控制三处，3/3）。
+
+    asked 表示上一次委托问过。这句答了地点返回那一处点到的设备，答"都关"返回全部（每台一个 HA 认得准的名字）：范围照名单定，小模型只填工具和动作。
+    只答地点时小模型常填"乙地净化器"这种 HA 找不到的名字（模拟 24 次里 8 次）。只算名字里有这个词的：答"甲地"时名字里没有"净化器"的净化风扇不算。
+    没答上来（"嗯""第一个"，或者转写还没到）再问一遍；答复里点了别的设备（"把甲地的窗帘拉开"）是新的一句，不算在答。
+
+    其余返回 ([], None)，照旧执行小模型填的：排除、否定、提问、说状态（"除了甲地""别都关""都关了吗""都关着呢"，Haiku 自己做得对，模拟排除 45 次 44 次全对、否定 18 次都没动）；
+    没点到名单里的设备；这几处只有一处有；有一台没有 HA 认得准的名字。"""
+    said = said or ""
+    if not (asked or says_all(_BA.split(said)[-1])) or _EXCEPT_WORDS.search(said) or _STATIVE_WORDS.search(said):
+        return [], None
+    devices = [e for e in entries if e["domain"] in set(domains)]
+    tokens = area_tokens(entries)
+    lines = (recent or "").split("\n")
+    texts = [_without_places(x, tokens) for x in lines]
+    at = next((i for i in reversed(range(len(lines))) if says_device_word(texts[i], devices)), None)
+    if at is None:
+        return [], None
+    places = next(filter(None, (mentioned_areas(x, tokens) for x in reversed(lines[at:]))), set())
+    group = [e for e in devices if not places or (e["areas"] and e["areas"][0] in places)]
+    words, hits = _named_by(texts[at], group)
+    if not words:
+        return [], None
+    if asked and lines[at] == said:
+        # 答复里点了设备：和上一句同一批才算在答（"甲地的净化器"）
+        earlier = next((t for t in reversed(texts[:at]) if says_device_word(t, devices)), "")
+        asked = words <= _named_by(earlier, group)[0]
+        if not (asked or says_all(_BA.split(said)[-1])):
+            return [], None
+    answered = asked and (bool(places) or says_all(said))
+    where = list(dict.fromkeys(e["areas"][0] for e in hits if e["areas"]))
+    if not (answered or places) and len(where) > 1:
+        return [], _ask_where(where, len(hits))
+    if not answered:
+        return [], None
+    names = [next((n for n in _names(e) if matched(tool_name, {"name": n}, entries) == [e]), None) for e in hits]
+    return ([] if None in names else names), None
 
 
 def names_listed_device(said: str, entries: list[dict], domains: Iterable[str] = DEFAULT_DOMAINS) -> bool:
