@@ -785,10 +785,11 @@ class S2SProvider(S2SProviderBase):
         return calls or None
 
     def _check_ha_call(self, call: dict, intents: dict, utterance: str, recent: str | None = None,
-                       asked: set[str] | frozenset[str] = frozenset()) -> str | None:
+                       asked: set[str] | frozenset[str] = frozenset(), last: str = "") -> str | None:
         """HA 意图调用执行前：domain 误填成 device_class 的挪过去（改写 call 里的参数，后面记进对话的也是改后的）；
         用户说的地点和会命中的设备不在一处、或者没说清是哪一台 / 哪一类时，返回交给 Live 的说明、不执行。
-        utterance 是上次委托之后用户说的话，recent 是小模型手边的那几句（默认同 utterance），asked 是上一次委托回问时列的设备。"""
+        utterance 是上次委托之后用户说的话，recent 是小模型手边的那几句（默认同 utterance），asked 是上一次委托回问时列的设备，
+        last 是用户最后一句话。"""
         name = call.get("name") or ""
         try:
             args = json.loads(call.get("arguments") or "{}")
@@ -801,7 +802,10 @@ class S2SProvider(S2SProviderBase):
             self.logger.bind(tag=TAG).info(f"Live HA 参数整理 {name}：domain {args.get('domain')} → "
                                            f"domain {tidy.get('domain')} / device_class {tidy.get('device_class')}")
             call["arguments"] = json.dumps(tidy, ensure_ascii=False)
-        blocked = ha_names.place_conflict(utterance, name, tidy, self._ha_entries)
+        # 这句说了地点就只看这句：上一句常落在委托标记之后（交回之后 Live 才开口），它的地点不能放过这句没说的地方
+        # （11-05 模拟：上文"把甲地的窗帘都关上"，这句"把乙地的风扇也都关了"，又把甲地的窗帘关了一遍）
+        said_here = ha_names.mentioned_areas(last, ha_names.area_tokens(self._ha_entries))
+        blocked = ha_names.place_conflict(last if said_here else utterance, name, tidy, self._ha_entries)
         if blocked:
             self.logger.bind(tag=TAG).info(f"Live 地点守卫拦下 {name}：{blocked}")
             return blocked
@@ -966,7 +970,7 @@ class S2SProvider(S2SProviderBase):
                 outputs = []
                 for call in calls:
                     used.append(call.get("name"))
-                    blocked = ask or (self._check_ha_call(call, intents, "\n".join(said), recent, asked) if call.get("name") in intents
+                    blocked = ask or (self._check_ha_call(call, intents, "\n".join(said), recent, asked, last) if call.get("name") in intents
                                       else self._check_set_state(call, last) if call.get("name") == "hass_set_state" else None)
                     result = blocked or await self.tools.run(call.get("name") or "", call.get("arguments") or "{}")
                     outputs.append(result)

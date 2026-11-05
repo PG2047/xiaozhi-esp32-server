@@ -1849,6 +1849,21 @@ def test_place_of_an_earlier_sentence_does_not_block_this_one():
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a2", "light.a3", "light.a1"]
 
 
+def test_place_of_the_previous_sentence_does_not_let_an_intent_through():
+    """HA 意图也一样：上一句也在 said 里（交回之后 Live 才开口），这句说了别处时，上一句的地点不放行；这句没说地点才看上一句。"""
+    off = "intent__HassTurnOff"
+    props = {"name": {"type": "string"}, "area": {"type": "string"}}
+    purifier = _intent_call(tool=off, name="除醛净化器")       # 在甲地
+    rec = _after_first_call(["把甲地的净化器关了", "把老家的风扇也关了"], [], first=purifier, tool=off, props=props)
+    assert [c["name"] for c in rec["calls"]] == ["除醛净化器"]
+    assert "没有执行" in rec["commentary"] and "不是同一个地方" in rec["commentary"]
+    rec = _after_first_call(["把老家的风扇关了", "关掉吧"], [], first=purifier, tool=off, props=props)
+    assert rec["calls"] == [] and "不是同一个地方" in rec["commentary"]
+    # 这句说的地方就是设备所在：放行
+    rec = _after_first_call(["把老家的风扇关了", "把甲地的净化器关了"], [], first=purifier, tool=off, props=props)
+    assert [c["name"] for c in rec["calls"]] == ["除醛净化器"]
+
+
 def test_reading_state_of_another_place_is_not_blocked():
     """只读的 hass_get_state 不管。"""
     query = {"type": "function_call", "call_id": "c0", "name": "hass_get_state", "arguments": json.dumps({"entity_id": "light.a1"})}
