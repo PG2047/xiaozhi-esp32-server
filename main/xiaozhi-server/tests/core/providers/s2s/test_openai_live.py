@@ -9,11 +9,14 @@ import json
 
 import numpy as np
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 from websockets.asyncio.server import serve
 
 from tests.core.providers.s2s.test_openai_realtime import (  # noqa: F401  复用夹具（也带上 _restore_sleep 与 Opus 跳过标记）
     FakeConn, _real_sleep, _restore_sleep, pytestmark, wait_until,
 )
+from core.providers.s2s.openai_live import openai_live as live_mod
 from core.providers.s2s.openai_live.openai_live import S2SProvider, UNFINISHED
 
 
@@ -612,6 +615,46 @@ def test_goodbye_word_inside_a_question_does_not_close():
     run(sc)
 
 
+def _closes_when_user_speaks_during_reply(user, reply):
+    """模型念着这段回复时用户说话，这段播完后会话是否结束（先后顺序和真机一样）。"""
+    result = {}
+
+    async def sc(lv, conn, p):
+        await lv.emit({"type": "session.output_transcript.delta", "delta": reply})
+        await lv.audio(6, 2000)
+        await lv.emit({"type": "session.input_transcript.delta", "delta": user})
+        await _real_sleep(0.05)
+        await lv.audio(5, 0)
+        await wait_until(lambda: conn.closed or ("tts", "stop") in conn.websocket.states(), timeout=8, what="这段播完")
+        await _real_sleep(0.2)
+        result["closed"] = conn.close_after_chat
+    run(sc)
+    return result["closed"]
+
+
+@pytest.mark.parametrize("user,reply", [    # 11-04 真机和外放日志的原句：模型的告别和前面的长回复并成了一段
+    ("拜拜", "今天宜祭祀、出行、结婚、宴会、求医,忌修置产室、开渠、穿井、破屋坏垣这些。你想知道今天适合做什么,还是需要避开什么呢?拜拜!"),
+    ("拜拜", "好,我看下宜忌。今天宜祭祀、出行、结婚嫁娶这些,忌修置产室和开渠。你需要我帮你查今天...好嘞,拜拜!"),
+    ("再见", "宜祭祀、出行、结婚、宴会等,忌修置产室、开渠、破屋坏垣。还要我说说其它细节吗?嗯,回头见!"),
+])
+def test_goodbye_merged_into_a_long_reply_closes(user, reply):
+    assert _closes_when_user_speaks_during_reply(user, reply)
+
+
+@pytest.mark.parametrize("user,reply", [
+    ("嗯", "故事讲到这里就结束了,他们挥挥手各自回家。大家一起说,再见!"),     # 用户没告别
+    ("拜拜", "拜拜是告别的话,和再见差不多。今天农历九月廿六,还想知道别的吗?"),     # 最后一句里没有告别词
+    ("拜拜", "今天农历九月廿六,宜祭祀、出行。从前的人分开的时候都会说再见然后挥手走很远很远的路"),     # 最后一句太长，只是提到
+    ("拜拜", "今天宜祭祀、出行、结婚、宴会、嫁娶、求医疗病。忌修置产室、开渠、穿井、破屋坏垣、苫盖等。"),     # 回复里没有告别词，等空闲关闭
+])
+def test_long_reply_without_a_goodbye_at_the_end_stays_open(user, reply):
+    assert not _closes_when_user_speaks_during_reply(user, reply)
+
+
+def test_short_reply_is_judged_as_a_whole():
+    assert _closes_when_user_speaks_during_reply("拜拜", "拜拜!祝你今天愉快。")
+
+
 def test_early_audio_buffered_then_drained_in_order_only_for_willing_provider():
     from core.utils.s2s import drain_early_audio, s2s_buffer_early_audio
 
@@ -1104,7 +1147,7 @@ def _ha_client(scenario, **over):
 
 async def _delegate(lv, p, said: str | None, call: dict, did: str) -> str:
     """said=None：委托时这句转写还没到（in_text 是空的）。"""
-    async def fake(items, tools):
+    async def fake(items, tools, one_call=False):
         return {"output": [dict(call, type="function_call", call_id="c1")]}
     p._responses_call = fake
     if said is not None:
@@ -1209,19 +1252,226 @@ def test_ha_names_wait_for_tool_handler_init():
 
 
 def test_area_only_call_hitting_several_devices_asks_unless_user_said_all():
-    """没填 name、会一次控制甲地的风扇和窗帘两台：用户没说"都"就不执行、回问；说了"都"照常执行。"""
+    """没填 name、会一次控制甲地的两台窗帘：用户没说"都"就不执行、回问；说了"都"照常执行。"""
     off = "intent__HassTurnOff"
 
+    def curtains_only(p):
+        p._ha_entries = [e for e in p._ha_entries if e["domain"] != "fan"]
+        p._ha_entries.append(dict(p._ha_entries[0], names=["甲地1号卧室纱帘", "卧室纱帘"]))
+
     async def sc(lv, conn, p):
+        curtains_only(p)
         content = await _delegate(lv, p, "把甲地的关了", {"name": off, "arguments": "{\"area\": \"甲地楼下1号\"}"}, "a1")
         assert "没有执行" in content and "2 台" in content
         assert [c["name"] for c in conn.func_handler.calls] == ["homeassistant__GetLiveContext"]
     _ha_client(sc)
 
     async def sc2(lv, conn, p):
+        curtains_only(p)
         await _delegate(lv, p, "把甲地的都关了", {"name": off, "arguments": "{\"area\": \"甲地楼下1号\"}"}, "a2")
         assert conn.func_handler.calls[-1]["name"] == off
     _ha_client(sc2)
+
+
+def _ha_ran(conn) -> list[dict]:
+    return [json.loads(c["arguments"]) for c in conn.func_handler.calls if c["name"] in ("intent__HassTurnOff", "intent__HassTurnOn")]
+
+
+async def _kind_round(lv, p, said: str, args: dict, did: str) -> str:
+    """转写先落进 history 再委托，交回后 Live 问的那句也记进 history（线上常见的顺序）。"""
+    p.history.append(("user", said))
+    content = await _delegate(lv, p, None, {"name": "intent__HassTurnOff", "arguments": json.dumps(args, ensure_ascii=False)}, did)
+    p.history.append(("assistant", "你要控制哪一类？"))
+    return content
+
+
+AREA_ONLY = {"area": "甲地楼下1号"}
+
+
+def test_area_only_call_across_kinds_asks_which_kind_even_when_user_said_all():
+    """用户说了"都"，小模型只填了区域：HA 会动那一处的风扇和窗帘。不执行，说清有哪几类、问要哪一类。"""
+    async def sc(lv, conn, p):
+        content = await _kind_round(lv, p, "把甲地的都关了", AREA_ONLY, "k1")
+        assert "没有执行" in content and "风扇或净化器 1 个" in content and "窗帘 1 个" in content and "哪一类" in content
+        assert _ha_ran(conn) == []
+    _ha_client(sc)
+
+
+def test_answer_with_a_kind_runs_and_is_not_asked_which_one():
+    """答了"窗帘"，小模型填上类别：只动窗帘，这句虽然没有"都"，也不能再问是哪一台（上一句说过了）。"""
+    args = {"area": "戊地楼下1号", "domain": ["cover"]}
+
+    async def sc(lv, conn, p):
+        assert "哪一类" in await _kind_round(lv, p, "把戊地的都关了", {"area": "戊地楼下1号"}, "c1")
+        assert "没有执行" not in await _kind_round(lv, p, "窗帘", args, "c2")
+        assert _ha_ran(conn) == [args]
+    _name_client(sc)
+
+
+def test_answer_with_a_kind_and_one_named_device_runs_then_rivals_are_checked_again():
+    """答了"窗帘"，小模型先填了一幅的名字：这一批还在问过的范围里，不再问"哪一台"（后面几轮它会接着补）。
+    只管回答的这一次，再下一句说不清是哪一幅照样问。"""
+    args = {"name": "戊地1号卧室布帘"}
+
+    async def sc(lv, conn, p):
+        assert "哪一类" in await _kind_round(lv, p, "把戊地的都关了", {"area": "戊地楼下1号"}, "c5")
+        assert "没有执行" not in await _kind_round(lv, p, "窗帘", args, "c6")
+        assert _ha_ran(conn) == [args]
+        assert "4 台" in await _kind_round(lv, p, "把戊地的窗帘关上", args, "c7")
+        assert _ha_ran(conn) == [args]
+    _name_client(sc)
+
+
+async def _answer_with_a_light(lv, p, conn, said: str, did: str) -> list[str]:
+    """问过"哪一类"之后用户答 said，小模型填了一盏灯，拿到结果后说一句话。返回这次执行的灯。"""
+    before = len(conn.func_handler.calls)
+
+    async def fake(items, tools, one_call=False):
+        if any(i.get("type") == "function_call_output" for i in items):
+            return {"output": [{"type": "message", "content": [{"type": "output_text", "text": "好了。"}]}]}
+        return {"output": [_light_call("light.a1")]}
+    p._responses_call = fake
+    p.history.append(("user", said))
+    await lv.emit({"type": "session.delegation.created", "delegation": {"id": did, "target": "client"}})
+    await wait_until(lambda: [m for m in lv.received if m["type"] == "session.commentary.append" and m["delegation_id"] == did],
+                     what="commentary")
+    return [json.loads(c["arguments"])["entity_id"] for c in conn.func_handler.calls[before:] if c["name"] == "hass_set_state"]
+
+
+def test_answer_lights_fans_out_to_every_light_at_that_place():
+    """答了"灯"，小模型只填一盏：上一句说过"都"，按设备列表控制那一处的每一盏，只管回答的这一次。"""
+    async def sc(lv, conn, p):
+        conn.prompt = _LIGHTS_PROMPT
+        assert "哪一类" in await _kind_round(lv, p, "把甲地的都关了", AREA_ONLY, "f1")
+        assert await _answer_with_a_light(lv, p, conn, "灯", "f2") == ["light.a1", "light.a2", "light.a3"]
+        p.history.append(("assistant", "好了。"))
+        assert await _answer_with_a_light(lv, p, conn, "灯", "f3") == ["light.a1"]
+    _ha_client(sc)
+
+
+def test_answer_naming_a_light_or_giving_up_does_not_fan_out():
+    """答了具体的灯只控制那一盏；"算了"之后小模型万一还填了一盏，也不会变成那一处的每一盏。"""
+    async def sc(lv, conn, p):
+        conn.prompt = _LIGHTS_PROMPT
+        assert "哪一类" in await _kind_round(lv, p, "把甲地的都关了", AREA_ONLY, "f4")
+        assert await _answer_with_a_light(lv, p, conn, "书房灯", "f5") == ["light.a1"]
+        p.history.append(("assistant", "好了。"))
+        assert "哪一类" in await _kind_round(lv, p, "把甲地的都关了", AREA_ONLY, "f6")
+        assert await _answer_with_a_light(lv, p, conn, "算了", "f7") == ["light.a1"]
+    _ha_client(sc)
+
+
+def test_area_ambiguity_still_asks_without_a_kind_question_before_it():
+    """同样的调用，上一轮没问过类别、这句也没说"都"：照旧问是哪一台。"""
+    async def sc(lv, conn, p):
+        content = await _kind_round(lv, p, "把戊地的窗帘关了", {"area": "戊地楼下1号", "domain": ["cover"]}, "c3")
+        assert "没有执行" in content and "4 台" in content and _ha_ran(conn) == []
+        # 只命中档位、目标湿度（HA 动不了）也一样照旧问，不能因为"能开关的一个都没有"就跳过
+        place = ["庚地"]
+        p._ha_entries = p._ha_entries + [{"names": [n], "domain": d, "areas": place, "device_class": None}
+                                         for n, d in (("庚地档位", "select"), ("庚地目标湿度", "number"))]
+        content = await _kind_round(lv, p, "把庚地的关了", {"area": "庚地"}, "c4")
+        assert "没有执行" in content and "2 台" in content and _ha_ran(conn) == []
+    _name_client(sc)
+
+
+def test_answer_all_runs_area_only_call_once():
+    """问过之后答"都关"，还是那一批设备才算真要全部；放行一次就用掉了，接着再说"都关"又要问。"""
+    async def sc(lv, conn, p):
+        assert "哪一类" in await _kind_round(lv, p, "把甲地的都关了", AREA_ONLY, "e1")
+        assert "没有执行" not in await _kind_round(lv, p, "都关", AREA_ONLY, "e2")
+        assert _ha_ran(conn) == [AREA_ONLY]
+        assert "哪一类" in await _kind_round(lv, p, "都关", AREA_ONLY, "e3")
+        assert _ha_ran(conn) == [AREA_ONLY]
+    _ha_client(sc)
+
+
+def test_answer_with_a_kind_but_area_only_call_asks_again():
+    """答了"窗帘"，小模型还是只填区域：不能执行，也不能改口问"哪一台"，接着问哪一类。"""
+    async def sc(lv, conn, p):
+        assert "哪一类" in await _kind_round(lv, p, "把甲地的都关了", AREA_ONLY, "g1")
+        assert "哪一类" in await _kind_round(lv, p, "窗帘", AREA_ONLY, "g2")
+        assert "哪一类" in await _kind_round(lv, p, "窗帘都关了", AREA_ONLY, "g3")      # 带"都"也是点了类别，不是全部
+        assert _ha_ran(conn) == []
+    _ha_client(sc)
+
+
+def test_all_words_for_another_place_after_a_kind_question_asks_about_that_place():
+    """问的是甲地，用户接着说"乙地的都关了"：不是答上一个问题，乙地也要问。"""
+    async def sc(lv, conn, p):
+        assert "哪一类" in await _kind_round(lv, p, "把甲地的都关了", AREA_ONLY, "h1")
+        content = await _kind_round(lv, p, "乙地的都关了", {"area": "乙地"}, "h2")
+        assert "乙地所有能开关的设备" in content and _ha_ran(conn) == []
+    _ha_client(sc)
+
+
+def test_place_guard_still_blocks_other_area_right_after_a_kind_question():
+    """回问之后用户换了个地方，小模型抄了甲地设备不带地名的别名：上一句的地点不能把它放过去。"""
+    async def sc(lv, conn, p):
+        assert "哪一类" in await _kind_round(lv, p, "把甲地的都关了", AREA_ONLY, "p3")
+        content = await _kind_round(lv, p, "把乙地的除醛净化器关了", {"name": "除醛净化器"}, "p4")
+        assert "不是同一个地方" in content and _ha_ran(conn) == []
+    _ha_client(sc)
+
+
+def test_kinds_or_names_filled_and_other_intents_are_not_asked_which_kind():
+    """填了类别、名字，或者 HA 那边不会跨类的意图（SetPosition），都照常执行。"""
+    calls = [("intent__HassTurnOff", {"area": "甲地楼下1号", "domain": ["cover"]}),
+             ("intent__HassTurnOn", {"area": "甲地楼下1号", "device_class": ["curtain"]}),
+             ("intent__HassTurnOff", {"name": "甲地客厅纱帘"}),
+             ("intent__HassSetPosition", {"area": "甲地楼下1号", "position": 0})]
+
+    async def sc(lv, conn, p):
+        for i, (name, args) in enumerate(calls):
+            said = "把甲地的窗帘都" + ("关上" if name != "intent__HassTurnOn" else "打开")
+            content = await _delegate(lv, p, said, {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}, f"m{i}")
+            assert "没有执行" not in content
+            ran = conn.func_handler.calls[-1]
+            assert ran["name"] == name and json.loads(ran["arguments"]) == args
+    _ha_client(sc)
+
+
+def test_area_only_call_after_tidy_dropped_a_bad_domain_is_asked():
+    """domain 填了 HA 没有、也不是 device_class 的词：整理时丢掉后就只剩区域，一样要问。"""
+    async def sc(lv, conn, p):
+        content = await _kind_round(lv, p, "把甲地的都关了", {"area": "甲地楼下1号", "domain": ["东西"]}, "t1")
+        assert "哪一类" in content and _ha_ran(conn) == []
+    _ha_client(sc)
+
+
+async def _many_area_calls(lv, p, said: str, areas: tuple, did: str) -> None:
+    """小模型一轮出好几个只填区域的调用，拿到结果后说一句话。"""
+    calls = [{"type": "function_call", "call_id": f"{did}{i}", "name": "intent__HassTurnOff",
+              "arguments": json.dumps({"area": a}, ensure_ascii=False)} for i, a in enumerate(areas)]
+
+    async def fake(items, tools):
+        if any(i.get("type") == "function_call_output" for i in items):
+            return {"output": [{"type": "message", "content": [{"type": "output_text", "text": "要关哪一类？"}]}]}
+        return {"output": calls}
+    p._responses_call = fake
+    p.history.append(("user", said))
+    await lv.emit({"type": "session.delegation.created", "delegation": {"id": did, "target": "client"}})
+    await wait_until(lambda: [m for m in lv.received if m["type"] == "session.commentary.append" and m["delegation_id"] == did],
+                     what="commentary")
+    p.history.append(("assistant", "要关哪一类？"))
+
+
+def test_two_area_only_calls_in_one_delegation_are_both_asked_and_both_answered():
+    """小模型一轮填了甲地、乙地两个只填区域的调用：都不执行；用户答"都关"后两处都算答过了。"""
+    async def sc(lv, conn, p):
+        await _many_area_calls(lv, p, "把甲地和乙地的都关了", ("甲地楼下1号", "乙地"), "b1")
+        assert _ha_ran(conn) == []
+        await _many_area_calls(lv, p, "都关", ("甲地楼下1号", "乙地"), "b2")
+        assert [a["area"] for a in _ha_ran(conn)] == ["甲地楼下1号", "乙地"]
+    _ha_client(sc)
+
+
+def test_same_area_only_call_twice_in_one_delegation_is_not_counted_as_answered():
+    """一轮出两个一样的：同一次委托里刚问的不算问过，用户这句带"都"也不能把第二个放过去。"""
+    async def sc(lv, conn, p):
+        await _many_area_calls(lv, p, "把甲地的都关了", ("甲地楼下1号", "甲地楼下1号"), "b3")
+        assert _ha_ran(conn) == []
+    _ha_client(sc)
 
 
 def _name_client(scenario):
@@ -1652,3 +1902,203 @@ def test_no_fan_out_for_other_tools():
     """别的工具（同样是短结果）照旧：说了"都"也是一个调用、直接交回。"""
     rec = _after_first_call("甲地都几点了", [], first=_light_call("light.a1", name="llm__GetDateTime"), tool="llm__GetDateTime")
     assert len(rec["calls"]) == 1 and rec["auto"] == [] and rec["commentary"].startswith("已调用 llm__GetDateTime")
+
+
+# ---------- 工具链路走别家网关（tool_api_key）、固定应答存文件 ----------
+async def _http_recorder(reply, status=200):
+    """假的 HTTP 上游：记下每次请求的 Authorization，回 reply（dict 回 JSON，bytes 原样回）。"""
+    seen = []
+
+    async def handler(request):
+        seen.append(request.headers.get("Authorization"))
+        if isinstance(reply, dict):
+            return web.json_response(reply, status=status)
+        return web.Response(body=reply, status=status)
+    app = web.Application()
+    app.router.add_post("/{tail:.*}", handler)
+    srv = TestServer(app)
+    await srv.start_server()
+    return srv, seen
+
+
+def _plain_provider(**over):
+    conn = FakeConn(asyncio.get_running_loop())
+    return S2SProvider({"api_key": "k", "echo_gate": False, "wake_greeting_text": "", **over}, conn)
+
+
+def test_responses_call_uses_tool_api_key_and_defaults_to_api_key():
+    async def go():
+        srv, seen = await _http_recorder({"output": []})
+        try:
+            url = str(srv.make_url("/v1/responses"))
+            await _plain_provider(tool_url=url, tool_api_key="gw")._responses_call([{"role": "user", "content": "x"}], [])
+            await _plain_provider(tool_url=url)._responses_call([{"role": "user", "content": "x"}], [])
+            await _plain_provider(tool_url=url, tool_api_key="")._responses_call([{"role": "user", "content": "x"}], [])
+        finally:
+            await srv.close()
+        assert seen == ["Bearer gw", "Bearer k", "Bearer k"]
+    asyncio.run(go())
+
+
+def _capture_body(calls):
+    """假的 aiohttp 客户端不好写，直接开上游：记下请求体。"""
+    async def start():
+        async def handler(request):
+            calls.append(await request.json())
+            return web.json_response({"output": []})
+        app = web.Application()
+        app.router.add_post("/{tail:.*}", handler)
+        srv = TestServer(app)
+        await srv.start_server()
+        return srv
+    return start
+
+
+def test_responses_call_limits_parallel_calls_only_when_asked():
+    async def go():
+        bodies = []
+        srv = await _capture_body(bodies)()
+        try:
+            p = _plain_provider(tool_url=str(srv.make_url("/v1/responses")))
+            await p._responses_call([{"role": "user", "content": "x"}], [], one_call=True)
+            await p._responses_call([{"role": "user", "content": "x"}], [])
+        finally:
+            await srv.close()
+        assert bodies[0]["parallel_tool_calls"] is False and "parallel_tool_calls" not in bodies[1]
+    asyncio.run(go())
+
+
+def _one_call_flags(said: str, asked: bool = False, picker: str = "model") -> list:
+    """跑一次 client 委托，记下每一轮 _responses_call 的 one_call。第一轮调灯，还要第二轮时回一句话。"""
+    from tests.core.providers.s2s.test_ha_names import entries
+    seen = []
+
+    async def sc(lv, conn, p):
+        async def fake(items, tools, force=None, one_call=False):
+            seen.append(one_call)
+            return {"output": [_light_call("light.a1")] if len(seen) == 1 else _text_reply("都关了。")}
+
+        async def no_decisions(ctx, tools):
+            raise RuntimeError("decisions 不可用")
+        p._responses_call = fake
+        p._decisions_call = no_decisions
+        p._tool_list = lambda: [{"type": "function", "name": "hass_set_state", "description": "设置设备状态",
+                                 "parameters": {"type": "object", "properties": {"entity_id": {"type": "string"}, "state": {"type": "object"}}}}]
+        p._ha_entries = entries()
+        p._all_asked = asked
+        conn.prompt = _LIGHTS_PROMPT
+        await lv.emit({"type": "session.input_transcript.delta", "delta": said})
+        await _real_sleep(0.05)
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d1", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+    _run_client(sc, tool_picker=picker)
+    return seen
+
+
+def test_first_round_asks_for_one_call_when_the_server_will_fan_out():
+    """"把甲地的灯都关了"服务端展开、"把灯全关了"服务端回问，小模型只要给出动作；结果交回总结的那一轮不限。"""
+    assert _one_call_flags("把甲地的灯都关了") == [True, False]
+    assert _one_call_flags("把灯全关了") == [True]
+    assert _one_call_flags("甲地", asked=True) == [True, False]
+
+
+def test_first_round_leaves_parallel_calls_alone_when_the_server_will_not_fan_out():
+    """点了设备、有排除、没说"都"：服务端不接手，小模型一轮出多个调用才控制得全。"""
+    assert _one_call_flags("把书房灯和小台灯都关了") == [False]
+    assert _one_call_flags("除了甲地都关了") == [False]
+    assert _one_call_flags("把书房灯关了") == [False]
+    assert _one_call_flags("把甲地的灯关了") == [False]     # 没说"都"，服务端不展开，小模型自己写全才控制得到
+
+
+def test_time_goes_in_the_message_not_in_the_dispatch_instructions():
+    """调度指令里不能有会变的东西：每分钟变一次，上游的提示词缓存和网关的隐私遮蔽都算新文本，多等 2 s。时间放在用户消息里。"""
+    seen = []
+
+    async def sc(lv, conn, p):
+        async def fake(items, tools):
+            seen.append(items[0]["content"])
+            return {"output": _text_reply("好的。")}
+        p._responses_call = fake
+        assert "当前时间" not in p._dispatch_instructions()
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "现在几点了"})
+        await _real_sleep(0.05)
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d1", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+    _run_client(sc)
+    assert seen[0].startswith("当前时间：") and seen[0].endswith("现在几点了")
+
+
+def test_one_call_is_off_with_the_decisions_picker():
+    """新代码配旧模板（decisions + mini）行为不变：退回小模型那一次不限调用数。"""
+    assert _one_call_flags("把甲地的灯都关了", picker="decisions") == [False, False]
+
+
+PHRASE_PCM = (np.ones(2400, np.int16) * 3000).tobytes()   # 100 ms @24k，够响，不会被当静音裁掉
+
+
+def test_fixed_phrase_is_synthesized_once_and_read_from_file(tmp_path, monkeypatch):
+    """合成一次存文件：清掉进程内缓存（相当于重启）再要，读文件、不调 TTS；换一句才再合成。"""
+    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+
+    async def go():
+        srv, seen = await _http_recorder(PHRASE_PCM)
+        try:
+            over = dict(tts_url=str(srv.make_url("/v1/audio/speech")), phrase_dir=str(tmp_path / "phrases"))
+            first = await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答")
+            assert first and len(seen) == 1
+            live_mod._GREETING_CACHE.clear()
+            assert await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答") == first and len(seen) == 1
+            await _plain_provider(**over)._tts_pcm("好。", "停下应答")
+            assert len(seen) == 2 and len(list((tmp_path / "phrases").iterdir())) == 2
+        finally:
+            await srv.close()
+    asyncio.run(go())
+
+
+def test_fixed_phrase_file_keeps_24k_and_each_rate_resamples_from_it(tmp_path, monkeypatch):
+    """文件里是没重采样的 24 kHz：16 kHz 的设备先合成，24 kHz 的设备读到的长度也对。"""
+    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+
+    async def go():
+        srv, seen = await _http_recorder(PHRASE_PCM)
+        try:
+            over = dict(tts_url=str(srv.make_url("/v1/audio/speech")), phrase_dir=str(tmp_path))
+            low = _plain_provider(**over)
+            low.speaker.sample_rate = 16000
+            assert len(await low._tts_pcm("我在。", "唤醒应答")) < len(PHRASE_PCM)
+            high = _plain_provider(**over)
+            high.speaker.sample_rate = 24000
+            assert await high._tts_pcm("我在。", "唤醒应答") == PHRASE_PCM and len(seen) == 1
+        finally:
+            await srv.close()
+    asyncio.run(go())
+
+
+def test_fixed_phrase_tts_failure_saves_nothing_and_retries_next_time(tmp_path, monkeypatch):
+    """余额用完时 TTS 回 429：不存文件、不进缓存，充值后下一次唤醒自己补上。"""
+    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+
+    async def go():
+        srv, seen = await _http_recorder({"error": {"code": "credit_balance_exhausted"}}, status=429)
+        try:
+            over = dict(tts_url=str(srv.make_url("/v1/audio/speech")), phrase_dir=str(tmp_path / "phrases"))
+            assert await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答") == b""
+            assert await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答") == b""
+            assert len(seen) == 2 and not (tmp_path / "phrases").exists()
+        finally:
+            await srv.close()
+    asyncio.run(go())
+
+
+def test_fixed_phrase_still_plays_when_the_file_cannot_be_written(tmp_path, monkeypatch):
+    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+    (tmp_path / "occupied").write_text("这是文件，建不了目录")
+
+    async def go():
+        srv, seen = await _http_recorder(PHRASE_PCM)
+        try:
+            p = _plain_provider(tts_url=str(srv.make_url("/v1/audio/speech")), phrase_dir=str(tmp_path / "occupied" / "phrases"))
+            assert await p._tts_pcm("我在。", "唤醒应答") and len(seen) == 1
+        finally:
+            await srv.close()
+    asyncio.run(go())

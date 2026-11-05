@@ -22,8 +22,10 @@ import asyncio
 import audioop
 import base64
 import contextlib
+import hashlib
 import json
 import os
+import re
 import time
 
 from websockets.asyncio.client import connect
@@ -50,6 +52,7 @@ UNFINISHED = "工具调用到这里停了，不会接着做，可能还有没做
 # 喊停那句里不算"别的话"的词：口头的"一下 / 一点 / 下来"、称呼、客气话和语气词（见 _has_more），长的在前
 _STOP_FILLERS = ("好不好", "可以吗", "一下", "一点", "下来", "好吗", "行吗", "好的", "谢谢", "那个", "先", "你", "我", "好",
                  "吧", "啊", "呀", "呢", "嗯", "哦", "噢", "喔", "唉", "诶", "欸", "哎", "嘛", "啦", "了", "吗")
+_SENTENCE_END = re.compile(r"[。！？!?….]+")   # 判断告别时切出回复的最后一句
 
 
 def _trim_silence(pcm: bytes, rate: int, rms: int = 200, pad_ms: int = 40) -> bytes:
@@ -79,6 +82,8 @@ class S2SProvider(S2SProviderBase):
         self.wake_greeting_text = str(c.get("wake_greeting_text", "我在。") or "").strip()
         self.greeting_tts_model = str(c.get("greeting_tts_model") or "gpt-4o-mini-tts")
         self.tts_url = str(c.get("tts_url") or "https://api.openai.com/v1/audio/speech")
+        # 固定应答（"我在。""好。"）只合成一次：存在这个目录下，以后读文件，重启也不再调 TTS
+        self.phrase_dir = str(c.get("phrase_dir") or "data/live_phrases")
         self._greeting_task = None
         # 告别：Live 说完"再见"不会自己结束会话（11-03 R19：要等 45 秒空闲关闭）。用户这句里有告别词、
         # 模型这段回复又短又是告别，就在这段播完后关连接；工具（handle_exit_intent）置了 close_after_chat 也照办
@@ -117,6 +122,8 @@ class S2SProvider(S2SProviderBase):
         self.delegation_mode = str(c.get("delegation_mode") or "responses")
         self.tool_model = str(c.get("tool_model") or "gpt-4.1-mini")
         self.tool_url = str(c.get("tool_url") or "https://api.openai.com/v1/responses")
+        # tool_url 指向别家（如 Magpie 网关）时用这把 key；不配就用 api_key。Live 连接和 decisions 始终用 api_key
+        self.tool_api_key = str(c.get("tool_api_key") or "") or self.api_key
         self.ack_delay_ms = int(c.get("ack_delay_ms", 800))
         self.tool_rounds = int(c.get("tool_rounds", 3))
         self.direct_max_chars = int(c.get("tool_direct_max_chars", 200))   # 单个工具结果不超过这么长就直接交给 Live 转述，省一轮
@@ -136,8 +143,10 @@ class S2SProvider(S2SProviderBase):
         self.ha_names_wait_s = float(c.get("ha_names_wait_s", 15))   # 等工具处理器初始化完（HA MCP 连上）的上限
         self._ha_entries: list[dict] = []
         self._guard_mark = 0          # 上次委托结束时 history 的长度：地点守卫只看这之后用户说的话
+        self._ha_kinds_asked: set[str] = set()   # 这次委托问"要控制哪一类"时，那一处能开关的设备
+        self._ha_kinds_prev: set[str] = set()    # 上一次委托问的那一批（判断用户这句是不是在答）
         self._ha_asked: set[str] = set()   # 上一次委托回问时列的设备
-        self._all_asked = False            # 上一次委托问过"全部"是哪一处（见 _fan_out_all）
+        self._all_asked = False            # 上一次委托问过"全部"是哪一处、哪一类（见 _fan_out_all）
         self.history: list[tuple[str, str]] = []
         self._session_sig = None
         self._calls: dict[str, asyncio.Task] = {}   # call_id → 执行中的工具
@@ -393,26 +402,51 @@ class S2SProvider(S2SProviderBase):
     async def _ack_pcm(self) -> bytes:
         return await self._tts_pcm(self.stop_ack_text, "停下应答")
 
+    def _phrase_path(self, text: str) -> str:
+        """固定应答的文件名：音色 + 模型和文本的摘要，改了其中一样就是另一个文件、重新合成。"""
+        digest = hashlib.sha256(f"{self.greeting_tts_model}\n{text}".encode()).hexdigest()[:16]
+        return os.path.join(self.phrase_dir, f"{self.voice}-{digest}.pcm")
+
+    def _save_phrase(self, path: str, pcm: bytes, what: str) -> None:
+        """存不下只记一条日志：这次会话照样能播，下次重启再合成。"""
+        tmp = f"{path}.tmp"
+        try:
+            os.makedirs(self.phrase_dir, exist_ok=True)
+            with open(tmp, "wb") as f:
+                f.write(pcm)
+            os.replace(tmp, path)
+        except OSError as e:
+            self.logger.bind(tag=TAG).warning(f"{what} 存文件失败 {type(e).__name__}")
+
     async def _tts_pcm(self, text: str, what: str) -> bytes:
         key = (self.voice, text, self.speaker.sample_rate)
         if key in _GREETING_CACHE:
             return _GREETING_CACHE[key]
-        import aiohttp
-        body = {"model": self.greeting_tts_model, "voice": self.voice, "input": text,
-                "response_format": "pcm", "instructions": "自然、亲切、简短地应一声。"}
-        # 后台预取，超时放宽到 30 s：11-04 Tokyo 实测同样的请求有时 19 s 才回（"好。"19.0 s、2.0 s，"我在。"1.1 s），
-        # 6 s 超时会让重启后缓存还空的那批会话一直没有应答。播放那边最多只等 2.5 s，取得慢不耽误
+        path = self._phrase_path(text)
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
-                async with s.post(self.tts_url, json=body, headers={"Authorization": f"Bearer {self.api_key}"}) as r:
-                    if r.status != 200:
-                        self.logger.bind(tag=TAG).warning(f"{what} TTS 失败 HTTP {r.status}")
-                        return b""
-                    pcm = await r.read()
-        except Exception as e:  # noqa: BLE001
-            self.logger.bind(tag=TAG).warning(f"{what} TTS 失败 {type(e).__name__}")
-            return b""
-        pcm = _trim_silence(pcm, TTS_RATE)   # TTS 首尾各带几百毫秒静音（11-02 实测整句 2.35 秒）
+            with open(path, "rb") as f:
+                pcm = f.read()       # 文件里是裁过静音、没重采样的 24 kHz PCM，不同采样率的设备共用
+        except OSError:
+            pcm = b""
+        if not pcm:
+            import aiohttp
+            body = {"model": self.greeting_tts_model, "voice": self.voice, "input": text,
+                    "response_format": "pcm", "instructions": "自然、亲切、简短地应一声。"}
+            # 后台预取，超时放宽到 30 s：11-04 Tokyo 实测同样的请求有时 19 s 才回（"好。"19.0 s、2.0 s，"我在。"1.1 s），
+            # 6 s 超时会让重启后缓存还空的那批会话一直没有应答。播放那边最多只等 2.5 s，取得慢不耽误
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
+                    async with s.post(self.tts_url, json=body, headers={"Authorization": f"Bearer {self.api_key}"}) as r:
+                        if r.status != 200:
+                            self.logger.bind(tag=TAG).warning(f"{what} TTS 失败 HTTP {r.status}")
+                            return b""
+                        pcm = await r.read()
+            except Exception as e:  # noqa: BLE001
+                self.logger.bind(tag=TAG).warning(f"{what} TTS 失败 {type(e).__name__}")
+                return b""
+            pcm = _trim_silence(pcm, TTS_RATE)   # TTS 首尾各带几百毫秒静音（11-02 实测整句 2.35 秒）
+            if pcm:
+                self._save_phrase(path, pcm, what)
         if self.speaker.sample_rate != TTS_RATE:
             pcm = Resampler(TTS_RATE, self.speaker.sample_rate).process(pcm)
         _GREETING_CACHE[key] = pcm
@@ -634,14 +668,13 @@ class S2SProvider(S2SProviderBase):
 
     # ---------- 工具（client delegation：自己选工具） ----------
     def _dispatch_instructions(self) -> str:
-        now = time.strftime("%Y-%m-%d %H:%M %A", time.localtime())
         # HA 意图工具的填法规则 + 智能设备列表以外的设备名单（decisions 和小模型都看；Live 主模型的指令里没有）
         ha = ha_names.dispatch_text(self._tool_list(), self._ha_entries, self.ha_names_domains) if self.ha_names else ""
         return (f"{self._instructions()}\n\n你现在是小智的工具调度：根据对话里用户最后一句话决定调用哪个工具。"
                 "日期、农历、时间、天气、家里设备的状态和控制、本机音量这类实时信息必须调用工具，不要凭记忆回答。"
                 # 11-03 夜对比：没有这一句时 gpt-4.1-mini 4/4 把"停一下"当成告别去调 handle_exit_intent
                 "“停一下”“等一下”“别说了”只是让小智先停下，不是结束对话，不要调用 handle_exit_intent；只有用户明确告别（再见、拜拜、没事了）才结束对话。"
-                f"拿到工具结果后用一两句中文说出结论；不需要工具就直接用一句话回答。当前时间：{now}" + (f"\n{ha}" if ha else ""))
+                "拿到工具结果后用一两句中文说出结论；不需要工具就直接用一句话回答。" + (f"\n{ha}" if ha else ""))
 
     @staticmethod
     def _dispatch_tools(tools: list) -> list:
@@ -682,7 +715,7 @@ class S2SProvider(S2SProviderBase):
         choice = a.get("choice")
         return (None if choice in (None, "none") else str(choice)), a.get("confidence")
 
-    async def _responses_call(self, items: list, tools: list, force: str | None = None) -> dict:
+    async def _responses_call(self, items: list, tools: list, force: str | None = None, one_call: bool = False) -> dict:
         import aiohttp
         # 工具显式 strict: false。不写时 Responses 会尽量把 schema 规整成严格模式，可选参数全变必填，小模型只好硬填：
         # HA intent 的 floor 填空串、device_class / domain 猜成 switch，HA 按猜出来的条件匹配不上设备；强制填参和自选都这样（11-03 空跑）。
@@ -690,8 +723,10 @@ class S2SProvider(S2SProviderBase):
         tools = [dict(t, strict=False) for t in tools]
         body = {"model": self.tool_model, "instructions": self._dispatch_instructions(), "input": items,
                 "tools": tools, "tool_choice": {"type": "function", "name": force} if force else "auto", "store": False}
+        if one_call:
+            body["parallel_tool_calls"] = False
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
-            async with s.post(self.tool_url, json=body, headers={"Authorization": f"Bearer {self.api_key}"}) as r:
+            async with s.post(self.tool_url, json=body, headers={"Authorization": f"Bearer {self.tool_api_key}"}) as r:
                 if r.status != 200:
                     raise RuntimeError(f"HTTP {r.status}")
                 return await r.json()
@@ -722,7 +757,7 @@ class S2SProvider(S2SProviderBase):
     def _check_ha_call(self, call: dict, intents: dict, utterance: str, recent: str | None = None,
                        asked: set[str] | frozenset[str] = frozenset()) -> str | None:
         """HA 意图调用执行前：domain 误填成 device_class 的挪过去（改写 call 里的参数，后面记进对话的也是改后的）；
-        用户说的地点和会命中的设备不在一处、或者没说清是哪一台时，返回交给 Live 的说明、不执行。
+        用户说的地点和会命中的设备不在一处、或者没说清是哪一台 / 哪一类时，返回交给 Live 的说明、不执行。
         utterance 是上次委托之后用户说的话，recent 是小模型手边的那几句（默认同 utterance），asked 是上一次委托回问时列的设备。"""
         name = call.get("name") or ""
         try:
@@ -740,11 +775,25 @@ class S2SProvider(S2SProviderBase):
         if blocked:
             self.logger.bind(tag=TAG).info(f"Live 地点守卫拦下 {name}：{blocked}")
             return blocked
+        # 上一次问了"哪一类"，这次的调用还落在那一批里：这句在答那个问题（"窗帘"），上一句说过"都"，下面两道"哪一台"都不问
+        switched = {e["names"][0] for e in ha_names.would_switch(name, tidy, self._ha_entries)}
+        answering = bool(self._ha_kinds_prev) and switched <= self._ha_kinds_prev
         # 没填 name、会一次控制多台、用户又没说"都 / 全部"：先问是哪一台（设备名没识别出来时小模型会退成只填区域）
-        blocked = ha_names.area_ambiguity(utterance, name, tidy, self._ha_entries)
+        blocked = None if answering else ha_names.area_ambiguity(utterance, name, tidy, self._ha_entries)
         if blocked:
             self.logger.bind(tag=TAG).info(f"Live 区域歧义拦下 {name}：{blocked}")
             return blocked
+        # 用户说了"都"，小模型却只填了区域、没填类别：那一处能开关的全算（"把甲地的灯都关了"会连窗帘一起动）。先问要控制哪一类。
+        # 问过了，这句又说了全部（"都关"），才算真要全部；答了"灯"小模型还是只填区域，接着问
+        mixed = ha_names.mixed_kinds(name, tidy, self._ha_entries)
+        if mixed and not (answering and ha_names.said_all_kinds(utterance)):
+            self._ha_kinds_asked |= switched
+            self._all_asked = True          # 答"灯"时小模型多半只填一盏，上一句说过"都"，按展开控制那一处的每一盏
+            blocked = ha_names.ask_kind(mixed, tidy)
+            self.logger.bind(tag=TAG).info(f"Live 类别歧义拦下 {name} {call.get('arguments')}：{blocked}")
+            return blocked
+        if answering:
+            return None
         # 填了 name，但用户的话分不开这台和同类的另一台：先问。只放行一种情况：还是上一次问的那一批设备，用户最后这句话里也没有
         # 这些设备的词（"第一个""靠窗那幅"，名单里没有，靠小模型手边的对话上下文，再问就没完了）。答了半截（"客厅的"）时这一批
         # 会变小，接着问剩下的；带着设备的词却还是分不开（小模型选错了，或者上次问完没答、这次又说了一遍），也要问
@@ -811,12 +860,21 @@ class S2SProvider(S2SProviderBase):
         return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}",
                      arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False)) for n, e in enumerate(targets)], None
 
+    def _will_fan_out(self, said: str, recent: str, asked: bool) -> bool:
+        """这句选了灯的话 _fan_out_all 会接手（展开或回问），小模型只要给出动作。这时还不知道选的是不是灯，所以"把某地的窗帘都关了"也算：
+        第一轮只出一个调用，HA 意图按区域一次就能控制全，没控制全的第二轮起不限（11-05 回归窗帘全部 48/48）。"""
+        if not (asked or ha_names.says_all(said)):
+            return False
+        return any(ha_names.all_at_place(self.conn.prompt, said, recent, "light.", self._ha_entries, asked))
+
     async def _client_delegation(self, did: str) -> None:
         """Live 把一件事委托出来（没有请求正文）：用最近几句对话拼出请求，小模型选工具、ToolRunner 执行，结果交回 Live 转述。"""
         t0 = time.time()
         pending = "".join(self.in_text).strip()
         turns = self.history[-6:] + ([("user", pending)] if pending else [])
         ctx = "\n".join(f"{'用户' if r == 'user' else '小智'}：{t}" for r, t in turns) or self.last_user_text
+        # 时间放这里，不放调度指令：指令每分钟变一次的话，上游的提示词缓存和网关的隐私遮蔽（Magpie 对没见过的文本跑本地模型）都算新的，多等 2 s（11-05 实测）
+        ctx = f"当前时间：{time.strftime('%Y-%m-%d %H:%M %A', time.localtime())}\n{ctx}"
         items: list = [{"role": "user", "content": ctx}]
         tools = self._dispatch_tools(self._tool_list())
         # 地点守卫看的是上次委托之后用户说的话：还没落进 history 的转写，加上这期间落进 history 的用户发言
@@ -825,6 +883,7 @@ class S2SProvider(S2SProviderBase):
         said = [t for r, t in self.history[self._guard_mark:] if r == "user"] + ([pending] if pending else [])
         # 设备歧义看小模型手边的这几句：刚问过"甲地客厅的纱帘开着吗"，接着说"把它关了"不用再问；回问之后用户答半截也接得上
         recent = "\n".join(t for r, t in turns if r == "user")
+        self._ha_kinds_prev, self._ha_kinds_asked = self._ha_kinds_asked, set()
         asked, self._ha_asked = self._ha_asked, set()
         asked_all, self._all_asked = self._all_asked, False
         intents = ha_names.device_intents(tools) if self.ha_names and self._ha_entries else {}
@@ -840,11 +899,14 @@ class S2SProvider(S2SProviderBase):
                     and bool(ha_names.all_at_place(self.conn.prompt, last, recent, "light.", self._ha_entries, asked_all)[0])
                     and not ha_names.names_listed_device(last, self._ha_entries, self.ha_names_domains))
             first = await self._decide_first(ctx, items, tools, sure) if self.tool_picker == "decisions" else None
+            # 小模型自己选工具时第一轮只要一个调用：Haiku 会把一处的灯一盏盏写全（十盏约 1100 token、3.5 s），写完还是被展开替换或者被回问拦下（11-05 空跑）
+            one_call = self.tool_picker != "decisions" and self._will_fan_out(last, recent, asked_all)
             for i in range(max(1, self.tool_rounds)):
                 if i == 0 and first:
                     calls, out = first, []
                 else:
-                    resp = await self._responses_call(items, tools)
+                    resp = await (self._responses_call(items, tools, one_call=True) if one_call and i == 0
+                                  else self._responses_call(items, tools))
                     out = resp.get("output") or []
                     calls = [o for o in out if o.get("type") == "function_call"]
                 text = "".join(c.get("text", "") for o in out if o.get("type") == "message"
@@ -974,8 +1036,14 @@ class S2SProvider(S2SProviderBase):
         if not self.close_on_goodbye or not assistant_txt:
             return False
         said = (self.last_user_text + "".join(self.in_text))
-        return (any(w in said for w in self.goodbye_words) and len(assistant_txt) <= 16
-                and any(w in assistant_txt for w in self.goodbye_words))
+        if not any(w in said for w in self.goodbye_words):
+            return False
+        # 11-04 真机：用户在模型念长回复时说拜拜，模型的告别会和长回复并成一段（"…还要查别的吗?拜拜!"）。
+        # 整段超过 16 字就只看最后一句，否则要等空闲关闭，这期间喊唤醒词会被当成普通的话
+        farewell = assistant_txt
+        if len(farewell) > 16:
+            farewell = ([s for s in _SENTENCE_END.split(farewell) if s.strip()] or [""])[-1]
+        return len(farewell) <= 16 and any(w in farewell for w in self.goodbye_words)
 
     async def _flush_input_text(self) -> None:
         txt = "".join(self.in_text).strip()
