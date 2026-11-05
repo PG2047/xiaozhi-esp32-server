@@ -782,8 +782,8 @@ def test_partial_names_answer_after_asking():
     for said in ("就卧室灯吧", "书房灯", "厨房的", "就书房那个", "不用了", "算了", "把甲地的窗帘都关上", "把老家的风扇打开", "把甲地的灯全关了"):
         assert answer(said) == ([], None, False), said
     # 名单里的设备，名字里没有"风扇""窗帘"这类词
-    named = entries() + [{"names": ["甲牌小机"], "domain": "fan", "areas": ["甲地楼下1号"], "device_class": None}]
-    assert H.partial_names(_HOUSES, "把甲地的甲牌小机关了", named, "把客厅和卧室的灯关了") == ([], None, False)
+    named = entries() + [{"names": ["丁号小机"], "domain": "fan", "areas": ["甲地楼下1号"], "device_class": None}]
+    assert H.partial_names(_HOUSES, "把甲地的丁号小机关了", named, "把客厅和卧室的灯关了") == ([], None, False)
     # "甲地的灯"是在答
     assert answer("甲地的灯") == (["light.a2", "light.a8"], None, False)
     # 说了别的事：这里还是回问，要不要问由调用方看小模型选了什么
