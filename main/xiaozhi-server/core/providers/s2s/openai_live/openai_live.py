@@ -23,6 +23,7 @@ import audioop
 import base64
 import contextlib
 import hashlib
+import io
 import json
 import os
 import re
@@ -43,9 +44,11 @@ TAG = __name__
 
 LIVE_RATE = 16000       # 上下行都用 16 kHz（Live 支持 16 k / 24 k）
 WAKE_TRIGGER = "嘿，你好呀"
-TTS_RATE = 24000        # /v1/audio/speech 的 pcm 是 24 kHz 16-bit 单声道
+TTS_RATE = 24000        # 固定应答文件的格式：24 kHz 16-bit 单声道，不同采样率的设备各自从它重采样
+PHRASE_PEAK = 20000     # 固定应答统一放大到这个峰值（满量程 32767）：11-05 Edge 云希"好。"只有约 12400，MeloTTS 更轻
+PHRASE_TTS_TIMEOUT_S = 30   # 后台预取，播放那边最多只等 2.5 s，取得慢不耽误；太短会让重启后缓存还空的那批会话一直没有应答
 CONTEXT_CHUNK_CHARS = 400   # session.thinking.append 每条 content 上限 500 token，中文按 400 字切
-_GREETING_CACHE: dict[tuple, bytes] = {}   # (voice, 文本, 设备采样率) → PCM，进程内共用：只有第一次唤醒要等 TTS
+_GREETING_CACHE: dict[tuple, bytes] = {}   # (音色, 文本, 设备采样率) → PCM，进程内共用：只有第一次唤醒要等 TTS
 _HA_CACHE: dict = {"t": 0.0, "entries": []}  # GetLiveContext 解析出的设备表，进程内各连接共用（见 _load_ha_names）；只按一个 HA 缓存
 # 调用没走完（轮数用完、中途出错）时交给 Live 的话的开头，后面跟每个调用的结果
 UNFINISHED = "工具调用到这里停了，不会接着做，可能还有没做的。下面是已经调用的，照实告诉用户做了哪些，不要说都做完了，也不要说还在继续：\n"
@@ -66,6 +69,29 @@ def _trim_silence(pcm: bytes, rate: int, rms: int = 200, pad_ms: int = 40) -> by
     return b"".join(frames[max(0, loud[0] - pad):loud[-1] + 1 + pad])
 
 
+def _louder(pcm: bytes, peak: int = PHRASE_PEAK) -> bytes:
+    """太轻的声音放大到 peak，够响的不动。放大要在裁静音之前：裁静音按固定电平判断，声音太轻时字尾会被裁掉。"""
+    top = audioop.max(pcm, 2)
+    return audioop.mul(pcm, 2, peak / top) if 0 < top < peak else pcm
+
+
+def _decode_mp3(mp3: bytes) -> bytes:
+    """MP3 → TTS_RATE 的 16 位单声道 PCM。要 ffmpeg，server 镜像里有。"""
+    from pydub import AudioSegment
+    seg = AudioSegment.from_file(io.BytesIO(mp3), format="mp3")
+    return seg.set_channels(1).set_sample_width(2).set_frame_rate(TTS_RATE).raw_data
+
+
+async def _edge_pcm(text: str, voice: str) -> bytes:
+    """Edge TTS 合成一句（微软的接口，不用 key，级联的 EdgeTTS 也用它），转成 PCM。没声音、不通时抛异常。"""
+    import edge_tts
+    mp3 = b""
+    async for chunk in edge_tts.Communicate(text, voice=voice).stream():
+        if chunk["type"] == "audio":
+            mp3 += chunk["data"]
+    return await asyncio.to_thread(_decode_mp3, mp3)
+
+
 class S2SProvider(S2SProviderBase):
     def __init__(self, config: dict, conn):
         super().__init__(config, conn)
@@ -78,10 +104,10 @@ class S2SProvider(S2SProviderBase):
         # 默认把设备 listen start 之前的音频（唤醒词那几十帧）也送给模型，让它自己听到"你好小智"再回应
         self.forward_before_listen = bool(c.get("forward_before_listen", True))
         # 唤醒应答：Live 没法让模型先开口（XVF3800 走"服务端收唤醒词音频"的路径，固件也不播提示音），
-        # 所以用同一把 key 的 TTS 合成一句（默认"我在。"、同一个音色）缓存起来，唤醒时直接播。空串关掉
+        # 所以合成一句（默认"我在。"）缓存起来，唤醒时直接播。空串关掉
         self.wake_greeting_text = str(c.get("wake_greeting_text", "我在。") or "").strip()
-        self.greeting_tts_model = str(c.get("greeting_tts_model") or "gpt-4o-mini-tts")
-        self.tts_url = str(c.get("tts_url") or "https://api.openai.com/v1/audio/speech")
+        # 固定应答用 Edge TTS（11-05：OpenAI 那把 key 只给 Live 连接用）。音色和 Live 不一样
+        self.greeting_tts_voice = str(c.get("greeting_tts_voice") or "zh-CN-YunxiNeural")
         # 固定应答（"我在。""好。"）只合成一次：存在这个目录下，以后读文件，重启也不再调 TTS
         self.phrase_dir = str(c.get("phrase_dir") or "data/live_phrases")
         self._greeting_task = None
@@ -121,9 +147,9 @@ class S2SProvider(S2SProviderBase):
         # Live 自己转述（API 探针：说完到说出答案 3.7 s）
         self.delegation_mode = str(c.get("delegation_mode") or "responses")
         self.tool_model = str(c.get("tool_model") or "gpt-4.1-mini")
-        self.tool_url = str(c.get("tool_url") or "https://api.openai.com/v1/responses")
-        # tool_url 指向别家（如 Magpie 网关）时用这把 key；不配就用 api_key。Live 连接和 decisions 始终用 api_key
-        self.tool_api_key = str(c.get("tool_api_key") or "") or self.api_key
+        # 11-05：tool_url、tool_api_key 没有默认值，也不退回 api_key。那把 key 只给 Live 连接用，配错了工具调用报错，不会悄悄花到 OpenAI
+        self.tool_url = str(c.get("tool_url") or "")
+        self.tool_api_key = str(c.get("tool_api_key") or "")
         self.ack_delay_ms = int(c.get("ack_delay_ms", 800))
         self.tool_rounds = int(c.get("tool_rounds", 3))
         self.direct_max_chars = int(c.get("tool_direct_max_chars", 200))   # 单个工具结果不超过这么长就直接交给 Live 转述，省一轮
@@ -132,7 +158,7 @@ class S2SProvider(S2SProviderBase):
         # 不要参数的直接调用、要参数的再让 tool_model 强制只填这一个工具的参数；拿不准（置信度 < decision_min_confidence）
         # 或判成"不需要工具"就退回 model 的做法。11-03 夜 72 题对比：两种都 72/72，decisions 选工具中位 0.21 s（mini 0.94 s）
         self.tool_picker = str(c.get("tool_picker") or "model")
-        self.decision_url = str(c.get("decision_url") or "https://api.openai.com/v1/decisions")
+        self.decision_url = str(c.get("decision_url") or "")   # 没配就退回 tool_model（见 _decide_first）
         self.decision_model = str(c.get("decision_model") or "gpt-6-luna")
         self.decision_min_conf = float(c.get("decision_min_confidence", 0.6))
         # 智能设备列表以外的 HA 设备（风扇、窗帘……）：调度指令带上从 GetLiveContext 生成的名单，HA 意图调用执行前过地点守卫
@@ -405,9 +431,9 @@ class S2SProvider(S2SProviderBase):
         return await self._tts_pcm(self.stop_ack_text, "停下应答")
 
     def _phrase_path(self, text: str) -> str:
-        """固定应答的文件名：音色 + 模型和文本的摘要，改了其中一样就是另一个文件、重新合成。"""
-        digest = hashlib.sha256(f"{self.greeting_tts_model}\n{text}".encode()).hexdigest()[:16]
-        return os.path.join(self.phrase_dir, f"{self.voice}-{digest}.pcm")
+        """固定应答的文件名：音色 + 文本的摘要，改了其中一样就是另一个文件、重新合成。"""
+        digest = hashlib.sha256(text.encode()).hexdigest()[:16]
+        return os.path.join(self.phrase_dir, f"{self.greeting_tts_voice}-{digest}.pcm")
 
     def _save_phrase(self, path: str, pcm: bytes, what: str) -> None:
         """存不下只记一条日志：这次会话照样能播，下次重启再合成。"""
@@ -421,7 +447,7 @@ class S2SProvider(S2SProviderBase):
             self.logger.bind(tag=TAG).warning(f"{what} 存文件失败 {type(e).__name__}")
 
     async def _tts_pcm(self, text: str, what: str) -> bytes:
-        key = (self.voice, text, self.speaker.sample_rate)
+        key = (self.greeting_tts_voice, text, self.speaker.sample_rate)
         if key in _GREETING_CACHE:
             return _GREETING_CACHE[key]
         path = self._phrase_path(text)
@@ -431,24 +457,16 @@ class S2SProvider(S2SProviderBase):
         except OSError:
             pcm = b""
         if not pcm:
-            import aiohttp
-            body = {"model": self.greeting_tts_model, "voice": self.voice, "input": text,
-                    "response_format": "pcm", "instructions": "自然、亲切、简短地应一声。"}
-            # 后台预取，超时放宽到 30 s：11-04 Tokyo 实测同样的请求有时 19 s 才回（"好。"19.0 s、2.0 s，"我在。"1.1 s），
-            # 6 s 超时会让重启后缓存还空的那批会话一直没有应答。播放那边最多只等 2.5 s，取得慢不耽误
             try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
-                    async with s.post(self.tts_url, json=body, headers={"Authorization": f"Bearer {self.api_key}"}) as r:
-                        if r.status != 200:
-                            self.logger.bind(tag=TAG).warning(f"{what} TTS 失败 HTTP {r.status}")
-                            return b""
-                        pcm = await r.read()
-            except Exception as e:  # noqa: BLE001
+                raw = await asyncio.wait_for(_edge_pcm(text, self.greeting_tts_voice), PHRASE_TTS_TIMEOUT_S)
+            except Exception as e:  # noqa: BLE001  网络错误、超时、解码失败
                 self.logger.bind(tag=TAG).warning(f"{what} TTS 失败 {type(e).__name__}")
                 return b""
-            pcm = _trim_silence(pcm, TTS_RATE)   # TTS 首尾各带几百毫秒静音（11-02 实测整句 2.35 秒）
-            if pcm:
-                self._save_phrase(path, pcm, what)
+            pcm = _trim_silence(_louder(raw), TTS_RATE)   # TTS 首尾带静音，唤醒后要马上出声
+            if not pcm:
+                self.logger.bind(tag=TAG).warning(f"{what} TTS 没有声音")
+                return b""
+            self._save_phrase(path, pcm, what)
         if self.speaker.sample_rate != TTS_RATE:
             pcm = Resampler(TTS_RATE, self.speaker.sample_rate).process(pcm)
         _GREETING_CACHE[key] = pcm
@@ -702,6 +720,8 @@ class S2SProvider(S2SProviderBase):
 
     async def _decisions_call(self, ctx: str, tools: list) -> tuple:
         """/v1/decisions 多选一：返回 (工具名或 None, 置信度)。"""
+        if not self.decision_url or not self.tool_api_key:
+            raise RuntimeError("没配 decision_url 或 tool_api_key")
         import aiohttp
         choices = [{"value": t["name"], "description": (t.get("description") or "")[:300]} for t in tools]
         choices.append({"value": "none", "description": "不需要工具：闲聊、讲故事、讲笑话、常识问答"})
@@ -710,7 +730,7 @@ class S2SProvider(S2SProviderBase):
                                "instructions": "根据用户最后一句话，选出小智要调用的工具；不需要工具就选 none。"
                                                "日期、时间、农历、设备状态和控制、音量这类实时信息必须选工具。"}]}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
-            async with s.post(self.decision_url, json=body, headers={"Authorization": f"Bearer {self.api_key}"}) as r:
+            async with s.post(self.decision_url, json=body, headers={"Authorization": f"Bearer {self.tool_api_key}"}) as r:
                 if r.status != 200:
                     raise RuntimeError(f"HTTP {r.status}")
                 a = ((await r.json()).get("answers") or [{}])[0]
@@ -718,6 +738,8 @@ class S2SProvider(S2SProviderBase):
         return (None if choice in (None, "none") else str(choice)), a.get("confidence")
 
     async def _responses_call(self, items: list, tools: list, force: str | None = None, one_call: bool = False) -> dict:
+        if not self.tool_url or not self.tool_api_key:
+            raise RuntimeError("没配 tool_url 或 tool_api_key")
         import aiohttp
         # 工具显式 strict: false。不写时 Responses 会尽量把 schema 规整成严格模式，可选参数全变必填，小模型只好硬填：
         # HA intent 的 floor 填空串、device_class / domain 猜成 switch，HA 按猜出来的条件匹配不上设备；强制填参和自选都这样（11-03 空跑）。

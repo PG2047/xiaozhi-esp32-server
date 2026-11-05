@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
+import re
+import shutil
 
 import numpy as np
 import pytest
@@ -1055,7 +1058,8 @@ def test_responses_tools_sent_non_strict(monkeypatch):
 
     async def go():
         p = S2SProvider({"api_key": "k", "delegation_mode": "client", "tool_picker": "decisions", "echo_gate": False,
-                         "wake_greeting_text": ""}, FakeConn(asyncio.get_running_loop()))
+                         "wake_greeting_text": "", "tool_url": "http://gw/v1/responses", "tool_api_key": "gw"},
+                        FakeConn(asyncio.get_running_loop()))
 
         async def fake_dec(ctx, tools):
             return "intent__HassTurnOn", 0.9
@@ -2139,18 +2143,62 @@ def _plain_provider(**over):
     return S2SProvider({"api_key": "k", "echo_gate": False, "wake_greeting_text": "", **over}, conn)
 
 
-def test_responses_call_uses_tool_api_key_and_defaults_to_api_key():
+def test_responses_call_uses_tool_api_key_and_never_falls_back_to_the_live_key():
+    """OpenAI 那把 key 只给 Live 连接用：工具链路配错了要报错，不能悄悄用它。"""
+    msg = [{"role": "user", "content": "x"}]
+
     async def go():
         srv, seen = await _http_recorder({"output": []})
         try:
             url = str(srv.make_url("/v1/responses"))
-            await _plain_provider(tool_url=url, tool_api_key="gw")._responses_call([{"role": "user", "content": "x"}], [])
-            await _plain_provider(tool_url=url)._responses_call([{"role": "user", "content": "x"}], [])
-            await _plain_provider(tool_url=url, tool_api_key="")._responses_call([{"role": "user", "content": "x"}], [])
+            await _plain_provider(tool_url=url, tool_api_key="gw")._responses_call(msg, [])
+            for over in (dict(tool_url=url), dict(tool_url=url, tool_api_key=""), dict(tool_api_key="gw"), {}):
+                with pytest.raises(RuntimeError, match="tool_url"):
+                    await _plain_provider(**over)._responses_call(msg, [])
         finally:
             await srv.close()
-        assert seen == ["Bearer gw", "Bearer k", "Bearer k"]
+        assert seen == ["Bearer gw"]
     asyncio.run(go())
+
+
+def test_decisions_call_uses_tool_api_key_and_needs_its_own_url():
+    tool = [{"name": "t", "description": "d"}]
+
+    async def go():
+        srv, seen = await _http_recorder({"answers": [{"choice": "t", "confidence": 0.9}]})
+        try:
+            url = str(srv.make_url("/v1/decisions"))
+            assert await _plain_provider(decision_url=url, tool_api_key="gw")._decisions_call("ctx", tool) == ("t", 0.9)
+            for over in (dict(decision_url=url), dict(tool_api_key="gw"), {}):
+                with pytest.raises(RuntimeError, match="decision_url"):
+                    await _plain_provider(**over)._decisions_call("ctx", tool)
+        finally:
+            await srv.close()
+        assert seen == ["Bearer gw"]
+    asyncio.run(go())
+
+
+def test_only_the_live_connection_defaults_to_openai():
+    """默认地址里不能再有别的 OpenAI 接口：配漏了不会花到那把 key 上。"""
+    assert re.findall(r"https?://[^\s\"']*openai\.com", open(live_mod.__file__, encoding="utf-8").read()) == []
+
+    async def go():
+        p = _plain_provider()
+        assert p.url == "wss://api.openai.com/v1/live/sessions"
+        assert (p.tool_url, p.tool_api_key, p.decision_url) == ("", "", "")
+    asyncio.run(go())
+
+
+def test_delegation_without_tool_config_says_it_cannot_and_sends_nothing():
+    """配漏 tool_url：Live 转述"查不到"，不会有请求出去。"""
+    async def sc(lv, conn, p):
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "现在几点了"})
+        await _real_sleep(0.05)
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d1", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        said = [m for m in lv.received if m["type"] == "session.commentary.append"][0]
+        assert "查不到" in said["content"]
+    _run_client(sc)
 
 
 def _capture_body(calls):
@@ -2172,7 +2220,7 @@ def test_responses_call_limits_parallel_calls_only_when_asked():
         bodies = []
         srv = await _capture_body(bodies)()
         try:
-            p = _plain_provider(tool_url=str(srv.make_url("/v1/responses")))
+            p = _plain_provider(tool_url=str(srv.make_url("/v1/responses")), tool_api_key="gw")
             await p._responses_call([{"role": "user", "content": "x"}], [], one_call=True)
             await p._responses_call([{"role": "user", "content": "x"}], [])
         finally:
@@ -2246,72 +2294,144 @@ def test_one_call_is_off_with_the_decisions_picker():
     assert _one_call_flags("把甲地的灯都关了", picker="decisions") == [False, False]
 
 
-PHRASE_PCM = (np.ones(2400, np.int16) * 3000).tobytes()   # 100 ms @24k，够响，不会被当静音裁掉
+PHRASE_PCM = (np.ones(2400, np.int16) * live_mod.PHRASE_PEAK).tobytes()   # 100 ms @24k，够响，不会被放大也不会被裁掉
+
+
+def _fake_edge(monkeypatch, reply=PHRASE_PCM):
+    """假的 Edge TTS：记下 (文本, 音色)，回 reply；reply 是异常就抛出来。"""
+    seen = []
+
+    async def fake(text, voice):
+        seen.append((text, voice))
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+    monkeypatch.setattr(live_mod, "_edge_pcm", fake)
+    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+    return seen
+
+
+def test_fixed_phrase_defaults_to_yunxi_and_the_voice_can_be_configured(tmp_path, monkeypatch):
+    """换音色就是另一个文件，重新合成。"""
+    seen = _fake_edge(monkeypatch)
+
+    async def go():
+        assert await _plain_provider(phrase_dir=str(tmp_path))._tts_pcm("我在。", "唤醒应答")
+        assert await _plain_provider(phrase_dir=str(tmp_path), greeting_tts_voice="zh-CN-YunjianNeural")._tts_pcm("我在。", "唤醒应答")
+    asyncio.run(go())
+    assert seen == [("我在。", "zh-CN-YunxiNeural"), ("我在。", "zh-CN-YunjianNeural")]
+    assert len(list(tmp_path.iterdir())) == 2
 
 
 def test_fixed_phrase_is_synthesized_once_and_read_from_file(tmp_path, monkeypatch):
     """合成一次存文件：清掉进程内缓存（相当于重启）再要，读文件、不调 TTS；换一句才再合成。"""
-    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+    seen = _fake_edge(monkeypatch)
 
     async def go():
-        srv, seen = await _http_recorder(PHRASE_PCM)
-        try:
-            over = dict(tts_url=str(srv.make_url("/v1/audio/speech")), phrase_dir=str(tmp_path / "phrases"))
-            first = await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答")
-            assert first and len(seen) == 1
-            live_mod._GREETING_CACHE.clear()
-            assert await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答") == first and len(seen) == 1
-            await _plain_provider(**over)._tts_pcm("好。", "停下应答")
-            assert len(seen) == 2 and len(list((tmp_path / "phrases").iterdir())) == 2
-        finally:
-            await srv.close()
+        over = dict(phrase_dir=str(tmp_path / "phrases"))
+        first = await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答")
+        assert first and len(seen) == 1
+        live_mod._GREETING_CACHE.clear()
+        assert await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答") == first and len(seen) == 1
+        await _plain_provider(**over)._tts_pcm("好。", "停下应答")
+        assert len(seen) == 2 and len(list((tmp_path / "phrases").iterdir())) == 2
     asyncio.run(go())
 
 
 def test_fixed_phrase_file_keeps_24k_and_each_rate_resamples_from_it(tmp_path, monkeypatch):
     """文件里是没重采样的 24 kHz：16 kHz 的设备先合成，24 kHz 的设备读到的长度也对。"""
-    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+    seen = _fake_edge(monkeypatch)
 
     async def go():
-        srv, seen = await _http_recorder(PHRASE_PCM)
-        try:
-            over = dict(tts_url=str(srv.make_url("/v1/audio/speech")), phrase_dir=str(tmp_path))
-            low = _plain_provider(**over)
-            low.speaker.sample_rate = 16000
-            assert len(await low._tts_pcm("我在。", "唤醒应答")) < len(PHRASE_PCM)
-            high = _plain_provider(**over)
-            high.speaker.sample_rate = 24000
-            assert await high._tts_pcm("我在。", "唤醒应答") == PHRASE_PCM and len(seen) == 1
-        finally:
-            await srv.close()
+        low = _plain_provider(phrase_dir=str(tmp_path))
+        low.speaker.sample_rate = 16000
+        assert len(await low._tts_pcm("我在。", "唤醒应答")) < len(PHRASE_PCM)
+        high = _plain_provider(phrase_dir=str(tmp_path))
+        high.speaker.sample_rate = 24000
+        assert await high._tts_pcm("我在。", "唤醒应答") == PHRASE_PCM and len(seen) == 1
     asyncio.run(go())
 
 
-def test_fixed_phrase_tts_failure_saves_nothing_and_retries_next_time(tmp_path, monkeypatch):
-    """余额用完时 TTS 回 429：不存文件、不进缓存，充值后下一次唤醒自己补上。"""
-    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+def test_fixed_phrase_quiet_tts_is_made_louder_and_keeps_its_quiet_tail(tmp_path, monkeypatch):
+    """放大后再裁静音，字尾（放大前电平低于裁静音门限）不能被裁掉。够响的声音不动，见上面的测试。"""
+    body = np.ones(2400, np.int16) * 2800       # 100 ms
+    tail = np.ones(2400, np.int16) * 100        # 100 ms，放大前低于门限（200），放大后高于它
+    silence = np.zeros(4800, np.int16)          # 200 ms，放大后还是静音，要裁掉
+    _fake_edge(monkeypatch, np.concatenate([body, tail, silence]).tobytes())
 
     async def go():
-        srv, seen = await _http_recorder({"error": {"code": "credit_balance_exhausted"}}, status=429)
-        try:
-            over = dict(tts_url=str(srv.make_url("/v1/audio/speech")), phrase_dir=str(tmp_path / "phrases"))
-            assert await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答") == b""
-            assert await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答") == b""
-            assert len(seen) == 2 and not (tmp_path / "phrases").exists()
-        finally:
-            await srv.close()
+        p = _plain_provider(phrase_dir=str(tmp_path))
+        p.speaker.sample_rate = 24000
+        out = np.frombuffer(await p._tts_pcm("我在。", "唤醒应答"), np.int16)
+        assert abs(int(out.max()) - live_mod.PHRASE_PEAK) <= 2
+        assert 4800 <= len(out) <= 4800 + 960 + 240      # 声音和字尾都在，后面只多留 40 ms（960 样本）和不满一帧的零头
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("reply", [RuntimeError("不通"), asyncio.TimeoutError(), b""])
+def test_fixed_phrase_tts_failure_saves_nothing_and_retries_next_time(tmp_path, monkeypatch, reply):
+    """TTS 失败、没有声音：不存文件、不进缓存，下一次唤醒自己补上。"""
+    seen = _fake_edge(monkeypatch, reply)
+
+    async def go():
+        over = dict(phrase_dir=str(tmp_path / "phrases"))
+        assert await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答") == b""
+        assert await _plain_provider(**over)._tts_pcm("我在。", "唤醒应答") == b""
+        assert len(seen) == 2 and not (tmp_path / "phrases").exists() and not live_mod._GREETING_CACHE
+    asyncio.run(go())
+
+
+def test_fixed_phrase_tts_is_given_up_after_the_time_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+    monkeypatch.setattr(live_mod, "PHRASE_TTS_TIMEOUT_S", 0.05)
+
+    async def stuck(text, voice):
+        await _real_sleep(5)
+        return PHRASE_PCM
+    monkeypatch.setattr(live_mod, "_edge_pcm", stuck)
+
+    async def go():
+        assert await _plain_provider(phrase_dir=str(tmp_path))._tts_pcm("我在。", "唤醒应答") == b""
     asyncio.run(go())
 
 
 def test_fixed_phrase_still_plays_when_the_file_cannot_be_written(tmp_path, monkeypatch):
-    monkeypatch.setattr(live_mod, "_GREETING_CACHE", {})
+    seen = _fake_edge(monkeypatch)
     (tmp_path / "occupied").write_text("这是文件，建不了目录")
 
     async def go():
-        srv, seen = await _http_recorder(PHRASE_PCM)
-        try:
-            p = _plain_provider(tts_url=str(srv.make_url("/v1/audio/speech")), phrase_dir=str(tmp_path / "occupied" / "phrases"))
-            assert await p._tts_pcm("我在。", "唤醒应答") and len(seen) == 1
-        finally:
-            await srv.close()
+        p = _plain_provider(phrase_dir=str(tmp_path / "occupied" / "phrases"))
+        assert await p._tts_pcm("我在。", "唤醒应答") and len(seen) == 1
     asyncio.run(go())
+
+
+def test_edge_pcm_joins_the_audio_chunks_and_uses_the_voice(monkeypatch):
+    """只收 audio 块（还有 WordBoundary 这类），音色传给 Edge，拼好的 MP3 拿去解码。"""
+    import edge_tts
+    made = []
+
+    class Communicate:
+        def __init__(self, text, voice=None):
+            made.append((text, voice))
+
+        async def stream(self):
+            yield {"type": "audio", "data": b"ab"}
+            yield {"type": "WordBoundary", "text": "我"}
+            yield {"type": "audio", "data": b"cd"}
+    monkeypatch.setattr(edge_tts, "Communicate", Communicate)
+    monkeypatch.setattr(live_mod, "_decode_mp3", lambda mp3: b"pcm:" + mp3)
+    assert asyncio.run(live_mod._edge_pcm("好。", "zh-CN-YunxiNeural")) == b"pcm:abcd"
+    assert made == [("好。", "zh-CN-YunxiNeural")]
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="要 ffmpeg")
+def test_decode_mp3_gives_24k_mono_16bit():
+    from pydub import AudioSegment
+    t = np.arange(44100)
+    stereo = (np.sin(t * 2 * np.pi * 440 / 44100) * 8000).astype(np.int16).repeat(2).tobytes()
+    seg = AudioSegment(stereo, sample_width=2, frame_rate=44100, channels=2)
+    buf = io.BytesIO()
+    seg.export(buf, format="mp3")
+    pcm = live_mod._decode_mp3(buf.getvalue())
+    assert abs(len(pcm) / 2 / 24000 - 1.0) < 0.1      # 1 秒的声音，按 24 kHz 单声道算还是约 1 秒
+    assert np.abs(np.frombuffer(pcm, np.int16)).max() > 4000

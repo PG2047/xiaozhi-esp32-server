@@ -523,6 +523,17 @@ ASR:
     base_url: https://api.openai.com/v1/audio/transcriptions
     model_name: gpt-4o-mini-transcribe
     output_dir: tmp/
+  CloudflareASR:
+    # Cloudflare Workers AI 语音识别，$0.0005/音频分钟，每天有免费额度
+    # 令牌要有 Workers AI 权限：https://dash.cloudflare.com/profile/api-tokens
+    # 提示词要短，列词汇表时安静的片段容易幻听
+    type: cloudflare
+    account_id: 你的Cloudflare账号ID
+    api_token: 你的Cloudflare令牌
+    model_name: "@cf/openai/whisper-large-v3-turbo"
+    language: zh
+    initial_prompt: 以下是普通话。
+    output_dir: tmp/
   GroqASR:
     # Groq语音识别服务，需要先在Groq Console创建API密钥
     # 申请步骤：
