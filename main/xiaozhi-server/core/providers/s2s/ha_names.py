@@ -463,6 +463,13 @@ def all_named(said: str, recent: str, tool_name: str, entries: list[dict], domai
     return [] if None in names else names
 
 
+def hits_exactly(tool_name: str, args: dict, names: list[str], entries: list[dict]) -> bool:
+    """这个调用在 HA 上命中的正好是 names 这几台（小模型只填区域也填对了）。"""
+    want = [e for n in names for e in matched(tool_name, {"name": n}, entries)]
+    hits = matched(tool_name, args, entries)
+    return len(hits) == len(want) and all(e in want for e in hits)
+
+
 def names_listed_device(said: str, entries: list[dict], domains: Iterable[str] = DEFAULT_DOMAINS) -> bool:
     """用户这句话点了名单里（智能设备列表以外）的设备：地点词和灯的名字里也有的词不算（"窗帘"算，"卧室"不算）。"""
     text = _without_places(said, area_tokens(entries))

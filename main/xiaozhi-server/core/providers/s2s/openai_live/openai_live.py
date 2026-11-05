@@ -812,7 +812,8 @@ class S2SProvider(S2SProviderBase):
     def _fan_out_intent(self, calls: list, said: str, recent: str) -> list:
         """"把甲地的窗帘都关上"走 HA 意图：小模型有时一幅一轮，默认 3 轮用完还没关完；有时漏了几幅还说都关了；有时只填区域，用户没点的那种
         也动了（"把甲地的纱帘都关上"连布帘一起关），或者 device_class 填错一幅都找不到（11-04 模拟）。和灯一样：工具和动作用小模型填的，
-        设备照名单（见 ha_names.all_named），每台一个调用，结果交给小模型总结。小模型一轮出好几个调用、动作不一样的照它填的。"""
+        设备照名单（见 ha_names.all_named），每台一个调用，结果交给小模型总结。小模型一轮出好几个调用、动作不一样的照它填的。
+        一个调用已经正好是那几台（Haiku 常只填区域，也填对了）就不拆：HA 一次控制全，也少占每分钟的调用次数。"""
         tool = calls[0].get("name") or ""
         intents = ha_names.device_intents(self._tool_list()) if self.ha_names and self._ha_entries else {}
         if tool not in intents or any(c.get("name") != tool for c in calls):
@@ -828,6 +829,8 @@ class S2SProvider(S2SProviderBase):
             return calls
         names = ha_names.all_named(said, recent, tool, self._ha_entries, self.ha_names_domains)
         if len(names) < 2:
+            return calls
+        if len(calls) == 1 and ha_names.hits_exactly(tool, ha_names.tidy_args(intents[tool], filled[0], self._ha_entries), names, self._ha_entries):
             return calls
         self.logger.bind(tag=TAG).info(f"Live 全部展开 {tool}：{len(names)} 个设备")
         return [dict(calls[0], call_id=f"{calls[0].get('call_id')}_{n}",

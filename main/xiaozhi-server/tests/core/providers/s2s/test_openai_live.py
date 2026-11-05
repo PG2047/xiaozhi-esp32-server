@@ -1804,7 +1804,8 @@ def _curtains(said: str | list[str], auto_rounds: list, first: dict | list, tool
     """同 _after_first_call，设备表是虚构的戊地四幅窗帘（见 test_ha_names._name_entries），工具是 HA 意图。"""
     from tests.core.providers.s2s.test_ha_names import _name_entries
     return _after_first_call(said, auto_rounds, first=first, tool=tool, conf=conf, es=_name_entries(),
-                             props={"name": {"type": "string"}, "area": {"type": "string"}, "device_class": {"type": "array"},
+                             props={"name": {"type": "string"}, "area": {"type": "string"}, "domain": {"type": "array"},
+                                    "device_class": {"type": "array", "items": {"type": "string", "enum": ["curtain", "shade"]}},
                                     "position": {"type": "integer"}}, **over)
 
 
@@ -1817,11 +1818,27 @@ def test_curtains_all_words_fan_out_with_the_filled_action():
 
 
 def test_curtains_fan_out_replaces_area_calls():
-    """只填区域的调用也换：device_class 填错 HA 一幅都找不到；"纱帘"按区域会把布帘也动了。"""
+    """只填区域、范围不对的调用换掉：device_class 填错 HA 一幅都找不到；"纱帘"按区域会把布帘也动了；什么都没限定的会动别的设备。"""
     rec = _curtains("把戊地的窗帘都关上", [_text_reply("好了。")], _intent_call(area="戊地楼下1号", device_class=["shade"], position=0))
     assert rec["calls"] == [{"position": 0, "name": n} for n in _CURTAINS]
     rec = _curtains("把戊地的纱帘都关上", [_text_reply("好了。")], _intent_call(area="戊地楼下1号", device_class=["curtain"], position=0))
     assert rec["calls"] == [{"position": 0, "name": n} for n in (_CURTAINS[1], _CURTAINS[3])]
+    rec = _curtains("把戊地的窗帘都关上", [_text_reply("好了。")], _intent_call(area="戊地楼下1号", position=0))
+    assert rec["calls"] == [{"position": 0, "name": n} for n in _CURTAINS]
+
+
+def test_curtains_area_call_that_is_exactly_right_is_kept():
+    """只填区域也填对了（正好是用户说的那几幅）：不拆，HA 一次控制全。domain 误填的整理之后算对。"""
+    area = {"area": "戊地楼下1号", "device_class": ["curtain"], "position": 0}
+    rec = _curtains("把戊地的窗帘都关上", [], _intent_call(**area))
+    assert rec["calls"] == [area] and rec["auto"] == []
+    rec = _curtains("把戊地的窗帘都关上", [], _intent_call(area="戊地1号", domain=["cover"], position=0))
+    assert rec["calls"] == [{"area": "戊地1号", "domain": ["cover"], "position": 0}]
+    rec = _curtains("把戊地的窗帘都关上", [], _intent_call(area="戊地楼下1号", domain=["curtain"], position=0))
+    assert rec["calls"] == [{"area": "戊地楼下1号", "position": 0, "device_class": ["curtain"]}]
+    # 一轮两个同样的调用：不算一个调用就够，照名单换
+    rec = _curtains("把戊地的窗帘都关上", [_text_reply("好了。")], [_intent_call("c0", **area), _intent_call("c1", **area)])
+    assert [c["name"] for c in rec["calls"]] == _CURTAINS
 
 
 def test_curtains_fan_out_replaces_several_calls_with_one_action():

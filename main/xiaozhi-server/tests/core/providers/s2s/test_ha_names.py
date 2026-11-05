@@ -443,6 +443,16 @@ def test_all_named_picks_a_name_only_this_device_has():
     assert _all_named("把戊地的窗帘都关上", es=[cover("窗帘"), cover("窗帘", "西窗帘")]) == []
 
 
+def test_hits_exactly_compares_what_ha_would_control():
+    es, tool = _name_entries(), "intent__HassSetPosition"
+    assert H.hits_exactly(tool, {"area": "戊地楼下1号", "device_class": ["curtain"]}, _CURTAINS, es)
+    assert H.hits_exactly(tool, {"area": "戊地1号", "domain": ["cover"]}, _CURTAINS, es)            # 区域别名
+    assert not H.hits_exactly(tool, {"area": "戊地楼下1号", "device_class": ["curtain"]}, _CURTAINS[:2], es)   # 比要的多
+    assert not H.hits_exactly(tool, {"area": "戊地楼下1号", "device_class": ["shade"]}, _CURTAINS, es)         # HA 找不到
+    assert not H.hits_exactly(tool, {"area": "戊地楼下1号"}, _CURTAINS, es)                         # 还会动别的
+    assert not H.hits_exactly(tool, {"name": _CURTAINS[0]}, _CURTAINS, es)                          # 比要的少
+
+
 def test_sounds_like_command():
     for said in ("把戊地的灯全关了", "戊地的灯全部打开", "把灯都调到百分之三十", "都关了吧", "把戊地的灯全灭了", "接着把戊地的窗帘都放下来"):
         assert H.sounds_like_command(said), said
