@@ -1013,7 +1013,9 @@ class S2SProvider(S2SProviderBase):
                     items.append({"type": "function_call", "call_id": call.get("call_id"), "name": call.get("name"),
                                   "arguments": call.get("arguments") or "{}"})
                     items.append({"type": "function_call_output", "call_id": call.get("call_id"), "output": result})
-                if len(calls) == 1 and len(outputs[0]) <= self.direct_max_chars:
+                # 地点守卫的说明是写给小模型看的：它接着调用或者总结，不念给用户。11-05 模拟：第一轮都对，第二轮小模型常多调一盏别处的
+                # （"把灯都关了，除了甲地"6 次 5 次），都走到这里。写给 Live 的问句（"问用户要控制哪一类"）照旧直接交回
+                if len(calls) == 1 and len(outputs[0]) <= self.direct_max_chars and not (blocked or "").startswith(ha_names.NOT_AN_ERROR):
                     # 短结果直接交给 Live 转述，省一轮小模型。带上调用了什么、参数是什么：
                     # 设音量这类工具只回"成功"，光给结果 Live 只会说"好了"（11-03 R26），带上参数它会说"调到六十了"。
                     # 前几轮做过的也带上，不然 Live 只知道最后这一个
