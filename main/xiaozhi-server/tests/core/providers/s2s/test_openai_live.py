@@ -1838,6 +1838,7 @@ def test_first_round_leaves_parallel_calls_alone_when_the_server_will_not_fan_ou
     assert _one_call_flags("把书房灯和小台灯都关了") == [False]
     assert _one_call_flags("除了甲地都关了") == [False]
     assert _one_call_flags("把书房灯关了") == [False]
+    assert _one_call_flags("把甲地的灯关了") == [False]     # 没说"都"，服务端不展开，小模型自己写全才控制得到
 
 
 def test_one_call_is_off_with_the_decisions_picker():
