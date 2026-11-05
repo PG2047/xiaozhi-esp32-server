@@ -833,7 +833,8 @@ class S2SProvider(S2SProviderBase):
                      arguments=json.dumps(dict(args, entity_id=e), ensure_ascii=False)) for n, e in enumerate(targets)], None
 
     def _will_fan_out(self, said: str, recent: str, asked: bool) -> bool:
-        """这句选了灯的话 _fan_out_all 会接手（展开或回问），小模型只要给出动作。"""
+        """这句选了灯的话 _fan_out_all 会接手（展开或回问），小模型只要给出动作。这时还不知道选的是不是灯，所以"把某地的窗帘都关了"也算：
+        第一轮只出一个调用，HA 意图按区域一次就能控制全，没控制全的第二轮起不限（11-05 回归窗帘全部 48/48）。"""
         if not (asked or ha_names.says_all(said)):
             return False
         return any(ha_names.all_at_place(self.conn.prompt, said, recent, "light.", self._ha_entries, asked))
