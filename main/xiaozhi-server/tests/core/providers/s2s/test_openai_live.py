@@ -684,6 +684,7 @@ def _closes_when_user_speaks_during_reply(user, reply):
     ("拜拜", "今天宜祭祀、出行、结婚、宴会、求医,忌修置产室、开渠、穿井、破屋坏垣这些。你想知道今天适合做什么,还是需要避开什么呢?拜拜!"),
     ("拜拜", "好,我看下宜忌。今天宜祭祀、出行、结婚嫁娶这些,忌修置产室和开渠。你需要我帮你查今天...好嘞,拜拜!"),
     ("再见", "宜祭祀、出行、结婚、宴会等,忌修置产室、开渠、破屋坏垣。还要我说说其它细节吗?嗯,回头见!"),
+    ("拜拜", ",它停下来听见树叶沙沙响,才发现风其实,拜拜!"),     # 11-05 真机：说到一半收尾，只隔一个逗号
 ])
 def test_goodbye_merged_into_a_long_reply_closes(user, reply):
     assert _closes_when_user_speaks_during_reply(user, reply)
@@ -694,6 +695,7 @@ def test_goodbye_merged_into_a_long_reply_closes(user, reply):
     ("拜拜", "拜拜是告别的话,和再见差不多。今天农历九月廿六,还想知道别的吗?"),     # 最后一句里没有告别词
     ("拜拜", "今天农历九月廿六,宜祭祀、出行。从前的人分开的时候都会说再见然后挥手走很远很远的路"),     # 最后一句太长，只是提到
     ("拜拜", "今天宜祭祀、出行、结婚、宴会、嫁娶、求医疗病。忌修置产室、开渠、穿井、破屋坏垣、苫盖等。"),     # 回复里没有告别词，等空闲关闭
+    ("拜拜", "这个词很常用,大家分开的时候都会说再见或者拜拜,你还想知道别的吗"),     # 告别词在前面的小句里，最后一小句不是告别
 ])
 def test_long_reply_without_a_goodbye_at_the_end_stays_open(user, reply):
     assert not _closes_when_user_speaks_during_reply(user, reply)
