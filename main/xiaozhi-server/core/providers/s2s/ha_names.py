@@ -541,6 +541,19 @@ def sounds_like_command(said: str) -> bool:
     return bool(_COMMAND_WORDS.search(said or "")) and not _STATIVE_WORDS.search(said or "")
 
 
+_CHANGE_WORDS = re.compile(r"调|[大小亮暗高低响轻]一?点|太[大小亮暗高低响吵轻]|听不[清见]|关掉|关上|关了|打开|拉上|拉开")
+_ASKING_WORDS = re.compile(r"吗|多少|几|什么|怎么样|是不是|有没有|[?？]")
+_REQUEST_WORDS = re.compile(r"能|可以|帮|麻烦|请")
+
+
+def wants_change(said: str) -> bool:
+    """这句话是要改设备（"把音量调小一点""声音太大了""可以调亮一点吗"），不是只问现在怎么样（"音量调大了吗""现在音量多少"）。"""
+    said = said or ""
+    if not _CHANGE_WORDS.search(said):
+        return False
+    return bool(_REQUEST_WORDS.search(said)) or not _ASKING_WORDS.search(said)
+
+
 def _without_places(text: str, tokens: dict[str, set[str]]) -> str:
     """去掉地点词（长的先去），转小写、去空格。"""
     t = norm(text).replace(" ", "")

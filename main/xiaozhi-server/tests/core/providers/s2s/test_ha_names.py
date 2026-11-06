@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from core.providers.s2s import ha_names as H
 
 # HA GetLiveContext 的正文（yaml，名字和区域都用 ", " 连成一个字符串）。甲地的除醛净化器和客厅纱帘有不带地名的别名
@@ -914,3 +916,13 @@ def test_partial_names_without_the_lists():
     # 名单没取到认不出地点，房间也认不出，"客厅灯"不算；提示词里没有设备列表就不管
     assert _partial("把书房灯和客厅灯关了", es=[]) == []
     assert _partial("把书房灯和客厅灯关了", prompt="你是小智") == []
+
+
+@pytest.mark.parametrize("said,want", [
+    ("把音量调小一点", True), ("呃 把你的音量调小一点吧", True), ("声音太大了", True), ("太吵了", True), ("大点声", True),
+    ("书房灯太亮了", True), ("把书房灯调暗一点", True), ("可以把音量调小一点吗", True), ("能不能调亮一点", True), ("帮我把灯关了", True),
+    ("现在音量多少", False), ("音量调大了吗", False), ("书房灯现在开着吗", False), ("灯关了吗", False), ("现在几点了", False), ("", False), (None, False),
+])
+def test_wants_change(said, want):
+    assert H.wants_change(said) is want
+

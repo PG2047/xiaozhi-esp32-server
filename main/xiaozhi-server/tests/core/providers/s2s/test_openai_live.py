@@ -1139,6 +1139,50 @@ def test_responses_tools_sent_non_strict(monkeypatch):
     assert "strict" not in tool
 
 
+def _adjust_case(said, script):
+    """小模型按 script 依次返回，跑一次委托，返回 (交给 Live 的答复, 小模型被调了几次, 执行过的工具)。"""
+    result = {}
+
+    async def sc(lv, conn, p):
+        script_left, n = list(script), []
+
+        async def fake(items, tools, **k):
+            n.append(1)
+            return {"output": script_left.pop(0)}
+        p._responses_call = fake
+        await lv.emit({"type": "session.input_transcript.delta", "delta": said})
+        await _real_sleep(0.05)
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "a1", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        result["answer"] = [m for m in lv.received if m["type"] == "session.commentary.append"][0]["content"]
+        result["rounds"], result["ran"] = len(n), [c["name"] for c in conn.func_handler.calls]
+    _run_client(sc)
+    return result
+
+
+_LOOK = {"type": "function_call", "call_id": "c1", "name": "self_get_device_status", "arguments": "{}"}
+_SET = {"type": "function_call", "call_id": "c2", "name": "self_audio_speaker_set_volume", "arguments": "{\"volume\": 70}"}
+
+
+def test_relative_adjust_goes_on_after_looking_at_the_status():
+    """"调小一点"先查音量：结果短也不能直接交回，要让小模型接着调，交回时查和调都带上。"""
+    r = _adjust_case("把音量调小一点", [[_LOOK], [_SET]])
+    assert r["rounds"] == 2 and r["ran"] == ["self_get_device_status", "self_audio_speaker_set_volume"]
+    assert "self_audio_speaker_set_volume" in r["answer"] and "70" in r["answer"]
+
+
+def test_asking_for_the_status_still_goes_straight_to_live():
+    r = _adjust_case("现在音量多少", [[_LOOK]])
+    assert r["rounds"] == 1 and r["ran"] == ["self_get_device_status"] and "self_get_device_status" in r["answer"]
+
+
+def test_after_looking_small_model_may_answer_in_words():
+    """小模型查完没有接着调、只说了一句：照旧交回这句，不空转。"""
+    say = {"type": "message", "content": [{"type": "output_text", "text": "现在音量八十，已经不算大了。"}]}
+    r = _adjust_case("声音太大了", [[_LOOK], [say]])
+    assert r["rounds"] == 2 and r["answer"] == "现在音量八十，已经不算大了。"
+
+
 class _FakeGateway:
     """假网关：记下请求体，按给定内容返回；raises 时模拟超时或连不上。"""
     def __init__(self, reply=None, status=200, raises=None):
