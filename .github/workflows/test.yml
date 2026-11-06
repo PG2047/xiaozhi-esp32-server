@@ -59,6 +59,8 @@ jobs:
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
+          prune-cache: true
+          cache-suffix: cpu-pruned-v1
           cache-dependency-glob: main/xiaozhi-server/requirements.txt
       - name: Install dependencies
         working-directory: main/xiaozhi-server
@@ -96,7 +98,7 @@ jobs:
       # The POM currently skips test execution; retain its existing compile checks.
       - name: Run Maven test lifecycle
         working-directory: main/manager-api
-        run: mvn -B -q test -DfailIfNoTests=false
+        run: mvn -B -q --settings "$GITHUB_WORKSPACE/.github/maven-settings.xml" test -DfailIfNoTests=false
 
   web:
     name: Vue (manager-web)
