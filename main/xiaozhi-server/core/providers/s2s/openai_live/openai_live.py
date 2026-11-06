@@ -57,6 +57,7 @@ _STOP_FILLERS = ("好不好", "可以吗", "一下", "一点", "下来", "好吗
                  "吧", "啊", "呀", "呢", "嗯", "哦", "噢", "喔", "唉", "诶", "欸", "哎", "嘛", "啦", "了", "吗")
 _BYE_FILLER = re.compile(r"[，,。.！!？?、\s]|小智|好的|好吧|好嘞|好|嗯|哦|噢|那就|那|就|吧|啦|了|呀|啊")   # 告别句里不算别的话的部分（见 _only_goodbye）
 _CLAUSE_END = re.compile(r"[。！？!?….，,、；;：:]+")   # 判断告别时切出回复的最后一小句
+_STATUS_TOOL = re.compile(r"get_device_status|get_state|GetLiveContext")   # 只查不动设备的工具
 THINK_TOOL = "think_deeper"     # 小模型用它把要查、要想的问题交给思考模型（见 _think）
 THINK_INSTRUCTIONS = ("你是语音助手小智的思考后台，你的答复会由小智念给用户听。用中文，两三句话说结论和关键数字，总共不超过一百字，不要 Markdown、链接和来源编号。"
                       "需要最新信息就联网查；行情这类会变的数字说“约”，并说明是什么时候的；查不到或者拿不准就直说，不要编。")
@@ -1127,8 +1128,10 @@ class S2SProvider(S2SProviderBase):
                     items.append({"type": "function_call_output", "call_id": call.get("call_id"), "output": result})
                 # 地点守卫的说明是写给小模型看的：它接着调用或者总结，不念给用户。11-05 模拟：第一轮都对，第二轮小模型常多调一盏别处的
                 # （"把灯都关了，除了甲地"6 次 5 次），都走到这里。写给 Live 的问句（"问用户要控制哪一类"）照旧直接交回
+                # 11-06 真机："把音量调小一点"没给数值，小模型按工具说明先查音量，短结果直接交回就没有下一轮，音量没调，Live 还说"我来调小一点"
+                only_looked = len(calls) == 1 and _STATUS_TOOL.search(calls[0].get("name") or "") and ha_names.wants_change(last)
                 if (len(calls) == 1 and len(outputs[0]) <= self.direct_max_chars and len(only) < 2 and not (partial_left and own)
-                        and not (blocked or "").startswith(ha_names.NOT_AN_ERROR)):
+                        and not (blocked or "").startswith(ha_names.NOT_AN_ERROR) and not only_looked):
                     # 短结果直接交给 Live 转述，省一轮小模型。带上调用了什么、参数是什么：
                     # 设音量这类工具只回"成功"，光给结果 Live 只会说"好了"（11-03 R26），带上参数它会说"调到六十了"。
                     # 前几轮做过的也带上，不然 Live 只知道最后这一个
