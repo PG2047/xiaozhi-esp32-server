@@ -348,6 +348,76 @@ def test_stop_plays_cached_ack_once_and_its_echo_does_not_end_the_hold():
     run(sc)
 
 
+def _notice_tts(p, conn):
+    pcm = (np.ones(conn.sample_rate * 3 // 10, np.int16) * 2000).tobytes()   # 0.3 秒
+
+    async def tts(text, what):
+        return pcm
+    p._tts_pcm = tts
+    p.power_cycle_notice_text = "麻烦拔插电源。"
+
+
+NEEDS_POWER_CYCLE = {"aec": "needs_power_cycle", "median": 3.2}
+
+
+def test_power_cycle_notice_plays_once_per_session():
+    async def sc(lv, conn, p):
+        _notice_tts(p, conn)
+        n = len(conn.websocket.frames())
+        await p.on_device_health(NEEDS_POWER_CYCLE)
+        await wait_until(lambda: len(conn.websocket.frames()) > n, what="拔插提醒")
+        await wait_until(lambda: not p.speaker.speaking, what="提醒放完")
+        m = len(conn.websocket.frames())
+        await p.on_device_health(NEEDS_POWER_CYCLE)
+        await _real_sleep(0.3)
+        assert len(conn.websocket.frames()) == m
+    run(sc)
+
+
+def test_power_cycle_notice_waits_for_the_model_to_finish():
+    async def sc(lv, conn, p):
+        _notice_tts(p, conn)
+        await lv.audio(5, 3000)         # 模型在说
+        await wait_until(lambda: p.in_seg, what="开段")
+        await p.on_device_health(NEEDS_POWER_CYCLE)
+        await _real_sleep(0.3)
+        assert p.in_seg
+        await lv.audio(10, 0)           # 模型说完
+        await wait_until(lambda: not p.in_seg, what="收段")
+        n = len(conn.websocket.frames())
+        await wait_until(lambda: len(conn.websocket.frames()) > n, what="拔插提醒")
+    run(sc)
+
+
+def test_other_device_health_reports_and_an_empty_text_stay_quiet():
+    async def sc(lv, conn, p):
+        _notice_tts(p, conn)
+        n = len(conn.websocket.frames())
+        await p.on_device_health({"aec": "ok"})
+        await p.on_device_health("needs_power_cycle")
+        p.power_cycle_notice_text = ""
+        await p.on_device_health(NEEDS_POWER_CYCLE)
+        await _real_sleep(0.2)
+        assert len(conn.websocket.frames()) == n and not p._power_cycle_noticed
+    run(sc)
+
+
+def test_device_health_notification_reaches_the_provider_and_other_methods_do_not():
+    from core.providers.tools.device_mcp.mcp_handler import handle_mcp_message
+
+    async def sc(lv, conn, p):
+        seen = []
+
+        async def notify(params):
+            seen.append(params)
+        p.on_device_health = notify
+        await handle_mcp_message(conn, None, {"jsonrpc": "2.0", "method": "notifications/device_health",
+                                              "params": NEEDS_POWER_CYCLE})
+        await handle_mcp_message(conn, None, {"jsonrpc": "2.0", "method": "notifications/other", "params": {}})
+        assert seen == [NEEDS_POWER_CYCLE]
+    run(sc)
+
+
 def test_echo_right_after_the_cut_does_not_end_the_hold():
     async def sc(lv, conn, p):          # 截断时设备还在出声，回声过了 onset_rms 也会记一次"上行开口"
         await _stop_while_playing(lv, p)
