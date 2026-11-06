@@ -17,7 +17,9 @@ run in parallel after a small changed-file check.
   the same pinned versions. Import checks confirm both wheels load.
 - `setup-uv` manages and prunes its dependency cache. Do not also cache pip or a
   full virtual environment. The old pip cache stored about 3.19 GB per PR.
-- Java uses `setup-java` Maven caching. Vue uses `setup-node` npm caching.
+- Java uses `setup-java` Maven caching and a CI-only Maven Central mirror.
+  Local developer Maven repository settings are unchanged. Vue uses
+  `setup-node` npm caching.
   The npm lockfile keeps package versions and integrity hashes while using the
   official npm registry. Installation prefers cached package downloads.
 - Dependency installation and Vue tests have separate timing steps. The suites
