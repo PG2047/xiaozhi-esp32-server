@@ -37,16 +37,21 @@ jobs:
             });
             const isDoc = path => path.endsWith('.md') ||
               (path.startsWith('docs/') && !path.startsWith('docs/docker/'));
-            const code = files.some(file => !isDoc(file.filename) ||
+            const code = files.length < context.payload.pull_request.changed_files ||
+              files.some(file => !isDoc(file.filename) ||
               (file.previous_filename && !isDoc(file.previous_filename)));
             core.setOutput('code', String(code));
 
   python:
     name: Python (xiaozhi-server)
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-latest
     steps:
+      - name: Check change detection
+        env:
+          CHANGE_RESULT: ${{ needs.changes.result }}
+        run: test "$CHANGE_RESULT" = success
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -73,9 +78,13 @@ jobs:
   java:
     name: Java (manager-api)
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-latest
     steps:
+      - name: Check change detection
+        env:
+          CHANGE_RESULT: ${{ needs.changes.result }}
+        run: test "$CHANGE_RESULT" = success
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
@@ -89,9 +98,13 @@ jobs:
   web:
     name: Vue (manager-web)
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-latest
     steps:
+      - name: Check change detection
+        env:
+          CHANGE_RESULT: ${{ needs.changes.result }}
+        run: test "$CHANGE_RESULT" = success
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -100,7 +113,7 @@ jobs:
           cache-dependency-path: main/manager-web/package-lock.json
       - name: Install dependencies
         working-directory: main/manager-web
-        run: npm ci --prefer-offline --no-audit --no-fund
+        run: npm ci --registry=https://registry.npmjs.org --prefer-offline --no-audit --no-fund
       - name: Run tests
         working-directory: main/manager-web
         run: npm run test:unit
