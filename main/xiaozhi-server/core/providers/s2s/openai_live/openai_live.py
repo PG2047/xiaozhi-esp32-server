@@ -45,6 +45,7 @@ TAG = __name__
 LIVE_RATE = 16000       # 上下行都用 16 kHz（Live 支持 16 k / 24 k）
 WAKE_TRIGGER = "嘿，你好呀"
 TTS_RATE = 24000        # 固定应答文件的格式：24 kHz 16-bit 单声道，不同采样率的设备各自从它重采样
+POWER_CYCLE_NOTICE_WAIT_S = 30
 PHRASE_PEAK = 20000     # 固定应答统一放大到这个峰值（满量程 32767）：11-05 Edge 云希"好。"只有约 12400，MeloTTS 更轻
 PHRASE_TTS_TIMEOUT_S = 30   # 后台预取，播放那边最多只等 2.5 s，取得慢不耽误；太短会让重启后缓存还空的那批会话一直没有应答
 CONTEXT_CHUNK_CHARS = 400   # session.thinking.append 每条 content 上限 500 token，中文按 400 字切
@@ -203,6 +204,10 @@ class S2SProvider(S2SProviderBase):
         # 停下后补的一声应答，同唤醒应答一样用 TTS 合成后缓存。空串关掉
         self.stop_ack_text = str(c.get("stop_ack_text", "好。") or "").strip()
         self._ack_task = None
+        # 固件报告回声消除重启也没修好时念一句：喇叭还是好的，这事只有人能修。一个会话一次。空串关掉
+        self.power_cycle_notice_text = str(
+            c.get("power_cycle_notice_text", "我可能听不清你说话了，麻烦把我的电源拔掉再插上。") or "").strip()
+        self._power_cycle_noticed = False
 
         gate = None
         if c.get("echo_gate", True):
@@ -516,6 +521,30 @@ class S2SProvider(S2SProviderBase):
         await self.speaker.push(pcm)
         self.spawn(self.speaker.end())
         self.logger.bind(tag=TAG).info(f"Live 唤醒应答「{self.wake_greeting_text}」{round(len(pcm) / 2 / self.speaker.sample_rate * 1000)} ms")
+
+    async def on_device_health(self, params) -> None:
+        """设备状态上报（见 device_mcp/mcp_handler.py）。"""
+        if (not isinstance(params, dict) or params.get("aec") != "needs_power_cycle"
+                or not self.power_cycle_notice_text or self._power_cycle_noticed):
+            return
+        self._power_cycle_noticed = True
+        self.spawn(self._play_power_cycle_notice())
+
+    async def _play_power_cycle_notice(self) -> None:
+        pcm = await self._tts_pcm(self.power_cycle_notice_text, "拔插提醒")
+        if not pcm:
+            return
+        # 固件在会话一开始就报，这时可能还在放唤醒应答或模型的回复：等它说完再念
+        t_end = time.monotonic() + POWER_CYCLE_NOTICE_WAIT_S
+        while (self.in_seg or self.speaker.speaking) and time.monotonic() < t_end:
+            await asyncio.sleep(0.2)
+        if self.in_seg or self.speaker.speaking:
+            self.logger.bind(tag=TAG).info("Live 拔插提醒跳过：模型一直在说")
+            return
+        await self.speaker.begin()
+        await self.speaker.push(pcm)
+        self.spawn(self.speaker.end())
+        self.logger.bind(tag=TAG).warning(f"Live 拔插提醒「{self.power_cycle_notice_text}」")
 
     # ---------- 打断 ----------
     async def cancel(self, reason: str) -> None:

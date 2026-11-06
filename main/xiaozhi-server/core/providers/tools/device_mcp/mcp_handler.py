@@ -30,6 +30,14 @@ async def send_mcp_message(conn: "ConnectionHandler", payload: dict):
         logger.bind(tag=TAG).error(f"发送MCP消息失败: {e}")
 
 
+async def _on_device_health(conn: "ConnectionHandler", params) -> None:
+    """设备报告自己的状态。XVF3800 固件的回声消除判据：重启 XMOS 也没修好时报 aec=needs_power_cycle。"""
+    logger.bind(tag=TAG).warning(f"设备状态上报：{params}")
+    notify = getattr(getattr(conn, "s2s", None), "on_device_health", None)
+    if notify is not None:
+        await notify(params)
+
+
 async def handle_mcp_message(
     conn: "ConnectionHandler", mcp_client: MCPClient, payload: dict
 ):
@@ -132,6 +140,8 @@ async def handle_mcp_message(
     elif "method" in payload:
         method = payload["method"]
         logger.bind(tag=TAG).info(f"收到MCP客户端请求: {method}")
+        if method == "notifications/device_health":
+            await _on_device_health(conn, payload.get("params"))
 
     elif "error" in payload:
         error_data = payload["error"]
