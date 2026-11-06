@@ -4,27 +4,71 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Keep a separate group per non-PR run, including every main commit.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  changes:
+    name: Detect code changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.paths.outputs.code }}
+    steps:
+      - uses: actions/github-script@v7
+        id: paths
+        with:
+          script: |
+            if (context.eventName !== 'pull_request') {
+              core.setOutput('code', 'true');
+              return;
+            }
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...context.repo,
+              pull_number: context.issue.number,
+              per_page: 100,
+            });
+            const isDoc = path => path.endsWith('.md') ||
+              (path.startsWith('docs/') && !path.startsWith('docs/docker/'));
+            const code = files.length < context.payload.pull_request.changed_files ||
+              files.some(file => !isDoc(file.filename) ||
+              (file.previous_filename && !isDoc(file.previous_filename)));
+            core.setOutput('code', String(code));
+
   python:
     name: Python (xiaozhi-server)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-latest
     steps:
+      - name: Check change detection
+        env:
+          CHANGE_RESULT: ${{ needs.changes.result }}
+        run: test "$CHANGE_RESULT" = success
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'
-          cache-dependency-path: 'main/xiaozhi-server/requirements.txt'
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          prune-cache: true
+          cache-suffix: cpu-pruned-v1
+          cache-dependency-glob: main/xiaozhi-server/requirements.txt
       - name: Install dependencies
         working-directory: main/xiaozhi-server
         run: |
-          pip install -r requirements.txt
-          pip install pytest pytest-asyncio freezegun
+          # Hosted Linux runners have no GPU. Keep all requirements, using CPU wheels.
+          uv pip install --system --torch-backend cpu -r requirements.txt pytest pytest-asyncio freezegun
+      - name: Check CPU PyTorch imports
+        run: python -c "import torch, torchaudio; print(torch.__version__, torchaudio.__version__)"
       - name: Run smoke test
         working-directory: main/xiaozhi-server
         run: |
@@ -37,30 +81,47 @@ jobs:
 
   java:
     name: Java (manager-api)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-latest
     steps:
+      - name: Check change detection
+        env:
+          CHANGE_RESULT: ${{ needs.changes.result }}
+        run: test "$CHANGE_RESULT" = success
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
           cache: 'maven'
-      - name: Run tests
+          cache-dependency-path: |
+            main/manager-api/pom.xml
+            .github/maven-settings.xml
+      # The POM currently skips test execution; retain its existing compile checks.
+      - name: Run Maven test lifecycle
         working-directory: main/manager-api
-        run: mvn -B -q test -DfailIfNoTests=false
+        run: mvn -B -q --settings "$GITHUB_WORKSPACE/.github/maven-settings.xml" test -DfailIfNoTests=false
 
   web:
     name: Vue (manager-web)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-latest
     steps:
+      - name: Check change detection
+        env:
+          CHANGE_RESULT: ${{ needs.changes.result }}
+        run: test "$CHANGE_RESULT" = success
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
           cache-dependency-path: main/manager-web/package-lock.json
+      - name: Install dependencies
+        working-directory: main/manager-web
+        run: npm ci --registry=https://registry.npmjs.org --prefer-offline --no-audit --no-fund
       - name: Run tests
         working-directory: main/manager-web
-        run: |
-          npm ci --no-audit --no-fund
-          npm run test:unit
+        run: npm run test:unit
