@@ -15,6 +15,7 @@ response.item.create(function_call_output)，这一轮的调用全部交回且 r
 用户这句的转写里出现停止词时（播放中、设备已经 abort、或刚停不久）进入"停下"：一直丢模型的声音，补一声缓存的"好"，直到用户再开口（见 _stop_on）。
 上行：设备 16 kHz PCM → 残余回声门控（可关，echo_gate: false）→ 直接 16 kHz 送上游。
 日志只记事件、时长、字数，不记转写正文（log_text: true 才记）；api_key 不打印。
+连接健康度（下行间隔、ping 往返等）记在会话统计里，响亮的话久没转写时打 WARNING，读法见 core/providers/s2s/link_health.py。
 """
 from __future__ import annotations
 
@@ -37,6 +38,7 @@ from core.providers.s2s import ha_names
 from core.providers.s2s.audio import Resampler
 from core.providers.s2s.base import DeviceSpeaker, S2SProviderBase, UplinkTrace
 from core.providers.s2s.echo_gate import EchoGate, load_vad
+from core.providers.s2s.link_health import LinkHealth
 from core.providers.s2s.speech_gate import SpeechGate
 from core.providers.s2s.tools import ToolRunner, to_realtime_tools
 
@@ -197,6 +199,13 @@ class S2SProvider(S2SProviderBase):
         self.instructions_suffix = str(c.get("instructions_suffix") or "").strip()
         # 上行开口 / 收声日志（量插话和应答延迟用，onset_rms: 0 关掉）
         self.trace = UplinkTrace(conn.logger, TAG, "Live", int(c.get("onset_rms", 800)))
+        # 连接健康度，只记录不改行为（读法见 link_health.py）。link_ping_ms: 0 关掉定时 ping，unheard_warn_ms: 0 关掉没转写的 WARNING
+        self.link = LinkHealth()
+        self.link_ping_s = float(c.get("link_ping_ms", 2000)) / 1000
+        self.unheard_warn_s = float(c.get("unheard_warn_ms", 5000)) / 1000
+        self.unheard_rms = int(c.get("unheard_rms", 1500))
+        self.unheard_min_loud_s = float(c.get("unheard_min_loud_ms", 400)) / 1000
+        self._unheard = None       # 等转写的那段话：{t, wall, peak, loud_s}，见 _watch_unheard
         self.resume_after_user_s = float(c.get("resume_after_user_ms", 300)) / 1000
         self.resume_max_wait_s = float(c.get("resume_max_wait_ms", 1500)) / 1000
         # 喊停后的"停下"（见 _stop_on）：停止词到的时候模型在播、设备已经 abort，或者上一段结束不到 stop_recent_ms，才算喊停
@@ -389,6 +398,8 @@ class S2SProvider(S2SProviderBase):
         if self.stop_ack_text and self.stop_words:
             self._ack_task = self.spawn(self._ack_pcm())
         self.spawn(self._rx_loop())
+        if self.link_ping_s > 0:
+            self.spawn(self._ping_loop())
         self._arm_idle()
         self.logger.bind(tag=TAG).info(
             f"Live 会话已建立 model={self.model} voice={self.voice} echo_gate={'on' if self.gate else 'off'} "
@@ -400,11 +411,25 @@ class S2SProvider(S2SProviderBase):
     async def _send(self, obj: dict) -> None:
         if self.ws is None:
             return
+        t0 = time.monotonic()
         with contextlib.suppress(ConnectionClosed):
             await self.ws.send(json.dumps(obj, ensure_ascii=False))
+        self.link.sent(time.monotonic() - t0)
+
+    async def _ping_loop(self) -> None:
+        """定时 ping，量这条连接的往返（读法见 link_health.py）。pong 不回也不在这里断线，断线还是交给 websockets 的 keepalive。"""
+        with contextlib.suppress(ConnectionClosed):
+            while not self.closing:
+                await asyncio.sleep(self.link_ping_s)
+                self.link.ping_sent(time.monotonic())   # 发送缓冲满时 ping() 自己也要等，所以从调用之前算起
+                waiter = await self.ws.ping()
+                await waiter
+                self.link.pong(time.monotonic())
 
     async def close(self) -> None:
         self.closing = True
+        # 先取连接数字：后面的关闭握手要等，算进去就成了假的"下行断流"
+        self.stats.update({f"max_{k}": v for k, v in self.link.session_view(time.monotonic()).items()})
         if self._idle_handle is not None:
             self._idle_handle.cancel()
         await super().close()
@@ -427,6 +452,7 @@ class S2SProvider(S2SProviderBase):
         self.trace.feed(pcm16k, self.in_seg)
         if self._stop is not None and self.trace.loud and not was_loud and time.monotonic() >= self._stop["onset_ok"]:
             await self._end_stop("用户又开口")
+        self._watch_unheard(pcm16k, was_loud)
         if self.gate is not None:
             pcm16k, _ = self.gate.process(pcm16k, time.monotonic(), self.speaker.speaking)
         if not self.forward_before_listen and not getattr(self.conn, "client_is_listening", False):
@@ -437,6 +463,35 @@ class S2SProvider(S2SProviderBase):
                 return   # 前瞻队列还没填满
         await self._send({"type": "session.input_audio.append", "audio": base64.b64encode(pcm16k).decode()})
         self.stats["up_frames"] += 1
+
+    def _watch_unheard(self, pcm16k: bytes, was_loud: bool) -> None:
+        """模型没在说话时开口，过了 unheard_warn_s 还没有转写，打一条 WARNING，带上这段时间连接的情况，事后才分得清卡在哪。
+        只记录。这不等于"没听到"：响亮的不一定是话（11-06 统计，254 次里 49 次没转写，没存音频分不清），长句的第一段转写也可能晚。
+        模型在说话时不算（可能是回声），音频没往 Live 送时也不算。"""
+        if self.unheard_warn_s <= 0 or self.trace.rms <= 0:
+            return
+        u = self._unheard
+        now = time.monotonic()
+        if u is None:
+            if not self.trace.loud or was_loud or self.in_seg or self.speaker.speaking:
+                return
+            if not self.forward_before_listen and not getattr(self.conn, "client_is_listening", False):
+                return
+            u = self._unheard = {"t": now, "wall": time.time(), "peak": 0, "loud_s": 0.0}
+            self.link.reset_window()
+        level = audioop.rms(pcm16k, 2)
+        if level > self.trace.rms:
+            u["peak"] = max(u["peak"], level)
+            u["loud_s"] += len(pcm16k) / 2 / LIVE_RATE
+        if now - u["t"] < self.unheard_warn_s:
+            return
+        self._unheard = None
+        if u["peak"] < self.unheard_rms or u["loud_s"] < self.unheard_min_loud_s:
+            return             # 太轻或太短，多半不是话，等到这时才知道
+        self.stats["unheard_warns"] = self.stats.get("unheard_warns", 0) + 1
+        link = " ".join(f"{k}={v}" for k, v in self.link.window_view(now).items())
+        self.logger.bind(tag=TAG).warning(
+            f"Live 开口后 {now - u['t']:.1f} s 没转写 t={u['wall']:.3f} rms={u['peak']} loud_ms={round(u['loud_s'] * 1000)} {link}")
 
     async def on_text(self, text: str) -> None:
         # Live 没有"按文字起一轮回复"的入口：唤醒词那句只用来播缓存的唤醒应答，其余文字忽略
@@ -648,14 +703,17 @@ class S2SProvider(S2SProviderBase):
     async def _rx_loop(self) -> None:
         try:
             async for raw in self.ws:
+                self.link.rx(time.monotonic())
                 try:
                     ev = json.loads(raw)
                 except ValueError:
+                    self.link.rx_done(time.monotonic())
                     continue
                 try:
                     await self._on_event(ev.get("type", ""), ev)
                 except Exception as e:  # noqa: BLE001
                     self.logger.bind(tag=TAG).error(f"处理 Live 事件 {ev.get('type')} 出错: {type(e).__name__}: {e}")
+                self.link.rx_done(time.monotonic())
         except ConnectionClosed:
             pass
         if not self.closing:
@@ -667,6 +725,7 @@ class S2SProvider(S2SProviderBase):
         if et == "session.output_audio.delta":
             await self._on_audio(base64.b64decode(ev.get("delta") or ev.get("audio") or ""))
         elif et == "session.input_transcript.delta":
+            self._unheard = None
             now = time.monotonic()
             delta = ev.get("delta") or ""
             new_utt = self.t_last_input_text is None or now - self.t_last_input_text > 1.5
@@ -1264,6 +1323,7 @@ class S2SProvider(S2SProviderBase):
 
     async def _begin_segment(self) -> None:
         self.in_seg = True
+        self._unheard = None       # 模型已经开口，再等转写没有意义，这时候的响动也可能是回声
         self.t_seg = time.monotonic()
         self.stats["segments"] += 1
         self.logger.bind(tag=TAG).info(f"Live 段开始 #{self.stats['segments']} t={time.time():.3f}")

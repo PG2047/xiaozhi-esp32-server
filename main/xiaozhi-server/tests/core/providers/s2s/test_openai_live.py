@@ -3205,3 +3205,216 @@ def test_read_first_does_not_end_the_round():
     """强制填参没填出来，小模型先查了一盏：短结果不直接交回，灯还没动。"""
     rec = _partial("把书房和客厅的灯调暗一点", [[_get_call("light.a1", "c0")], [_light_call("light.a1", "c1")], _text_reply("调好了。")], first=[])
     assert [c["entity_id"] for c in rec["calls"]] == ["light.a1", "light.a1", "light.a2"] and rec["commentary"] == "调好了。"
+
+
+# ---------- 连接健康度：只记录，不改行为（11-04 19:40 转写晚 19 s，日志分不清卡在哪）----------
+class _Log:
+    def __init__(self):
+        self.warnings = []
+
+    def bind(self, **_):
+        return self
+
+    def info(self, *_):
+        pass
+
+    def debug(self, *_):
+        pass
+
+    def error(self, *_):
+        pass
+
+    def warning(self, m):
+        self.warnings.append(m)
+
+
+def _pcm(amp, frames=1):
+    return (np.ones(960 * frames, np.int16) * amp).tobytes()      # 60 ms 一帧 @16k
+
+
+async def _feed(p, amp, frames, gap=0.0):
+    for _ in range(frames):
+        await p.on_pcm(_pcm(amp))
+        if gap:
+            await _real_sleep(gap)
+
+
+def _watch(scenario, **over):
+    """短超时、关定时 ping 的 provider；scenario 里拿到收警告的 log。"""
+    async def go():
+        lv = FakeLive()
+        async with serve(lv.handler, "127.0.0.1", 0) as srv:
+            url = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}/v1/live/sessions"
+            conn = FakeConn(asyncio.get_running_loop())
+            conn.client_is_listening = True
+            p = S2SProvider({"api_key": "k", "url": url, "echo_gate": False, "idle_close_s": 0, "end_silence_ms": 300,
+                             "wake_greeting_text": "", "unheard_warn_ms": 150, "link_ping_ms": 0, **over}, conn)
+            conn.s2s = p
+            log = _Log()
+            p.logger = log
+            await p.open()
+            await scenario(lv, conn, p, log)
+            await p.close()
+    asyncio.run(go())
+
+
+def test_loud_speech_without_transcript_warns_once_with_link_numbers():
+    async def scenario(lv, conn, p, log):
+        await _feed(p, 3000, 8)
+        await _feed(p, 0, 8, gap=0.03)      # 时间到之后再来一帧才检查
+        assert len(log.warnings) == 1
+        m = log.warnings[0]
+        assert "没转写" in m and "rms=3000" in m and "loud_ms=480" in m
+        for key in ("rx_gap_ms=", "rx_handle_ms=", "send_ms=", "ping_ms="):
+            assert key in m
+        await _feed(p, 0, 8, gap=0.03)
+        assert len(log.warnings) == 1       # 这段话只报一次
+        assert p.stats["unheard_warns"] == 1
+    _watch(scenario)
+
+
+def test_each_new_loud_burst_can_warn_again():
+    async def scenario(lv, conn, p, log):
+        for _ in range(2):
+            await _feed(p, 3000, 8)
+            await _feed(p, 0, 22, gap=0.03)  # 收声（quiet_s 0.4）之后才算下一次开口
+        assert len(log.warnings) == 2
+    _watch(scenario)
+
+
+def test_transcript_clears_the_unheard_watch():
+    async def scenario(lv, conn, p, log):
+        await _feed(p, 3000, 8)
+        await lv.emit({"type": "session.input_transcript.delta", "delta": "你好"})
+        await wait_until(lambda: p._unheard is None)
+        await _feed(p, 0, 8, gap=0.03)
+        assert log.warnings == []
+    _watch(scenario)
+
+
+def test_model_starting_to_speak_clears_the_unheard_watch():
+    async def scenario(lv, conn, p, log):
+        await _feed(p, 3000, 8)
+        await lv.audio(3, 3000)
+        await wait_until(lambda: p.in_seg)
+        assert p._unheard is None
+        await _feed(p, 0, 8, gap=0.03)
+        assert log.warnings == []
+    _watch(scenario)
+
+
+def test_no_unheard_warning_while_model_speaks_or_audio_is_not_forwarded():
+    async def speaking(lv, conn, p, log):
+        p.in_seg = True
+        await _feed(p, 3000, 8)
+        p.in_seg = False
+        await _feed(p, 0, 8, gap=0.03)
+        assert log.warnings == []
+
+    async def device_speaking(lv, conn, p, log):
+        p.speaker.speaking = True
+        await _feed(p, 3000, 8)
+        p.speaker.speaking = False
+        await _feed(p, 0, 8, gap=0.03)
+        assert log.warnings == []
+
+    async def not_listening(lv, conn, p, log):
+        conn.client_is_listening = False
+        await _feed(p, 3000, 8)
+        await _feed(p, 0, 8, gap=0.03)
+        assert log.warnings == [] and p._unheard is None
+    _watch(speaking)
+    _watch(device_speaking)
+    _watch(not_listening, forward_before_listen=False)
+
+
+def test_short_or_quiet_burst_does_not_warn():
+    async def short(lv, conn, p, log):
+        await _feed(p, 3000, 2)              # 0.12 s，不到 0.4 s
+        await _feed(p, 0, 8, gap=0.03)
+        assert log.warnings == []
+
+    async def quiet(lv, conn, p, log):
+        await _feed(p, 1000, 8)              # 过了开口线 800，没到 1500
+        await _feed(p, 0, 8, gap=0.03)
+        assert log.warnings == []
+    _watch(short)
+    _watch(quiet)
+
+
+def test_unheard_warning_can_be_turned_off():
+    async def scenario(lv, conn, p, log):
+        await _feed(p, 3000, 8)
+        await _feed(p, 0, 8, gap=0.03)
+        assert log.warnings == [] and p._unheard is None
+    _watch(scenario, unheard_warn_ms=0)
+
+
+def test_warning_reports_the_stall_that_is_still_going_on():
+    """正卡着的时候下行还没来、pong 还没回，警告里要看得出来，不能只算已经结束的。"""
+    async def scenario(lv, conn, p, log):
+        await lv.audio(1, 0)
+        await wait_until(lambda: p.link.t_idle is not None)
+        p.link.ping_sent(live_mod.time.monotonic())
+        await _feed(p, 3000, 8)
+        await _feed(p, 0, 8, gap=0.03)
+        m = log.warnings[0]
+        assert int(re.search(r"rx_gap_ms=(\d+)", m).group(1)) >= 100
+        assert int(re.search(r"ping_ms=(\d+)", m).group(1)) >= 100
+    _watch(scenario)
+
+
+def test_close_writes_link_numbers_into_stats_and_ping_gets_pongs():
+    async def scenario(lv, conn, p, log):
+        pongs = []
+        real_pong = p.link.pong
+        p.link.pong = lambda now: (pongs.append(now), real_pong(now))
+        await lv.audio(1, 0)
+        await _real_sleep(0.12)
+        await lv.audio(1, 0)
+        await wait_until(lambda: len(pongs) >= 2)
+
+        real_send = p.ws.send
+
+        async def slow_send(*a, **k):
+            await _real_sleep(0.05)
+            return await real_send(*a, **k)
+        p.ws.send = slow_send
+        await p.on_pcm(_pcm(0))
+        p.ws.send = real_send
+        await p.close()
+        assert p.stats["max_rx_gap_ms"] >= 100
+        assert p.stats["max_send_ms"] >= 40
+        assert "max_ping_ms" in p.stats and "max_rx_handle_ms" in p.stats
+        json.dumps(p.stats)                  # 台账要能写
+    _watch(scenario, link_ping_ms=20)
+
+
+def test_link_health_gap_excludes_handling_time():
+    from core.providers.s2s.link_health import LinkHealth
+    h = LinkHealth()
+    h.rx(10.0)                               # 第一条没有"上一条"，不算间隔
+    assert h.session["rx_gap_ms"] == 0
+    h.rx_done(10.5)
+    assert h.session["rx_handle_ms"] == 500
+    h.rx(10.6)
+    assert h.session["rx_gap_ms"] == 100     # 从上一条处理完算，这边处理慢不算成下行断流
+    h.rx_done(10.6)
+    assert h.session_view(13.6)["rx_gap_ms"] == 3000
+    assert h.session["rx_gap_ms"] == 100     # 只是看一眼，不改记录
+
+
+def test_link_health_ping_and_window():
+    from core.providers.s2s.link_health import LinkHealth
+    h = LinkHealth()
+    h.pong(1.0)                              # 没发过 ping，不算
+    assert h.session["ping_ms"] == 0
+    h.ping_sent(1.0)
+    assert h.window_view(6.0)["ping_ms"] == 5000
+    h.pong(1.1)
+    assert h.session["ping_ms"] == 100 and h.window["ping_ms"] == 100
+    assert h.window_view(9.0)["ping_ms"] == 100
+    h.reset_window()
+    assert h.window["ping_ms"] == 0 and h.session["ping_ms"] == 100
+    h.sent(0.25)
+    assert h.window["send_ms"] == 250 and h.session["send_ms"] == 250
