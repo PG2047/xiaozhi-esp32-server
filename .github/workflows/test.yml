@@ -65,6 +65,8 @@ jobs:
         run: |
           # Hosted Linux runners have no GPU. Keep all requirements, using CPU wheels.
           uv pip install --system --torch-backend cpu -r requirements.txt pytest pytest-asyncio freezegun
+      - name: Check CPU PyTorch imports
+        run: python -c "import torch, torchaudio; print(torch.__version__, torchaudio.__version__)"
       - name: Run smoke test
         working-directory: main/xiaozhi-server
         run: |
@@ -91,7 +93,8 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
           cache: 'maven'
-      - name: Run tests
+      # The POM currently skips test execution; retain its existing compile checks.
+      - name: Run Maven test lifecycle
         working-directory: main/manager-api
         run: mvn -B -q test -DfailIfNoTests=false
 
