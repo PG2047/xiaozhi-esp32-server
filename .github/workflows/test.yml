@@ -95,6 +95,9 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
           cache: 'maven'
+          cache-dependency-path: |
+            main/manager-api/pom.xml
+            .github/maven-settings.xml
       # The POM currently skips test execution; retain its existing compile checks.
       - name: Run Maven test lifecycle
         working-directory: main/manager-api
