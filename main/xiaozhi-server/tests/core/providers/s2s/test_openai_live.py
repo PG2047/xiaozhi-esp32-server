@@ -3418,3 +3418,86 @@ def test_link_health_ping_and_window():
     assert h.window["ping_ms"] == 0 and h.session["ping_ms"] == 100
     h.sent(0.25)
     assert h.window["send_ms"] == 250 and h.session["send_ms"] == 250
+
+
+# ---------- 空闲关闭前念一句（11-07） ----------
+
+def _run_idle(scenario, bye="default", **over):
+    """空闲关闭的场景：idle_close_s 很短（第一次检查在 1 s 后），合成换成假的，不出网。bye=b"" 表示合成失败。"""
+    async def go():
+        lv = FakeLive()
+        async with serve(lv.handler, "127.0.0.1", 0) as srv:
+            url = f"ws://127.0.0.1:{srv.sockets[0].getsockname()[1]}/v1/live/sessions"
+            conn = FakeConn(asyncio.get_running_loop())
+            p = S2SProvider({"api_key": "k", "url": url, "echo_gate": False, "idle_close_s": 0.2,
+                             "end_silence_ms": 300, "wake_greeting_text": "", **over}, conn)
+            conn.s2s = p
+            pcm = (np.ones(conn.sample_rate * 3 // 10, np.int16) * 2000).tobytes() if bye == "default" else bye   # 0.3 秒
+            seen = []
+
+            async def tts(text, what):
+                seen.append(text)
+                return pcm
+            p._tts_pcm = tts
+            at_close = {}
+            orig_close = conn.close
+
+            async def close(ws=None):
+                at_close.update(states=conn.websocket.states(), frames=len(conn.websocket.frames()))
+                await orig_close(ws)
+            conn.close = close
+            await p.open()
+            await scenario(lv, conn, p, seen, at_close)
+            await p.close()
+    asyncio.run(go())
+
+
+def test_idle_close_defaults_to_30_seconds_with_a_bye():
+    async def go():
+        p = _plain_provider()
+        assert p.idle_close_s == 30 and p.idle_bye_text == "小智先退下了。"
+    asyncio.run(go())
+
+
+def test_idle_close_says_bye_and_closes_only_after_the_device_finished():
+    async def sc(lv, conn, p, seen, at_close):
+        await wait_until(lambda: conn.closed, timeout=4, what="空闲关闭")
+        assert seen == ["小智先退下了。"]
+        assert ("tts", "start") in at_close["states"] and at_close["states"][-1] == ("tts", "stop")
+        assert at_close["frames"] > 0 and at_close["frames"] == len(conn.websocket.frames())
+    _run_idle(sc)
+
+
+def test_idle_close_without_bye_text_closes_without_sound():
+    async def sc(lv, conn, p, seen, at_close):
+        await wait_until(lambda: conn.closed, timeout=4, what="空闲关闭")
+        assert seen == [] and at_close["frames"] == 0
+    _run_idle(sc, idle_bye_text="")
+
+
+def test_idle_close_still_closes_when_the_bye_could_not_be_synthesized():
+    async def sc(lv, conn, p, seen, at_close):
+        await wait_until(lambda: conn.closed, timeout=4, what="空闲关闭")
+        assert seen == ["小智先退下了。"] and at_close["frames"] == 0
+    _run_idle(sc, bye=b"")
+
+
+def test_idle_bye_that_never_finishes_playing_still_closes(monkeypatch):
+    monkeypatch.setattr(live_mod, "IDLE_BYE_MARGIN_S", 0.2)
+
+    async def sc(lv, conn, p, seen, at_close):
+        async def stuck():
+            await _real_sleep(30)       # 设备一直不回、tts stop 发不出去
+        p.speaker.end = stuck
+        await wait_until(lambda: conn.closed, timeout=4, what="限时到了照样关")
+    _run_idle(sc)
+
+
+def test_model_audio_after_idle_close_started_is_not_forwarded():
+    async def sc(lv, conn, p, seen, at_close):
+        await wait_until(lambda: p.closing, timeout=4, what="开始空闲关闭")
+        await lv.audio(5, 3000)         # 模型这时又出声
+        await wait_until(lambda: conn.closed, timeout=4, what="空闲关闭")
+        await _real_sleep(0.1)
+        assert p.stats["segments"] == 0 and at_close["states"][-1] == ("tts", "stop")
+    _run_idle(sc)

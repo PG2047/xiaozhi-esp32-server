@@ -48,6 +48,8 @@ LIVE_RATE = 16000       # 上下行都用 16 kHz（Live 支持 16 k / 24 k）
 WAKE_TRIGGER = "嘿，你好呀"
 TTS_RATE = 24000        # 固定应答文件的格式：24 kHz 16-bit 单声道，不同采样率的设备各自从它重采样
 POWER_CYCLE_NOTICE_WAIT_S = 30
+IDLE_BYE_WAIT_S = 2.5     # 空闲关闭时，下线前那句还没合成好最多等这么久（连上时就开始合成，一般早好了）
+IDLE_BYE_MARGIN_S = 3.0   # 下线前那句播放的时限：句长再加这么久（设备侧预缓冲、tts stop 前的等待）
 PHRASE_PEAK = 20000     # 固定应答统一放大到这个峰值（满量程 32767）：11-05 Edge 云希"好。"只有约 12400，MeloTTS 更轻
 PHRASE_TTS_TIMEOUT_S = 30   # 后台预取，播放那边最多只等 2.5 s，取得慢不耽误；太短会让重启后缓存还空的那批会话一直没有应答
 CONTEXT_CHUNK_CHARS = 400   # session.thinking.append 每条 content 上限 500 token，中文按 400 字切
@@ -139,7 +141,10 @@ class S2SProvider(S2SProviderBase):
         self.last_user_text = ""
         self._t_close_flag = None
         self.connect_timeout_s = float(c.get("connect_timeout_s", 4))
-        self.idle_close_s = float(c.get("idle_close_s", 45))
+        self.idle_close_s = float(c.get("idle_close_s", 30))   # 11-07 起 30 秒（原 45 秒）
+        # 空闲关闭前念一句（11-07 用户要的），设备播完再关；同唤醒应答一样用 TTS 合成后缓存，合成不出来就照旧直接关。空串关掉
+        self.idle_bye_text = str(c.get("idle_bye_text", "小智先退下了。") or "").strip()
+        self._bye_task = None
         self.speech_rms = int(c.get("speech_rms", 30))          # 下行帧 RMS 超过它算"在说话"（模型静音时发的是全零）
         self.end_silence_ms = int(c.get("end_silence_ms", 700))  # 段内连续静音这么久算一段结束
         self.log_text = bool(c.get("log_text", False))
@@ -397,6 +402,8 @@ class S2SProvider(S2SProviderBase):
             self._greeting_task = self.spawn(self._greeting_pcm())
         if self.stop_ack_text and self.stop_words:
             self._ack_task = self.spawn(self._ack_pcm())
+        if self.idle_bye_text and self.idle_close_s > 0:
+            self._bye_task = self.spawn(self._tts_pcm(self.idle_bye_text, "下线前那句"))
         self.spawn(self._rx_loop())
         if self.link_ping_s > 0:
             self.spawn(self._ping_loop())
@@ -1284,8 +1291,8 @@ class S2SProvider(S2SProviderBase):
             await self._send({"type": "response.create"})
 
     async def _on_audio(self, pcm: bytes) -> None:
-        if not pcm:
-            return
+        if not pcm or self.closing:
+            return     # 要关了（比如正在念下线前那句）：模型再出声也不转给设备，新的一段会把那句冲掉
         ms = len(pcm) / 2 / LIVE_RATE * 1000
         loud = audioop.rms(pcm, 2) > self.speech_rms
         if self._stop is not None:
@@ -1420,6 +1427,28 @@ class S2SProvider(S2SProviderBase):
         if not self.speaker.speaking and not self.in_seg and time.monotonic() - self.t_activity > self.idle_close_s:
             self.logger.bind(tag=TAG).info(f"空闲超过 {self.idle_close_s:.0f} 秒，关闭连接")
             self.closing = True
-            self.spawn(self.conn.close())
+            self.spawn(self._idle_leave())
             return
         self._arm_idle()
+
+    async def _idle_leave(self) -> None:
+        """空闲关闭：先念 idle_bye_text，等设备播完（tts stop 发出）再关。closing 已经置上，上行不再送给模型，模型的声音也不再转给设备。
+        念的时候用户开口也留不住会话。播放卡住（设备没回应）最多等这句的时长再加 IDLE_BYE_MARGIN_S，到了照样关。"""
+        pcm = b""
+        if self._bye_task is not None:
+            try:
+                pcm = await asyncio.wait_for(asyncio.shield(self._bye_task), IDLE_BYE_WAIT_S)
+            except Exception:  # noqa: BLE001  还没合成好、合成出错：不念，直接关
+                pcm = b""
+        if pcm:
+            dur = len(pcm) / 2 / self.speaker.sample_rate
+            self.logger.bind(tag=TAG).info(f"Live 下线前「{self.idle_bye_text}」{round(dur * 1000)} ms")
+            try:
+                await self.speaker.begin()
+                await self.speaker.push(pcm)
+                await asyncio.wait_for(self.speaker.end(), dur + IDLE_BYE_MARGIN_S)
+            except asyncio.TimeoutError:
+                self.logger.bind(tag=TAG).warning(f"Live 下线前那句 {dur + IDLE_BYE_MARGIN_S:.1f} s 内没播完，直接关闭")
+            except Exception as e:  # noqa: BLE001  设备连接已经断了之类：照样关
+                self.logger.bind(tag=TAG).warning(f"Live 下线前那句没播成 {type(e).__name__}")
+        self.spawn(self.conn.close())
