@@ -791,7 +791,7 @@ VLLM:
 # ##########################以下是语音进语音出（S2S）模型配置#################################
 # S2S（speech-to-speech）provider 把 VAD→ASR→LLM→TTS 中间那一格换成一个自己判轮次、自己出声、能被打断的实时语音模型。
 # 设备协议不变；工具（服务端插件 / server_mcp / 设备 MCP / MCP 接入点）照用 Intent=function_call 的统一工具处理器；
-# 转写写进对话历史，记忆模块照常保存。详见 docs/s2s-provider-integration.md。
+# 转写写进对话历史，记忆模块照常保存；建会话之前查一次记忆，拼进模型的主指令。详见 docs/s2s-provider-integration.md。
 S2S:
   OpenAIRealtime:
     type: openai_realtime
@@ -815,6 +815,10 @@ S2S:
     connect_timeout_s: 4
     # 模型最后一次真的出声回答之后多少秒没有新回答就关连接（设备回待机）；0 = 不按空闲关闭
     idle_close_s: 45
+    # 记忆（selected_module.Memory 不是 nomem 时）：建会话之前查一次，放在主指令的 <memory> 里。
+    # 查询限时（秒），超时这次会话就不带记忆；带进指令的上限（字），超了截断，0 = 不带记忆
+    memory_query_timeout_s: 0.5
+    memory_max_chars: 1200
     # 唤醒词的应答指令；留空则唤醒时不让模型开口
     wake_greeting: 用户刚叫醒你，只用两三个字回应，比如“我在”。
     # 残余回声门控：设备端 AEC 之后仍会漏一点播放回声，模型侧 VAD 会把它当成用户开口并打断自己。

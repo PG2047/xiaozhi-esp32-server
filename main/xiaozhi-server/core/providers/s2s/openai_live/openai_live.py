@@ -14,6 +14,7 @@ response.item.create(function_call_output)，这一轮的调用全部交回且 r
 设备 abort（按键 / 固件侧插话）时丢掉未发的帧，并丢弃本段剩下的音频，直到模型下一次静音再开口。
 用户这句的转写里出现停止词时（播放中、设备已经 abort、或刚停不久）进入"停下"：一直丢模型的声音，补一声缓存的"好"，直到用户再开口（见 _stop_on）。
 上行：设备 16 kHz PCM → 残余回声门控（可关，echo_gate: false）→ 直接 16 kHz 送上游。
+记忆：连接开始时取的记忆快照拼进 session.start 的主指令（memory_max_chars，见 base.with_memory）；调度指令不带。
 日志只记事件、时长、字数，不记转写正文（log_text: true 才记）；api_key 不打印。
 连接健康度（下行间隔、ping 往返等）记在会话统计里，响亮的话久没转写时打 WARNING，读法见 core/providers/s2s/link_health.py。
 """
@@ -293,9 +294,10 @@ class S2SProvider(S2SProviderBase):
     def _mutable_session(self, update: bool = False) -> dict:
         """session.start 里的指令 + delegation；update=True 时只给 delegation——session.update 不接受 instructions
         （11-02 实测 unknown_parameter: 'session.instructions'，整条更新被拒），所以 Live 主模型的指令只在建会话时定，
-        之后才挂上的 HA 设备清单等经后台模型的 instructions 带过去。"""
+        之后才挂上的 HA 设备清单等经后台模型的 instructions 带过去。
+        记忆（连接开始时取的快照）只拼进主模型的指令；签名和后台 / 调度的指令不带，它们经网关、要求指令不变。"""
         instructions = self._instructions()
-        out = {} if update else {"instructions": instructions}
+        out = {} if update else {"instructions": self.with_memory(instructions)}
         if self.tools_enabled and self.delegation_mode == "client":
             # client 模式工具清单在每次委托时现取，Live 这边没有要同步的
             self._session_sig = (instructions, tuple(sorted(t["name"] for t in self._tool_list())))
@@ -413,7 +415,8 @@ class S2SProvider(S2SProviderBase):
             f"speech_gate={'on' if self.speech_gate else 'off'} "
             f"speech_rms={self.speech_rms} end_silence_ms={self.end_silence_ms} "
             f"tools={'off' if not self.tools_enabled else len(self._session_sig[1])}@"
-            f"{self.tool_model + '(client)' if self.delegation_mode == 'client' else self.delegation_model} in {time.monotonic() - t0:.2f}s")
+            f"{self.tool_model + '(client)' if self.delegation_mode == 'client' else self.delegation_model} "
+            f"memory={self.memory_chars()}字 in {time.monotonic() - t0:.2f}s")
 
     async def _send(self, obj: dict) -> None:
         if self.ws is None:

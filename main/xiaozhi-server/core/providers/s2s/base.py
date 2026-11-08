@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import audioop
+import re
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -35,6 +36,10 @@ from core.utils.dialogue import Message
 from core.utils.status_ledger import append_session, is_server_process
 
 TAG = __name__
+
+# 记忆拼进主模型指令时的说明（和级联一样放在 <memory> 标签里，见 core/utils/dialogue.get_llm_dialogue_with_memory）
+MEMORY_HEADER = "下面是之前对话里记下的关于用户的信息，只作参考：不要主动念出来，用户问起或话题相关时再用；和用户现在说的不一样时，以现在说的为准。"
+_MEMORY_TAG = re.compile(r"<memory>.*?</memory>", re.DOTALL)
 
 
 class DeviceSpeaker:
@@ -191,6 +196,33 @@ class S2SProviderBase(ABC):
             t.cancel()
         if self.speaker is not None:
             await self.speaker.interrupt()
+
+    def with_memory(self, instructions: str) -> str:
+        """把连接开始时取的记忆快照（conn.memory_snapshot，见 connection._prepare_memory）拼进主模型的指令。
+
+        指令里有 <memory>…</memory>（增强提示词的模板带了）就填进去，没有就追加在末尾。没有快照时原样返回，
+        所以没开记忆时指令和以前逐字相同。只给主模型用：工具调度这类经网关、要求指令不变的地方别调它。
+        超过 memory_max_chars（默认 1200 字，0 = 不带记忆）就截断。日志只记长度。
+        """
+        text = str(getattr(self.conn, "memory_snapshot", None) or "").strip()
+        cap = int(self.config.get("memory_max_chars", 1200))
+        if not text or cap <= 0:
+            return instructions
+        if len(text) > cap:
+            if not getattr(self, "_memory_cut_logged", False):
+                self._memory_cut_logged = True
+                self.logger.bind(tag=TAG).warning(f"记忆 {len(text)} 字，超过 memory_max_chars={cap}，截断")
+            text = text[:cap] + "…"
+        block = f"<memory>\n{MEMORY_HEADER}\n{text}\n</memory>"
+        if _MEMORY_TAG.search(instructions or ""):
+            return _MEMORY_TAG.sub(lambda _m: block, instructions, count=1)   # 用函数替换：记忆里的反斜杠不当转义
+        return f"{instructions}\n\n{block}" if instructions else block
+
+    def memory_chars(self) -> int:
+        """这次会话带进指令的记忆字数（日志用）。"""
+        text = str(getattr(self.conn, "memory_snapshot", None) or "").strip()
+        cap = int(self.config.get("memory_max_chars", 1200))
+        return 0 if cap <= 0 else min(len(text), cap)
 
     def record_session(self, model: str, stats: dict) -> None:
         """会话结束写一行状态页台账（core/utils/status_ledger.py）。没配 log.status_dir 或不是 server 主进程就什么都不做。"""

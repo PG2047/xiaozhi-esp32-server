@@ -23,7 +23,7 @@ from core.utils.util import (
 )
 from typing import Dict, Any
 from collections import deque
-from core.utils.s2s import attach_s2s, drain_early_audio, drain_pending_to_cascade, record_cascade_session, s2s_buffer_early_audio
+from core.utils.s2s import attach_s2s, drain_early_audio, drain_pending_to_cascade, record_cascade_session, s2s_buffer_early_audio, s2s_selected
 from core.utils.device_overrides import apply_device_overrides
 from core.utils.modules_initialize import (
     initialize_modules,
@@ -627,6 +627,9 @@ class ConnectionHandler:
 
     def _initialize_components(self):
         try:
+            if not self.need_bind:
+                # 记忆先于 S2S 建会话：Live 的主指令只在建会话时定、之后改不了，所以记忆要在 open() 之前就绪
+                self._prepare_memory()
             if self.s2s is None:
                 self.s2s = attach_s2s(self)  # 选中 S2S 且上游会话建成则接管音频，不建 TTS / ASR；失败返回 None 走级联
             if self.tts is None and self.s2s is None:
@@ -668,8 +671,7 @@ class ConnectionHandler:
                     self.asr.open_audio_channels(self), self.loop
                 )
 
-            """加载记忆"""
-            self._initialize_memory()
+            """加载记忆：已在 attach_s2s 之前完成（_prepare_memory）"""
             """加载意图识别"""
             self._initialize_intent()
             """初始化上报线程"""
@@ -986,7 +988,40 @@ class ConnectionHandler:
         if modules.get("memory", None) is not None:
             self.memory = modules["memory"]
 
+    def _prepare_memory(self):
+        """初始化记忆；选了 S2S 时再取一份记忆快照（conn.memory_snapshot），provider 建会话时拼进主模型指令。
+
+        S2S 不走 chat()，没有每轮查记忆的机会，所以在会话开始查一次。取快照限时 memory_query_timeout_s（S2S 配置块，
+        默认 0.5 秒）：超时、出错、没有记忆都记 None，这次会话不带记忆，不耽误建会话。没选 S2S 的连接不查（级联每轮自己查）。
+        """
+        t0 = time.monotonic()
+        self.memory_snapshot = None
+        try:
+            self._initialize_memory()
+        except Exception as e:  # noqa: BLE001  记忆坏了不能连累对话：现在它排在建会话之前，出错就这条连接不用记忆
+            self.logger.bind(tag=TAG).error(f"初始化记忆失败，这条连接不用记忆: {type(e).__name__}: {e}")
+            self.memory = None
+            return
+        if self.memory is None or not s2s_selected(self):
+            return
+        block = (self.config.get("S2S") or {}).get((self.config.get("selected_module") or {}).get("S2S")) or {}
+        fut = None
+        try:
+            fut = asyncio.run_coroutine_threadsafe(self.memory.query_memory(""), self.loop)
+            text = fut.result(timeout=float(block.get("memory_query_timeout_s", 0.5)))
+        except Exception as e:  # noqa: BLE001
+            if fut is not None:
+                fut.cancel()
+            self.logger.bind(tag=TAG).warning(f"S2S 取记忆失败（{type(e).__name__}），这次会话不带记忆")
+            return
+        self.memory_snapshot = text.strip() if isinstance(text, str) and text.strip() else None
+        # 只记长度，不记内容
+        self.logger.bind(tag=TAG).info(
+            f"S2S 记忆快照 {len(self.memory_snapshot or '')} 字，{round(1000 * (time.monotonic() - t0))} ms")
+
     def _initialize_memory(self):
+        if getattr(self, "memory_disabled", False):
+            self.memory = None    # 登记表 memory: false：这条连接不带记忆、不存记忆（只影响这条连接）
         if self.memory is None:
             return
         # 服务启动时建的记忆实例是所有连接共用的（websocket_server.py），init_memory 会改它的 role_id 和记忆内容：
