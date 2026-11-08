@@ -154,3 +154,24 @@ def test_loading_does_not_wait_for_a_running_summary(tmp_path):
     took = time.monotonic() - t0
     t.join(5)
     assert other.short_memory == '{"b": 1}' and took < 0.5
+
+
+def test_two_summaries_of_one_device_run_one_after_another(tmp_path):
+    """同一台设备两段会话挨得很近、两次总结同时在跑：后一次要以前一次的结果为历史，
+    不能两次都从旧记忆出发、后写的把先写的冲掉（总结全程持锁管的就是这个）。"""
+    path = tmp_path / "m.yaml"
+    replies, lock = iter(['{"第": 1}', '{"第": 2}']), threading.Lock()
+
+    def reply(_user):
+        with lock:
+            return next(replies)
+
+    llm = FakeLLM(reply, delay=0.2)
+    p1, p2 = _provider(path, "dev-a", llm), _provider(path, "dev-a", llm)
+    ts = [threading.Thread(target=lambda p=p: asyncio.run(p.save_memory(_talk(), "s"))) for p in (p1, p2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(5)
+    assert len(llm.inputs) == 2 and '{"第": 1}' in llm.inputs[1]
+    assert _read(path) == {"dev-a": '{"第": 2}'}
