@@ -125,3 +125,11 @@ def test_memory_keeps_only_real_turns():
 
 def test_memory_needs_a_reply():
     assert dialogue_for_memory([Message(role="user", content="记住我喜欢芒果")]) == []
+
+
+def test_memory_drops_tool_calls_and_results():
+    msgs = [Message(role="user", content="把灯关了"),
+            Message(role="assistant", tool_calls=[{"id": "c1", "function": {"name": "x", "arguments": "{}"}}]),
+            Message(role="tool", content="ok", tool_call_id="c1"),
+            Message(role="assistant", content="关好了")]
+    assert [(m.role, m.content) for m in dialogue_for_memory(msgs)] == [("user", "把灯关了"), ("assistant", "关好了")]

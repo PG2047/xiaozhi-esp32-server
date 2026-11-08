@@ -29,18 +29,19 @@ WAKE_GREETING_QUERY = "嘿，你好呀"
 def dialogue_for_memory(messages, ignore_user_texts=()) -> List[Message]:
     """挑出交给记忆总结的消息。
 
-    去掉系统提示词和 few-shot 示例（is_temporary，function_call 模式每条连接都会注入"给我讲个故事吧""拜拜"），
+    只留有内容的用户和助手消息，去掉系统提示词、工具调用和结果、few-shot 示例（is_temporary，function_call 模式每条连接都会注入"给我讲个故事吧""拜拜"），
     也去掉唤醒时自动发的那句和唤醒词本身。剩下的里面没有真实的用户发言、或者没有有内容的助手回复，就返回空列表：
     这次不总结（只唤醒不说话的会话不该花一次总结请求）。
     """
     ignore = {WAKE_GREETING_QUERY, *(str(t).strip() for t in ignore_user_texts if t)}
+    # 只留有内容的用户和助手消息：工具调用那条助手消息没有 content（总结里会变成一行 "Assistant: None"），工具结果也不交
     msgs = [
         m for m in messages
-        if not m.is_temporary and m.role != "system"
-        and not (m.role == "user" and (m.content or "").strip() in ignore)
+        if not m.is_temporary and m.role in ("user", "assistant") and (m.content or "").strip()
+        and not (m.role == "user" and m.content.strip() in ignore)
     ]
-    has_user = any(m.role == "user" and (m.content or "").strip() for m in msgs)
-    has_reply = any(m.role == "assistant" and (m.content or "").strip() for m in msgs)
+    has_user = any(m.role == "user" for m in msgs)
+    has_reply = any(m.role == "assistant" for m in msgs)
     return msgs if has_user and has_reply else []
 
 
