@@ -31,6 +31,7 @@ devices:
     prompt: 你是书房的语音助手。   # 非空则替换全局 prompt
     llm: null                   # 非空且在 LLM 配置块里存在 → 这台设备用它
     tts: null                   # 同上
+    memory: true                # false = 这台设备不带记忆、也不存记忆（只影响它的连接；跑批量测试前关掉，免得测试对话进日常记忆）
     s2s:                        # 按设备覆盖所选 S2S 配置块里的项（标量；只对这条连接生效；brain 是级联时忽略）
       echo_gate: false          #   例：自带 AEC 的 DSP 板关掉服务端回声门控——本地插话依赖门控判决，会一起关掉
       vad_threshold: 0.6        #   例：电视旁边的设备把模型侧 VAD 门槛调高

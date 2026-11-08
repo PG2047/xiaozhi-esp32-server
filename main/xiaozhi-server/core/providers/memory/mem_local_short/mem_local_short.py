@@ -2,6 +2,7 @@ from ..base import MemoryProviderBase, logger
 import time
 import json
 import os
+import threading
 import yaml
 from config.config_loader import get_project_dir
 from config.manage_api_client import generate_and_save_chat_summary
@@ -94,12 +95,20 @@ def extract_json_data(json_code):
 
 TAG = __name__
 
+# 所有设备的记忆存在同一个 YAML 里，写（读-改-写）必须串行：不然两台设备同时断开时，后写的会把先写的那台冲掉。
+# 可重入锁：save_memory 持锁期间会调 save_memory_to_file，后者单独被调用时也要加锁。
+# 只读不加锁：写是临时文件 + 整体替换，读到的总是完整的旧文件或新文件。新连接在建会话之前就要读记忆，
+# 而 save_memory 会持锁等几秒的总结请求，读也排队的话，刚断开又唤醒（或另一台设备这时连上）就要多等这几秒。
+_FILE_LOCK = threading.RLock()
+
 
 class MemoryProvider(MemoryProviderBase):
     def __init__(self, config, summary_memory):
         super().__init__(config)
         self.short_memory = ""
         self.save_to_file = True
+        # 总结用的系统提示词：配置里写了 summary_prompt 就用它，不写用上面的默认提示词。输出必须是 JSON（保存前会校验）
+        self.summary_prompt = str((config or {}).get("summary_prompt") or "").strip() or short_term_memory_prompt
         self.memory_path = get_project_dir() + "data/.memory.yaml"
         self.load_memory(summary_memory)
 
@@ -116,37 +125,75 @@ class MemoryProvider(MemoryProviderBase):
             self.short_memory = summary_memory
             return
 
-        all_memory = {}
+        all_memory = self._read_all()   # 不加锁，见 _FILE_LOCK 的注释
+        # 文件里没有这台设备就从空开始，不沿用这个实例之前装过的记忆
+        self.short_memory = all_memory.get(self.role_id) or "" if self.role_id else ""
+
+    def _read_all(self):
         if os.path.exists(self.memory_path):
             with open(self.memory_path, "r", encoding="utf-8") as f:
-                all_memory = yaml.safe_load(f) or {}
-        if self.role_id in all_memory:
-            self.short_memory = all_memory[self.role_id]
+                return yaml.safe_load(f) or {}
+        return {}
 
     def save_memory_to_file(self):
-        all_memory = {}
-        if os.path.exists(self.memory_path):
-            with open(self.memory_path, "r", encoding="utf-8") as f:
-                all_memory = yaml.safe_load(f) or {}
-        all_memory[self.role_id] = self.short_memory
-        with open(self.memory_path, "w", encoding="utf-8") as f:
-            yaml.dump(all_memory, f, allow_unicode=True)
+        with _FILE_LOCK:
+            all_memory = self._read_all()
+            all_memory[self.role_id] = self.short_memory
+            # 先写临时文件再整体替换：写到一半进程被杀时，原文件还是完整的
+            tmp_path = f"{self.memory_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                yaml.dump(all_memory, f, allow_unicode=True)
+            os.replace(tmp_path, self.memory_path)
 
     async def save_memory(self, msgs, session_id=None):
         # 打印使用的模型信息
         model_info = getattr(self.llm, "model_name", str(self.llm.__class__.__name__))
         logger.bind(tag=TAG).debug(f"使用记忆保存模型: {model_info}")
-        api_key = getattr(self.llm, "api_key", None)
-        memory_key_msg = check_model_key("记忆总结专用LLM", api_key)
-        if memory_key_msg:
-            logger.bind(tag=TAG).error(memory_key_msg)
         if self.llm is None:
             logger.bind(tag=TAG).error("LLM is not set for memory provider")
             return None
+        memory_key_msg = check_model_key("记忆总结专用LLM", str(getattr(self.llm, "api_key", "") or ""))
+        if memory_key_msg:
+            logger.bind(tag=TAG).error(memory_key_msg)
 
         if len(msgs) < 2:
             return None
 
+        if not self.save_to_file:
+            # 当save_to_file为False时，调用Java端的聊天记录总结接口
+            summary_id = session_id if session_id else self.role_id
+            await generate_and_save_chat_summary(summary_id)
+            logger.bind(tag=TAG).info("Save memory successful - chat summary requested")
+            return self.short_memory
+
+        # 从重读文件、调总结到写回一直持有锁（中间是几秒的网络请求，中途放锁重读就白做了）：
+        # 同一台设备两段会话挨得很近、上一次总结还没写完时，这一次以文件里最新的记忆为"历史记忆"，不会把上一次的更新冲掉。
+        # 总结都在连接关闭后的后台线程里跑，一天几十次，串行没有代价。
+        with _FILE_LOCK:
+            latest = self._read_all().get(self.role_id)
+            if latest:
+                self.short_memory = latest
+            msgStr = self._summary_input(msgs)
+            try:
+                result = self.llm.response_no_stream(
+                    self.summary_prompt,
+                    msgStr,
+                    max_tokens=2000,
+                    temperature=0.2,
+                )
+                json_str = extract_json_data(result)
+                json.loads(json_str)  # 检查json格式是否正确
+                self.short_memory = json_str
+                self.save_memory_to_file()
+            except Exception as e:
+                logger.bind(tag=TAG).error(f"Error in saving memory: {e}")
+                return self.short_memory
+        # 不记 role_id：它是设备 MAC，日志里不出现设备身份
+        logger.bind(tag=TAG).info(f"Save memory successful - {len(self.short_memory or '')} chars")
+
+        return self.short_memory
+
+    def _summary_input(self, msgs) -> str:
         msgStr = ""
         for msg in msgs:
             content = msg.content
@@ -172,30 +219,7 @@ class MemoryProvider(MemoryProviderBase):
         # 当前时间
         time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         msgStr += f"当前时间：{time_str}"
-
-        if self.save_to_file:
-            try:
-                result = self.llm.response_no_stream(
-                    short_term_memory_prompt,
-                    msgStr,
-                    max_tokens=2000,
-                    temperature=0.2,
-                )
-                json_str = extract_json_data(result)
-                json.loads(json_str)  # 检查json格式是否正确
-                self.short_memory = json_str
-                self.save_memory_to_file()
-            except Exception as e:
-                logger.bind(tag=TAG).error(f"Error in saving memory: {e}")
-        else:
-            # 当save_to_file为False时，调用Java端的聊天记录总结接口
-            summary_id = session_id if session_id else self.role_id
-            await generate_and_save_chat_summary(summary_id)
-        logger.bind(tag=TAG).info(
-            f"Save memory successful - Role: {self.role_id}, Session: {session_id}"
-        )
-
-        return self.short_memory
+        return msgStr
 
     async def query_memory(self, query: str) -> str:
         return self.short_memory

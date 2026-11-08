@@ -194,7 +194,7 @@ class S2SProvider(S2SProviderBase):
             audio_in["noise_reduction"] = {"type": self.noise_reduction}
         return {
             "type": "realtime",
-            "instructions": instructions,
+            "instructions": self.with_memory(instructions),   # 记忆快照拼进主指令；签名不带（会话内不变）
             "tools": tools,
             "tool_choice": "auto",
             "output_modalities": ["audio"],
@@ -231,7 +231,7 @@ class S2SProvider(S2SProviderBase):
             f"Realtime 会话已建立 model={self.model} turn={self.turn_detection_type} "
             f"echo_gate={'on' if self.gate else 'off'} noise_reduction={self.noise_reduction or 'off'} "
             f"local_barge_frames={self.local_barge_frames} lag_prior_ms={self.lag_prior_ms}{'(记忆)' if self.lag_prior_remembered else ''} "
-            f"lag_max_ms={self.lag_max_ms} in {time.monotonic() - t0:.2f}s")
+            f"lag_max_ms={self.lag_max_ms} memory={self.memory_chars()}字 in {time.monotonic() - t0:.2f}s")
 
     def after_components_ready(self) -> None:
         asyncio.run_coroutine_threadsafe(self._after_ready(), self.conn.loop)

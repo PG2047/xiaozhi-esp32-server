@@ -106,3 +106,12 @@ def test_device_name_comes_from_registry(tmp_path):
     unknown = Conn("aa:bb:cc:dd:ee:99", str(p))
     apply_device_overrides(unknown)
     assert not hasattr(unknown, "device_name")
+
+
+def test_memory_false_marks_the_connection(tmp_path):
+    p = tmp_path / "devices.yaml"
+    p.write_text('version: 1\ndevices:\n  "aa:bb:cc:dd:ee:09": {name: m, memory: false}\n'
+                 '  "aa:bb:cc:dd:ee:0a": {name: n, memory: true}\n', encoding="utf-8")
+    off, on = Conn("aa:bb:cc:dd:ee:09", str(p)), Conn("aa:bb:cc:dd:ee:0a", str(p))
+    assert apply_device_overrides(off) == {"memory": False} and off.memory_disabled is True
+    assert apply_device_overrides(on) == {} and not getattr(on, "memory_disabled", False)

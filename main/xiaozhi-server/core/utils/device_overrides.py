@@ -16,6 +16,7 @@ devices:
     prompt: null                # 非空则替换 config["prompt"]
     llm: null                   # 非空且在 LLM 配置块里存在 → selected_module.LLM
     tts: null                   # 同上，TTS
+    memory: true                # false = 这台设备的连接不带记忆、也不存记忆（跑批量测试前关掉，免得测试对话进日常记忆）
     s2s:                        # 按设备覆盖所选 S2S 配置块里的项（只对这条连接生效；brain 是级联时忽略）
       echo_gate: false          #   例：DSP 板自带 AEC 的设备关掉服务端回声门控（本地插话依赖门控判决，会一起关掉）
       vad_threshold: 0.6        #   例：电视旁边的设备把模型侧 VAD 门槛调高
@@ -103,6 +104,10 @@ def apply_device_overrides(conn) -> dict:
                     applied[section] = name
                 else:
                     conn.logger.bind(tag=TAG).warning(f"设备覆盖的 {key}={name} 不在 {section} 配置块里，忽略")
+
+        if info.get("memory") is False:
+            conn.memory_disabled = True     # connection._initialize_memory 据此把这条连接的记忆置空
+            applied["memory"] = False
 
         s2s_over = info.get("s2s")
         if isinstance(s2s_over, dict) and s2s_over:

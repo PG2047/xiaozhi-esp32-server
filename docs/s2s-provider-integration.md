@@ -18,6 +18,7 @@
 设备 Opus ──▶ connection._route_message 解成 PCM ──▶ provider.on_pcm ──▶（残余回声门控）──▶ 16 k → 24 k ──▶ 模型
 模型音频  ──▶ provider ──▶ 24 kHz 60 ms Opus ──▶ 上游节拍器 sendAudio ──▶ 设备（tts start / sentence_start / stop 照发）
 模型转写  ──▶ stt / tts sentence_start 给设备显示；写进 conn.dialogue，连接关闭时由记忆模块照常保存
+记忆      ──▶ 建会话之前查一次（connection._prepare_memory），拼进模型的主指令（S2SProviderBase.with_memory）
 工具      ──▶ Intent=function_call 的统一工具处理器（服务端插件 / server_mcp / 设备 MCP / MCP 接入点）
 打断      ──▶ 设备 abort、模型侧 VAD 检到用户开口、本地门控连续几帧判为人声 → handleAbortMessage → provider.cancel
             （丢掉未发的帧、取消模型回复、把模型上下文截到设备实际播到的位置）

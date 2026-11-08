@@ -81,3 +81,55 @@ async def test_get_llm_dialogue_separates_temporary_few_shot_from_actual_history
     contents = [m["content"] for m in msgs if m["role"] == "user"]
     assert "real user msg" in contents
     assert "fewshot example" in contents
+
+# ---------- dialogue_for_memory：交给记忆总结的消息 ----------
+from core.utils.dialogue import WAKE_GREETING_QUERY, dialogue_for_memory  # noqa: E402
+
+
+def _fewshot():
+    return [
+        Message(role="user", content="给我讲个故事吧", is_temporary=True),
+        Message(role="tool", content="已直接回复", is_temporary=True, tool_call_id="x"),
+        Message(role="user", content="拜拜", is_temporary=True),
+        Message(role="assistant", content="再见，下次再聊~", is_temporary=True),
+    ]
+
+
+def test_memory_skips_session_with_only_fewshot_and_wake_reply():
+    msgs = [Message(role="system", content="你是小智")] + _fewshot()
+    msgs.append(Message(role="assistant", content="我在这里哦！"))   # 唤醒应答缓存命中时只有这一条
+    assert dialogue_for_memory(msgs) == []
+
+
+def test_memory_skips_session_with_only_the_wake_greeting():
+    msgs = _fewshot() + [Message(role="user", content=WAKE_GREETING_QUERY),
+                         Message(role="assistant", content="你好呀，有什么可以帮你？")]
+    assert dialogue_for_memory(msgs) == []
+
+
+def test_memory_ignores_configured_wake_words():
+    msgs = [Message(role="user", content="你好小智"), Message(role="assistant", content="我在")]
+    assert dialogue_for_memory(msgs, ["你好小智"]) == []
+
+
+def test_memory_keeps_only_real_turns():
+    real_u = Message(role="user", content="记住，我最喜欢的水果是芒果")
+    real_a = Message(role="assistant", content="记住啦")
+    msgs = [Message(role="system", content="你是小智")] + _fewshot() + [
+        Message(role="user", content=WAKE_GREETING_QUERY), Message(role="assistant", content="你好呀"), real_u, real_a]
+    out = dialogue_for_memory(msgs)
+    assert real_u in out and real_a in out
+    assert all(not m.is_temporary and m.role != "system" for m in out)
+    assert all(m.content != WAKE_GREETING_QUERY for m in out)
+
+
+def test_memory_needs_a_reply():
+    assert dialogue_for_memory([Message(role="user", content="记住我喜欢芒果")]) == []
+
+
+def test_memory_drops_tool_calls_and_results():
+    msgs = [Message(role="user", content="把灯关了"),
+            Message(role="assistant", tool_calls=[{"id": "c1", "function": {"name": "x", "arguments": "{}"}}]),
+            Message(role="tool", content="ok", tool_call_id="c1"),
+            Message(role="assistant", content="关好了")]
+    assert [(m.role, m.content) for m in dialogue_for_memory(msgs)] == [("user", "把灯关了"), ("assistant", "关好了")]
