@@ -33,7 +33,7 @@ from core.utils.modules_initialize import (
 from core.handle.reportHandle import report, enqueue_tool_report
 from core.providers.tts.default import DefaultTTS
 from concurrent.futures import ThreadPoolExecutor
-from core.utils.dialogue import Message, Dialogue
+from core.utils.dialogue import Message, Dialogue, dialogue_for_memory
 from core.providers.asr.dto.dto import InterfaceType
 from core.handle.textHandle import handleTextMessage
 from core.providers.tools.unified_tool_handler import UnifiedToolHandler
@@ -309,7 +309,12 @@ class ConnectionHandler:
                 threading.Thread(target=generate_title_task, daemon=True).start()
 
             # 守护线程2：走老流程记忆保存（仅记忆，不含标题）
-            if self.memory:
+            # 只交真实对话：few-shot 示例、唤醒自动发的那句不算；没说话的会话不总结
+            memory_msgs = (
+                dialogue_for_memory(self.dialogue.dialogue, self.config.get("wakeup_words") or ())
+                if self.memory else []
+            )
+            if memory_msgs:
                 # 使用线程池异步保存记忆
                 def save_memory_task():
                     try:
@@ -318,7 +323,7 @@ class ConnectionHandler:
                         asyncio.set_event_loop(loop)
                         loop.run_until_complete(
                             self.memory.save_memory(
-                                self.dialogue.dialogue, self.session_id
+                                memory_msgs, self.session_id
                             )
                         )
                     except Exception as e:
@@ -984,6 +989,10 @@ class ConnectionHandler:
     def _initialize_memory(self):
         if self.memory is None:
             return
+        # 服务启动时建的记忆实例是所有连接共用的（websocket_server.py），init_memory 会改它的 role_id 和记忆内容：
+        # 两台设备先后在线时，先连的那台断开时会把总结存到后连那台名下、还把那台的历史揉进去。
+        # 这里按连接浅拷贝一份再初始化（智控台差异化配置本来就按连接新建实例）；浅拷贝不重新构造，不读文件、不建客户端。
+        self.memory = copy.copy(self.memory)
         """初始化记忆模块"""
         self.memory.init_memory(
             role_id=self.device_id,
