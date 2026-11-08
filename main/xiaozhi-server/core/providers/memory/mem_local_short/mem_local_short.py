@@ -95,8 +95,10 @@ def extract_json_data(json_code):
 
 TAG = __name__
 
-# 所有设备的记忆存在同一个 YAML 里，读-改-写必须串行：不然两台设备同时断开时，后写的会把先写的那台冲掉。
+# 所有设备的记忆存在同一个 YAML 里，写（读-改-写）必须串行：不然两台设备同时断开时，后写的会把先写的那台冲掉。
 # 可重入锁：save_memory 持锁期间会调 save_memory_to_file，后者单独被调用时也要加锁。
+# 只读不加锁：写是临时文件 + 整体替换，读到的总是完整的旧文件或新文件。新连接在建会话之前就要读记忆，
+# 而 save_memory 会持锁等几秒的总结请求，读也排队的话，刚断开又唤醒（或另一台设备这时连上）就要多等这几秒。
 _FILE_LOCK = threading.RLock()
 
 
@@ -123,8 +125,7 @@ class MemoryProvider(MemoryProviderBase):
             self.short_memory = summary_memory
             return
 
-        with _FILE_LOCK:
-            all_memory = self._read_all()
+        all_memory = self._read_all()   # 不加锁，见 _FILE_LOCK 的注释
         # 文件里没有这台设备就从空开始，不沿用这个实例之前装过的记忆
         self.short_memory = all_memory.get(self.role_id) or "" if self.role_id else ""
 

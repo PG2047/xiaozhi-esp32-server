@@ -139,3 +139,18 @@ def test_default_summary_prompt_when_not_configured():
 
     assert MemoryProvider({}, None).summary_prompt == short_term_memory_prompt
     assert MemoryProvider({"summary_prompt": ""}, None).summary_prompt == short_term_memory_prompt
+
+
+def test_loading_does_not_wait_for_a_running_summary(tmp_path):
+    """新连接在建会话之前读记忆；另一条连接正在总结（持锁等几秒的请求）时，读不能跟着排队，不然唤醒应答要多等这几秒。"""
+    path = tmp_path / "m.yaml"
+    path.write_text(yaml.dump({"dev-b": '{"b": 1}'}), encoding="utf-8")
+    slow = _provider(path, "dev-a", FakeLLM(delay=1.0))
+    t = threading.Thread(target=lambda: asyncio.run(slow.save_memory(_talk(), "s")))
+    t.start()
+    time.sleep(0.1)                         # 让它先拿到锁、进入总结
+    t0 = time.monotonic()
+    other = _provider(path, "dev-b")
+    took = time.monotonic() - t0
+    t.join(5)
+    assert other.short_memory == '{"b": 1}' and took < 0.5
