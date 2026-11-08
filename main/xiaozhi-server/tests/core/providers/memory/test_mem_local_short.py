@@ -117,3 +117,25 @@ def test_success_log_has_no_device_id(tmp_path):
         logger.remove(hid)
     assert any("Save memory successful" in s for s in seen)
     assert not any("aa:bb:cc:dd:ee:ff" in s for s in seen)
+
+
+def test_summary_prompt_from_config_is_used(tmp_path):
+    seen = []
+
+    class RecordingLLM(FakeLLM):
+        def response_no_stream(self, system_prompt, user_prompt, **kwargs):
+            seen.append(system_prompt)
+            return '{"k": "v"}'
+
+    p = MemoryProvider({"summary_prompt": "  只记用户本人的稳定信息，只输出 JSON。  "}, None)
+    p.memory_path = str(tmp_path / "m.yaml")
+    p.init_memory("dev-a", RecordingLLM())
+    asyncio.run(p.save_memory(_talk(), "s"))
+    assert seen == ["只记用户本人的稳定信息，只输出 JSON。"]
+
+
+def test_default_summary_prompt_when_not_configured():
+    from core.providers.memory.mem_local_short.mem_local_short import short_term_memory_prompt
+
+    assert MemoryProvider({}, None).summary_prompt == short_term_memory_prompt
+    assert MemoryProvider({"summary_prompt": ""}, None).summary_prompt == short_term_memory_prompt

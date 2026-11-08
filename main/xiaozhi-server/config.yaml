@@ -363,6 +363,9 @@ Memory:
     # 如果这里不填，则会默认使用selected_module.LLM的模型作为意图识别的思考模型
     # 如果你的不想使用selected_module.LLM记忆存储，这里最好使用独立的LLM作为意图识别，例如使用免费的ChatGLMLLM
     llm: ChatGLMLLM
+    # 总结用的提示词（可选）：不填用内置的默认提示词。自己写时要让模型只输出 JSON（保存前会校验，不是 JSON 就不保存）
+    # summary_prompt: |
+    #   根据对话记录更新关于用户的长期记忆……只输出 JSON。
 
 ASR:
   FunASR:

@@ -105,6 +105,8 @@ class MemoryProvider(MemoryProviderBase):
         super().__init__(config)
         self.short_memory = ""
         self.save_to_file = True
+        # 总结用的系统提示词：配置里写了 summary_prompt 就用它，不写用上面的默认提示词。输出必须是 JSON（保存前会校验）
+        self.summary_prompt = str((config or {}).get("summary_prompt") or "").strip() or short_term_memory_prompt
         self.memory_path = get_project_dir() + "data/.memory.yaml"
         self.load_memory(summary_memory)
 
@@ -173,7 +175,7 @@ class MemoryProvider(MemoryProviderBase):
             msgStr = self._summary_input(msgs)
             try:
                 result = self.llm.response_no_stream(
-                    short_term_memory_prompt,
+                    self.summary_prompt,
                     msgStr,
                     max_tokens=2000,
                     temperature=0.2,
