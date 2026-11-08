@@ -926,7 +926,7 @@ def test_client_delegation_long_arguments_are_left_out_of_the_handback():
         await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d1", "target": "client"}})
         await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
         m = [m for m in lv.received if m["type"] == "session.commentary.append"][0]
-        assert "（参数 略）" in m["content"] and "async function" not in m["content"] and m["content"].endswith("结果：客厅灯已打开")
+        assert '"code": "略"' in m["content"] and "async function" not in m["content"] and m["content"].endswith("结果：客厅灯已打开")
     _run_client(sc)
 
     async def sc2(lv, conn, p):
@@ -937,6 +937,16 @@ def test_client_delegation_long_arguments_are_left_out_of_the_handback():
         await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
         assert "async function" in [m for m in lv.received if m["type"] == "session.commentary.append"][0]["content"]
     _run_client(sc2, tool_handback_max_args=10000)   # 调大上限：和以前一样带上全部参数
+
+
+def test_handback_args_keeps_short_fields():
+    async def sc(lv, conn, p):
+        ha = json.dumps({"entity_id": "light.opple_cn_1234567890_xxd_s_2_light", "state": {"type": "brightness_value", "input": 50}})
+        assert len(ha) > 80 and p._handback_args(ha) == ha                    # 整段长但字段都短：原样
+        out = json.loads(p._handback_args(json.dumps({"code": "x" * 200, "intent": "查比特币"})))
+        assert out == {"code": "略", "intent": "查比特币"}
+        assert p._handback_args("not json") == "not json" and p._handback_args("y" * 200) == "略"
+    _run_client(sc)
 
 
 def test_dispatch_hints_appended_only_when_configured():
