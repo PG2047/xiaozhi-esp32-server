@@ -38,7 +38,9 @@ async def connect_mcp_endpoint(mcp_endpoint_url: str, conn=None) -> MCPEndpointC
         return mcp_client
 
     except Exception as e:
-        logger.bind(tag=TAG).error(f"连接MCP接入点失败: {e}")
+        from core.utils.util import mask_endpoint_error
+
+        logger.bind(tag=TAG).error(f"连接MCP接入点失败: {type(e).__name__}: {mask_endpoint_error(e)}")
         return None
 
 

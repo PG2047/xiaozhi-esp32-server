@@ -645,6 +645,27 @@ def sanitize_tool_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_\-\u4e00-\u9fff]", "_", name)
 
 
+def mask_endpoint_url(url) -> str:
+    """接入点地址打日志用：去掉查询串（里面是 token）和用户名密码，只留协议、主机、端口、路径。
+
+    接入点的 token 不过期，拿到就能以小智端调工具、以工具端往清单里塞工具，所以不能进日志。
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(str(url))
+    except ValueError:
+        return "<接入点地址>"
+    netloc = parts.netloc.rsplit("@", 1)[-1]
+    masked = urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    return masked + ("?…" if parts.query else "")
+
+
+def mask_endpoint_error(err) -> str:
+    """异常说明里可能带着完整地址（比如 websockets 的 InvalidURI），把 token= 后面的值换掉。"""
+    return re.sub(r"(token=)[^&\s'\"]+", r"\1***", str(err))
+
+
 def validate_mcp_endpoint(mcp_endpoint: str) -> bool:
     """
     校验MCP接入点格式
