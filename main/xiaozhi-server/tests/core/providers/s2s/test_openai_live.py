@@ -1331,6 +1331,44 @@ def test_think_tool_only_when_configured():
     _run_client(sc2, **THINK_CFG)
 
 
+class _NewsClockFuncHandler:
+    """清单里除了设备工具，还有新闻插件和 MCP 时区工具（名字和线上一致）。"""
+
+    def __init__(self, names):
+        self.names = names
+
+    def get_functions(self):
+        return [{"type": "function", "function": {"name": n, "description": n, "parameters": {"type": "object", "properties": {}}}}
+                for n in ["hass_state", *self.names]]
+
+
+def test_dispatch_division_only_when_news_or_clock_tools_exist():
+    """没有新闻、时区工具时调度说明逐字不变；有新闻工具时新闻不再交给 think_deeper，有时区工具时别的城市几点用它。"""
+    async def sc(lv, conn, p):
+        plain = p._dispatch_instructions()
+        assert "要查最新信息（行情、新闻、比赛结果这类）" in plain and "新闻工具" not in plain and "IANA" not in plain
+
+        conn.func_handler = _NewsClockFuncHandler(["get_news_from_chinanews"])
+        d = p._dispatch_instructions()
+        assert "要查最新信息（行情、比赛结果、某件事的最新进展这类）" in d
+        assert "用 get_news_from_chinanews，不要交给 think_deeper" in d and "IANA" not in d
+
+        conn.func_handler = _NewsClockFuncHandler(["get_current_time", "convert_time"])
+        d = p._dispatch_instructions()
+        assert "用 get_current_time / convert_time，时区填 IANA 名称" in d and "新闻工具" not in d
+        assert "要查最新信息（行情、新闻、比赛结果这类）" in d
+    _run_client(sc, **THINK_CFG)
+
+
+def test_dispatch_division_without_think_model_does_not_mention_it():
+    async def sc(lv, conn, p):
+        conn.func_handler = _NewsClockFuncHandler(["get_news_from_chinanews", "convert_time"])
+        d = p._dispatch_instructions()
+        assert "think_deeper" not in d
+        assert "用 get_news_from_chinanews。" in d and "用 convert_time，时区填 IANA 名称" in d
+    _run_client(sc)
+
+
 def test_think_goes_to_think_model_with_search_and_hands_answer_back(monkeypatch):
     import aiohttp
     gw = _FakeGateway(_think_reply("BTC 约八万美元[[1]](https://example.com/a)，**涨了一点**。<|eos|>"))

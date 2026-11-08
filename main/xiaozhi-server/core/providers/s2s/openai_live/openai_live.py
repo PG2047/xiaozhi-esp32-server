@@ -802,7 +802,10 @@ class S2SProvider(S2SProviderBase):
     # ---------- 工具（client delegation：自己选工具） ----------
     def _dispatch_instructions(self) -> str:
         # HA 意图工具的填法规则 + 智能设备列表以外的设备名单（decisions 和小模型都看；Live 主模型的指令里没有）
-        ha = ha_names.dispatch_text(self._tool_list(), self._ha_entries, self.ha_names_domains) if self.ha_names else ""
+        tools = self._tool_list()
+        ha = ha_names.dispatch_text(tools, self._ha_entries, self.ha_names_domains) if self.ha_names else ""
+        news, extra = self._tool_division({t.get("name") for t in tools})
+        latest = "行情、比赛结果、某件事的最新进展这类" if news else "行情、新闻、比赛结果这类"
         return (f"{self._instructions()}\n\n你现在是小智的工具调度：根据对话里用户最后一句话决定调用哪个工具。"
                 # 11-05 模拟："把甲地的灯都关了""把乙地的灯也都关了"，小模型看不到上一次委托的工具记录，以为上文没真做，把甲地的灯又调了一遍，还"更正"说没关成
                 "对话记录里只有说过的话，看不到之前的工具记录：小智上文说已经做了的事都做过了，不要重做，也不要更正，除非用户最后一句要求。"
@@ -811,9 +814,23 @@ class S2SProvider(S2SProviderBase):
                 "“停一下”“等一下”“别说了”只是让小智先停下，不是结束对话，不要调用 handle_exit_intent；只有用户明确告别（再见、拜拜、没事了）才结束对话。"
                 "拿到工具结果后用一两句中文说出结论；不需要工具就直接用一句话回答。"
                 # 11-05 真机：问 BTC 行情时小模型手边没有工具，只能答查不到
-                + ("要查最新信息（行情、新闻、比赛结果这类）、要计算、推理、比较分析，或者其他工具办不了、你拿不准的问题，调用 think_deeper，不要自己答，也不要说查不到。"
+                + (f"要查最新信息（{latest}）、要计算、推理、比较分析，或者其他工具办不了、你拿不准的问题，调用 think_deeper，不要自己答，也不要说查不到。"
                    "家里的设备、音量、日期时间、农历宜忌用对应的工具；闲聊、讲故事、一句话能答的常识不用调用。" if self.think_model else "")
+                + extra
                 + (f"\n{ha}" if ha else ""))
+
+    def _tool_division(self, names: set) -> tuple[list, str]:
+        """清单里有新闻、时区工具时补一段分工（11-08）：没有这段时，"来条新闻"按上面那句会交给 think_deeper 联网查（十几秒），
+        "某地现在几点"小模型只能拿对话里的东八区时间自己换算。两样都没有时返回空串，调度说明和以前逐字一样。"""
+        news = sorted(n for n in names if isinstance(n, str) and n.startswith("get_news"))
+        clock = [n for n in ("get_current_time", "convert_time") if n in names]
+        out = ""
+        if news:
+            out += (f"用户要听新闻、某一类新闻（国内、国际、财经这类）或者上一条新闻的详细内容，用 {news[0]}"
+                    + ("，不要交给 think_deeper；要查某件具体事情的最新进展才交给 think_deeper。" if self.think_model else "。"))
+        if clock:
+            out += f"问别的城市、别的国家现在几点，或者两地差几个小时，用 {' / '.join(clock)}，时区填 IANA 名称（比如 Europe/London）。"
+        return news, out
 
     @staticmethod
     def _dispatch_tools(tools: list) -> list:
