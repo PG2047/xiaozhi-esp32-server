@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import audioop
+import json
 import re
 import time
 import uuid
@@ -40,6 +41,29 @@ TAG = __name__
 # 记忆拼进主模型指令时的说明（和级联一样放在 <memory> 标签里，见 core/utils/dialogue.get_llm_dialogue_with_memory）
 MEMORY_HEADER = "下面是之前对话里记下的关于用户的信息，只作参考：不要主动念出来，用户问起或话题相关时再用；和用户现在说的不一样时，以现在说的为准。"
 _MEMORY_TAG = re.compile(r"<memory>.*?</memory>", re.DOTALL)
+
+
+def _has_text(node) -> bool:
+    """JSON 里有没有一条非空的文字（数字、布尔不算：总结模板里的分值、天数单独没有意义）。"""
+    if isinstance(node, str):
+        return bool(node.strip())
+    if isinstance(node, dict):
+        return any(_has_text(v) for v in node.values())
+    if isinstance(node, list):
+        return any(_has_text(v) for v in node)
+    return False
+
+
+def memory_text(snapshot) -> str:
+    """记忆快照里真正要带进指令的文字。总结出来是空壳（{}、{"条目": []}、只有空字段的模板）就当没有记忆。"""
+    text = str(snapshot or "").strip()
+    if not text:
+        return ""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return text            # 不是 JSON（别的记忆 provider 返回纯文字）：原样带
+    return text if _has_text(data) else ""
 
 
 class DeviceSpeaker:
@@ -202,9 +226,9 @@ class S2SProviderBase(ABC):
 
         指令里有 <memory>…</memory>（增强提示词的模板带了）就填进去，没有就追加在末尾。没有快照时原样返回，
         所以没开记忆时指令和以前逐字相同。只给主模型用：工具调度这类经网关、要求指令不变的地方别调它。
-        超过 memory_max_chars（默认 1200 字，0 = 不带记忆）就截断。日志只记长度。
+        总结出来是空壳（{}、{"条目": []}）也当没有。超过 memory_max_chars（默认 1200 字，0 = 不带记忆）就截断。日志只记长度。
         """
-        text = str(getattr(self.conn, "memory_snapshot", None) or "").strip()
+        text = memory_text(getattr(self.conn, "memory_snapshot", None))
         cap = int(self.config.get("memory_max_chars", 1200))
         if not text or cap <= 0:
             return instructions
@@ -220,7 +244,7 @@ class S2SProviderBase(ABC):
 
     def memory_chars(self) -> int:
         """这次会话带进指令的记忆字数（日志用）。"""
-        text = str(getattr(self.conn, "memory_snapshot", None) or "").strip()
+        text = memory_text(getattr(self.conn, "memory_snapshot", None))
         cap = int(self.config.get("memory_max_chars", 1200))
         return 0 if cap <= 0 else min(len(text), cap)
 

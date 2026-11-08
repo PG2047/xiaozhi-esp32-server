@@ -63,6 +63,19 @@ def test_long_memory_is_cut_and_zero_turns_it_off():
     assert _rt(conn, memory_max_chars=0).with_memory("x") == "x"
 
 
+
+def test_empty_summary_is_treated_as_no_memory():
+    """总结模型在没什么可记时会回空壳：别往指令里塞一段空记忆。"""
+    empty_upstream = '{"时空档案": {"身份图谱": {"现用名": "", "特征标记": []}, "记忆立方": []}, "高光语录": [], "关系网络": {"高频话题": {"职场": 0}}}'
+    for snap in ('{"条目": []}', "{}", "[]", empty_upstream):
+        conn = FakeConn(None)
+        conn.memory_snapshot = snap
+        p = _rt(conn)
+        assert p.with_memory("x") == "x" and p.memory_chars() == 0, snap
+    conn = FakeConn(None)
+    conn.memory_snapshot = "用户喜欢芒果"          # 不是 JSON 的纯文字照样带
+    assert "用户喜欢芒果" in _rt(conn).with_memory("x")
+
 # ---------- Live：session.start 带，签名和调度指令不带 ----------
 def _live(conn, url, **over):
     return LiveProvider({"api_key": "k", "url": url, "echo_gate": False, "idle_close_s": 0,
