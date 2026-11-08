@@ -915,6 +915,44 @@ def test_client_delegation_short_tool_result_goes_straight_to_live():
     _run_client(sc)
 
 
+def test_client_delegation_long_arguments_are_left_out_of_the_handback():
+    """11-08：远程 MCP 要整段代码当参数，短结果直接交回时不把代码交给 Live（只写"参数略"）；短参数照旧带上。"""
+    code = json.dumps({"code": "async function run(client) {\n  return await client.simple.price.get({ ids: 'bitcoin' });\n}" + " " * 80})
+
+    async def sc(lv, conn, p):
+        async def fake(items, tools):
+            return {"output": [{"type": "function_call", "call_id": "c1", "name": "hass_state", "arguments": code}]}
+        p._responses_call = fake
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d1", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        m = [m for m in lv.received if m["type"] == "session.commentary.append"][0]
+        assert "（参数 略）" in m["content"] and "async function" not in m["content"] and m["content"].endswith("结果：客厅灯已打开")
+    _run_client(sc)
+
+    async def sc2(lv, conn, p):
+        async def fake(items, tools):
+            return {"output": [{"type": "function_call", "call_id": "c1", "name": "hass_state", "arguments": code}]}
+        p._responses_call = fake
+        await lv.emit({"type": "session.delegation.created", "delegation": {"id": "d1", "target": "client"}})
+        await wait_until(lambda: any(m["type"] == "session.commentary.append" for m in lv.received), what="commentary")
+        assert "async function" in [m for m in lv.received if m["type"] == "session.commentary.append"][0]["content"]
+    _run_client(sc2, tool_handback_max_args=10000)   # 调大上限：和以前一样带上全部参数
+
+
+def test_dispatch_hints_appended_only_when_configured():
+    hint = "问加密货币价格用 execute 调 CoinGecko，代码模板：async function run(client) { return await client.simple.price.get({ ids: 'bitcoin', vs_currencies: 'usd' }); }"
+
+    async def sc(lv, conn, p):
+        assert p.dispatch_hints == [] and "CoinGecko" not in p._dispatch_instructions()
+    _run_client(sc)
+
+    async def sc2(lv, conn, p):
+        d = p._dispatch_instructions()
+        assert d.endswith(hint) or f"\n{hint}\n" in d
+        assert p.dispatch_hints == [hint]
+    _run_client(sc2, dispatch_hints=[hint, "  "])   # 空串丢掉
+
+
 def test_client_delegation_long_tool_result_gets_summarised():
     async def sc(lv, conn, p):
         n = {"i": 0}
