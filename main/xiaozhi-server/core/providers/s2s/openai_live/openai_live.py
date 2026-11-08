@@ -171,6 +171,10 @@ class S2SProvider(S2SProviderBase):
         self.think_timeout_s = float(c.get("think_timeout_s", 20))
         self.ack_delay_ms = int(c.get("ack_delay_ms", 800))
         self.tool_rounds = int(c.get("tool_rounds", 3))
+        # 11-08：部署端按工具补的调度说明（比如远程 MCP 的用法和代码模板），原样接在调度说明后面；不配时调度说明不变
+        self.dispatch_hints = [str(h).strip() for h in (c.get("dispatch_hints") or []) if str(h).strip()]
+        # 短结果直接交回 Live 时带上参数（"调到六十了"靠它），但参数里过长的字段（比如远程 MCP 要的整段代码）换成"略"，免得 Live 念代码
+        self.handback_max_args = int(c.get("tool_handback_max_args", 80))
         self.direct_max_chars = int(c.get("tool_direct_max_chars", 200))   # 单个工具结果不超过这么长就直接交给 Live 转述，省一轮
         self.context_max_chars = int(c.get("tool_context_max_chars", 1200))  # 更长的结果总结后，原文作背景给 Live 的上限（0 关掉）
         # 选工具的第一步：model = tool_model 自己选；decisions = 先用 /v1/decisions（gpt-6-luna，只做多选一）挑工具，
@@ -820,7 +824,22 @@ class S2SProvider(S2SProviderBase):
                 + (f"要查最新信息（{latest}）、要计算、推理、比较分析，或者其他工具办不了、你拿不准的问题，调用 think_deeper，不要自己答，也不要说查不到。"
                    "家里的设备、音量、日期时间、农历宜忌用对应的工具；闲聊、讲故事、一句话能答的常识不用调用。" if self.think_model else "")
                 + extra
+                + ("\n" + "\n".join(self.dispatch_hints) if self.dispatch_hints else "")
                 + (f"\n{ha}" if ha else ""))
+
+    def _handback_args(self, arguments: str) -> str:
+        """交回 Live 的参数：字符串字段超过 handback_max_args 的换成"略"（音量、亮度、entity_id 这些短字段照旧带上）；
+        不是 JSON 对象时整段超过上限就只写"略"。"""
+        try:
+            args = json.loads(arguments)
+        except (ValueError, TypeError):
+            return arguments if len(arguments) <= self.handback_max_args else "略"
+        if not isinstance(args, dict):
+            return arguments if len(arguments) <= self.handback_max_args else "略"
+        if not any(isinstance(v, str) and len(v) > self.handback_max_args for v in args.values()):
+            return arguments
+        return json.dumps({k: ("略" if isinstance(v, str) and len(v) > self.handback_max_args else v) for k, v in args.items()},
+                          ensure_ascii=False)
 
     def _tool_division(self, names: set) -> tuple[list, str]:
         """清单里有新闻、时区工具时补一段分工（11-08）：没有这段时，"来条新闻"按上面那句会交给 think_deeper 联网查（十几秒），
@@ -1237,7 +1256,8 @@ class S2SProvider(S2SProviderBase):
                                           else self._check_set_state(call, last, only, keep_out) if call.get("name") == "hass_set_state" else None)
                     result = blocked or await self.tools.run(call.get("name") or "", call.get("arguments") or "{}")
                     outputs.append(result)
-                    ran.append(f"已调用 {call.get('name')}（参数 {call.get('arguments') or '{}'}），结果：{result[:self.direct_max_chars]}")
+                    args_text = self._handback_args(call.get("arguments") or "{}")
+                    ran.append(f"已调用 {call.get('name')}（参数 {args_text}），结果：{result[:self.direct_max_chars]}")
                     items.append({"type": "function_call", "call_id": call.get("call_id"), "name": call.get("name"),
                                   "arguments": call.get("arguments") or "{}"})
                     items.append({"type": "function_call_output", "call_id": call.get("call_id"), "output": result})
